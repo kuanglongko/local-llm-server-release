@@ -1,0 +1,22 @@
+# 构建产物
+.gradle/
+build/
+app/build/
+dist/
+out/
+local.properties
+
+# IDE
+.idea/
+*.iml
+
+# 临时
+*.log
+.DS_Store
+
+# 本地构建产物（通过 CI artifact 分发，不入库）
+app-debug-v*.apk
+crash_last.txt
+
+# Python 字节码（py_compile / import 产生）
+__pycache__/

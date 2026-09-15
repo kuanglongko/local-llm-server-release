@@ -1,0 +1,33 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+    <uses-permission android:name="android.permission.INTERNET" />
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC" />
+    <!-- 「就地引用」外部 GGUF 需要按裸路径直读（native 只接受路径字符串，SAF 的 uri 级
+         权限不延伸到裸路径）。依赖 targetSdk=28 的 legacy 存储可见性。
+         拒绝授权不影响「复制到应用内」路径，故不作为启动必需项申请。 -->
+    <uses-permission android:name="android.permission.READ_EXTERNAL_STORAGE" />
+    <application
+        android:name=".App"
+        android:label="LocalLLM Server"
+        android:theme="@android:style/Theme.Material.Light.NoActionBar"
+        android:allowBackup="false"
+        android:usesCleartextTraffic="true">
+        <!-- rnllama NPU 路径依赖高通 vendor 公开库；required=false 使无 NPU 机型仍可安装 -->
+        <uses-native-library android:name="libOpenCL.so" android:required="false" />
+        <uses-native-library android:name="libcdsprpc.so" android:required="false" />
+        <activity android:name=".MainActivity" android:exported="true">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+        <activity android:name=".EngineActivity" android:exported="false"
+            android:windowSoftInputMode="adjustResize" />
+        <service
+            android:name=".InferenceService"
+            android:exported="false"
+            android:foregroundServiceType="dataSync" />
+    </application>
+</manifest>
