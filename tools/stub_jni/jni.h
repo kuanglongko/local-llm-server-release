@@ -28,3 +28,21 @@ struct JNIEnv {
         return (jstring) this;
     }
 };
+
+// ---- 以下为 llama_jni.cpp 宿主侧语法检查所需的最小补充（不参与 Android 构建）----
+typedef int32_t jint;
+typedef uint8_t jboolean;
+typedef void * jobject;
+typedef void * jobjectArray;
+typedef void * jclass;
+typedef void * jmethodID;
+typedef void * JavaVM;
+#define JNI_FALSE 0
+#define JNI_TRUE 1
+#define JNI_VERSION_1_6 0x00010006
+#define JNI_OK 0
+#define JNIEXPORT
+#define JNICALL
+
+struct JNIEnv2;
+inline void jni_stub_unused() {}

@@ -70,6 +70,96 @@ object LlmEngine {
     /** 生成互斥锁：UI 测试页与本地 HTTP 服务共用，保证同一时刻只有一路生成。 */
     val genLock = Any()
 
+    // ---- 崩溃探针 ----
+    // 为什么要有它：这条链路上的闪退此前取证不到 —— 日志回调在 abort 前会丢，
+    // JVM 的 UncaughtExceptionHandler 覆盖不到 native abort，客户端只看到连接被重置。
+    // 探针把「谁进去了、走到哪一步、崩在哪」写进 native 自己持有的 fd，进程被 abort
+    // 杀死时内核缓冲里的数据仍在。
+    private const val PREFS_PROBE = "probe_prefs"
+    private const val PREF_PROBE_ON = "probe_on"
+    /** 探针是否由用户打开；打开后所有日志一律落 native 探针文件（含全量原生日志）。 */
+    @Volatile var probeEnabled: Boolean = false
+        private set
+    @Volatile var probeFile: java.io.File? = null
+        private set
+    @Volatile private var probeAttached = false
+
+    fun loadProbeSetting(ctx: android.content.Context) {
+        probeEnabled = ctx.applicationContext
+            .getSharedPreferences(PREFS_PROBE, android.content.Context.MODE_PRIVATE)
+            .getBoolean(PREF_PROBE_ON, false)
+    }
+
+    fun setProbeEnabled(ctx: android.content.Context, on: Boolean) {
+        ctx.applicationContext.getSharedPreferences(PREFS_PROBE, android.content.Context.MODE_PRIVATE)
+            .edit().putBoolean(PREF_PROBE_ON, on).apply()
+        probeEnabled = on
+    }
+
+    /**
+     * 挂载 native 探针。**必须在 loadNative() 之后**调用，且必须在 [backendInit] 之前。
+     *
+     * 为什么必须在 loadNative 之后：`nativeProbeInit` 定义在 llama_jni.cpp、
+     * 编进 `libllmjni_<tag>.so`，**不在** libcpufeat.so 里（后者只导出 cpuCaps）。
+     * 库没 load 就调它，JVM 只会给一个 UnsatisfiedLinkError。
+     *
+     * 但顺序对了不等于挂得上，所以**不要把 UnsatisfiedLinkError 当成单一病因**：
+     * 覆盖安装（Android 不替换已存在的 lib/arm64-v8a 下的 .so）、CMake 判 up-to-date 跳过
+     * native 重编、变体名与实际产物对不上，都会给出一模一样的报错。三种成因的区分办法：
+     *   · 顺序/变体名问题 → `[引擎] native 变体=...` 那行在不在、变体名对不对；
+     *   · .so 没换新       → 搜 logcat `JNI_OnLoad 已进入`（每次 load 到这个库都会打一行）；
+     *   · 符号确实不在库里 → 上面两行都在，仍报 UnsatisfiedLinkError。
+     * 另外 native 侧现在会自行自举探针（JNI_OnLoad），所以**即使这一跳失败**，
+     * probe-native.log 里也应该有 `[boot]` 开头的内容 —— 一条都没有，才说明 native 完全没跑起来。
+     *
+     * 为什么必须在 backendInit 之前：backendInit 里的 `llama_log_set` 只选一次 sink，
+     * 且探针要能接住 backendInit 自身与后续模型加载、渲染、解析各阶段的崩溃。
+     *
+     * 代价说清楚：探针接不住 `dlopen` 阶段（.so 静态初始化）的崩溃 —— 那需要先 load 才能挂，
+     * 循环依赖。但那个阶段崩了 App 根本起不来，是另一个现象；而真正出问题的
+     * 模型加载 / prompt 渲染 / 解析 / 生成四个阶段全在覆盖范围内。
+     *
+     * @return null=挂载成功；否则为失败原因（用于 UI 直接提示，不静默失败）
+     */
+    fun startProbe(ctx: android.content.Context): String? {
+        if (!probeEnabled) return null
+        return try {
+            val dir = java.io.File(ctx.applicationContext.filesDir, "logs")
+            if (!dir.exists()) dir.mkdirs()
+            probeFile = java.io.File(dir, "probe-native.log")
+            // nativeProbeInit 在 libllmjni_<tag>.so 里（不在 libcpufeat.so），
+            // 库没加载就调只会拿到 UnsatisfiedLinkError。这里先挡一道，把原因说清楚。
+            //
+            // 注意这一跳失败**不代表取证失败**：native 侧在 JNI_OnLoad 里会自行自举探针，
+            // 所以日志里「Kotlin 挂载失败」但 probe-native.log 有 `[boot]` 内容是正常组合
+            // —— 那说明崩点就在 Kotlin → native 之间，而不是 native 内部。
+            if (nativeTag == null) return "native 库尚未加载（loadNative 未成功），探针无处挂载"
+            probeAttached = nativeProbeInit(dir.absolutePath, true)
+            if (!probeAttached) return "nativeProbeInit 返回 false（文件打不开或无写权限）"
+            probeMark("Kotlin 侧已挂载探针，${
+                java.text.SimpleDateFormat("MM-dd HH:mm:ss", java.util.Locale.US)
+                    .format(java.util.Date())} abi=${android.os.Build.SUPPORTED_ABIS.firstOrNull()}")
+            null
+        } catch (t: Throwable) {
+            probeAttached = false
+            "探针挂载异常：${t.javaClass.simpleName}: ${t.message}"
+        }
+    }
+
+    val probeAttachedNow: Boolean get() = probeAttached
+
+    /** 探针打点：写 native fd，同时镜像进 Kotlin 日志文件（进程没崩时便于一次导出看完）。 */
+    fun probeMark(msg: String) {
+        if (!probeEnabled) return
+        try { nativeProbeMark(msg) } catch (_: Throwable) {}
+        LogFileStore.append("[probe] $msg")
+    }
+
+    /** 探针原始文本（native 直写的那份，含信号现场）。 */
+    fun probeText(): String = runCatching {
+        probeFile?.let { if (it.exists()) it.readText() else "" } ?: ""
+    }.getOrDefault("")
+
     /** 是否已加载模型（区别于 isLoaded：后者仅表示 native 库初始化完成）。 */
     val hasModel: Boolean get() = loaded && currentPath != null
 
@@ -84,6 +174,9 @@ object LlmEngine {
     private var ringBase: String? = null
     private var ringRep = 0
 
+    /** 探针模式下 ring 放宽：原始 token 流不再折叠，300 行窗口一眨眼就满 */
+    private const val PROBE_RING = 2000
+
     /**
      * 进 ring buffer 的同时**实时落盘**（filesDir/logs/session-*.log）。
      * 原来日志只在内存里，native SIGABRT 瞬间进程就没了，用户根本来不及点导出——
@@ -97,6 +190,20 @@ object LlmEngine {
     @Volatile var lastProgressAt: Long = 0L
 
     private fun pushLog(t: String) {
+        // 探针开启时**不过滤噪音、不折叠重复**：崩溃前最后那几条恰恰经常是
+        // llama 逐 token 打的 "."，折叠会把它们挤掉。全量落 native 探针文件。
+        if (probeEnabled) {
+            lastProgressAt = System.currentTimeMillis()
+            try { nativeProbeMark(t) } catch (_: Throwable) {}
+            // 同时也进内存 ring，UI 日志页能看到（不再落 Kotlin 会话文件，避免双份）
+            synchronized(logRing) {
+                logRing.addLast(t)
+                while (logRing.size > PROBE_RING) logRing.removeFirst()
+            }
+            HtpProbe.observe(t)
+            try { logSink?.invoke(t) } catch (_: Exception) {}
+            return
+        }
         // 纯探测噪音不进 ring、不进文件，只累计一条计数说明（见 LogFileStore.isNoise）
         if (LogFileStore.isNoise(t)) {
             LogFileStore.noteNoise(t)
@@ -182,7 +289,13 @@ object LlmEngine {
             // 界面上摆出来无收益只有风险。
             // 此处只保留 prepareHtpLibs 这一条必需路径。
             loadNative(useHtp)
+            // 探针只在 loadNative **成功之后**才挂得上（nativeProbeInit 在 llmjni_<tag> 里），
+            // 又必须赶在 backendInit 之前（backendInit 只选一次 log sink）。
+            // 这两个约束把挂载点唯一钉死在这里；见 startProbe 的注释。
+            startProbe(context)?.let { probeMark("!! 探针挂载失败：$it") }
+            probeMark("即将 backendInit")
             backendInit(logBridge)
+            probeMark("backendInit 成功")
             loaded = true
             lastInitError = null
             Log.i(TAG, "llmjni[$nativeTag] loaded & backend init ok (htp=$useHtp)")
@@ -224,6 +337,7 @@ object LlmEngine {
      * 无需任何改二进制的 hack。
      */
     private fun loadNative(forceHtp: Boolean) {
+        probeMark("loadNative 开始（forceHtp=$forceHtp）")
         System.loadLibrary("cpufeat")
         cpuCapsCache = runCatching { cpuCaps() }.getOrNull()
         val c = cpuCapsCache
@@ -238,7 +352,9 @@ object LlmEngine {
         var last: Throwable? = null
         for (tag in order) {
             try {
+                probeMark("即将 loadLibrary llmjni_$tag")
                 System.loadLibrary("llmjni_$tag")
+                probeMark("loadLibrary llmjni_$tag 成功")
                 nativeTag = tag
                 uiLog("[引擎] native 变体=$tag（dotprod=$dotprod i8mm=$i8mm 高通=$qcom）")
                 return
@@ -571,7 +687,81 @@ object LlmEngine {
         return sb.toString()
     }
 
-    /** 配置采样链。temp<=0 视为贪心。topK<=0 关闭；repPenalty>1 启用重复惩罚（近 penaltyN 个 token）。 */
+    /**
+     * 带工具定义渲染 prompt。tools 为空数组、无模型或渲染失败时返回 null，调用方回落 [applyChatTemplate]。
+     *
+     * 必须走这条路径才能支持工具调用：`llama_chat_apply_template` 只吃 role/content，
+     * 工具清单进不了 prompt（工具定义是写给模型看的，不入 prompt 模型就不知道自己有什么函数可用），
+     * 于是永远吐不出 tool_calls。
+     *
+     * @param toolsJson OpenAI 格式的 tools 数组（`[{"type":"function","function":{...}}]`）
+     * @param toolChoice "auto" / "required" / "none"。
+     *   注意：**不要传 null**。JNI 只能把 null 变成空串 `""`，而 vendor 库对空串是
+     *   throw `std::invalid_argument`（不是返回 AUTO），异常穿 JNI 即 SIGABRT。
+     *   请求侧 [ToolCalls.parseToolChoice] 已保证非 null；此处的 null 兜底仍然保留，
+     *   native 侧也另有一道同源兜底（两道防线都要有）。
+     */
+    fun applyChatTemplateWithTools(
+        messages: List<Pair<String, String>>,
+        toolsJson: String,
+        toolChoice: String? = null,
+        parallelToolCalls: Boolean = true,
+        addAss: Boolean = true
+    ): String? {
+        if (toolsJson.isBlank() || toolsJson == "[]" || toolsJson == "null") return null
+        val roles = Array(messages.size) { messages[it].first }
+        val contents = Array(messages.size) { messages[it].second }
+        val tmpl = chatTemplate()
+        probeMark("[工具] 即将渲染带 tools 的 prompt：msgs=${messages.size} tools_len=${toolsJson.length} " +
+                "chat_template_len=${tmpl.length}（=0 表示模型没带模板）choice=${toolChoice ?: "auto"}")
+        return try {
+            val r = nativeApplyChatTemplateTools(tmpl, roles, contents, toolsJson, toolChoice, parallelToolCalls, addAss)
+            probeMark("[工具] 带 tools 渲染返回：${if (r == null) "null（回落无工具路径）" else "len=${r.length}"}")
+            r
+        } catch (t: Throwable) {
+            uiLog("[工具] 模板渲染失败，回落无工具路径：${t.message}")
+            null
+        }
+    }
+
+    /**
+     * 从模型输出解析 tool_calls。
+     *
+     * 返回 Pair(content, toolCallsJson)：toolCallsJson 为 null 表示没有工具调用。
+     * 语法随模板变化（Qwen 的 `<tool_call>`、Llama 的 `[TOOL_CALLS]` 等），
+     * 由 native 侧 `common_chat_parse` 按模板归一，Kotlin 侧不做正则猜测。
+     */
+    fun parseToolCalls(text: String, toolsJson: String): Pair<String, String?>? {
+        if (text.isEmpty()) return null
+        val tmpl = chatTemplate()
+        probeMark("[工具] 即将调用 nativeParseToolCalls：text_len=${text.length} " +
+                "tools_len=${toolsJson.length} tmpl_len=${tmpl.length} " +
+                "text_head=${text.take(200).replace("\n", "\\n")}")
+        val raw = try { nativeParseToolCalls(text, toolsJson, tmpl) } catch (t: Throwable) {
+            probeMark("[工具] nativeParseToolCalls 抛出异常：${t.javaClass.name}: ${t.message}")
+            uiLog("[工具] 解析失败：${t.message}")
+            null
+        } ?: run { probeMark("[工具] nativeParseToolCalls 返回 null"); return null }
+        probeMark("[工具] nativeParseToolCalls 返回 len=${raw.length} head=${raw.take(200)}")
+        if (raw.isEmpty() || raw == "null") return null
+        return try {
+            val o = org.json.JSONObject(raw)
+            val calls = o.optJSONArray("toolCalls")
+            if (calls == null || calls.length() == 0) null
+            else o.optString("content", "") to calls.toString()
+        } catch (t: Throwable) {
+            null
+        }
+    }
+
+    /**
+     * 配置采样链，顺序与 llama.cpp 官方示例一致：
+     * `penalties -> top_k -> top_p -> min_p -> temp -> dist`。
+     * temp<=0 视为贪心（其余采样参数被忽略）。topK<=0 关闭；topP/minP<=0 或 >=1 关闭。
+     *
+     * 入参由 [SamplingParams.check] 校验过，native 侧不再重复兜底：
+     * NaN/Inf、越界值都会让 llama.cpp 的采样器行为未定义。
+     */
     fun newSampler(temp: Float, topP: Float, minP: Float, seed: Long = 0,
                    topK: Int = 0, repPenalty: Float = 1f, penaltyN: Int = 0,
                    freqPenalty: Float = 0f, presencePenalty: Float = 0f): Boolean =
@@ -641,6 +831,15 @@ object LlmEngine {
     // ---- native ----
     /** libcpufeat.so 提供，返回 [dotprod, i8mm, hwcap, hwcap2]。 */
     @JvmStatic private external fun cpuCaps(): LongArray
+    /**
+     * native 崩溃探针开关。on=true 时 native 侧自己开文件直写（不经 JVM、不经 llama log 系统），
+     * 并把 SIGSEGV/SIGABRT/... 的现场写进同一文件；开启期间所有 JVM 回调都被旁路，
+     * 以免探针自身成为观测者效应。返回是否挂上。
+     */
+    @JvmStatic private external fun nativeProbeInit(dir: String, on: Boolean): Boolean
+
+    /** Kotlin 侧埋点：把「要开始做 X」写进 native 探针文件；探针关闭时是空操作。 */
+    @JvmStatic private external fun nativeProbeMark(msg: String)
     @JvmStatic private external fun backendInit(logBridge: Any)
     /** 只读 GGUF header 预探真实量化，返回 {主类型, HTP受理%, HTP可算"1"/"0", 说明}。 */
     @JvmStatic private external fun nativeProbeGguf(path: String): Array<String>
@@ -655,6 +854,16 @@ object LlmEngine {
     @JvmStatic private external fun nativeChatTemplate(): String
     @JvmStatic private external fun nativeApplyChatTemplate(
         tmpl: String, roles: Array<String>, contents: Array<String>, addAss: Boolean): String?
+    /** 带 tools 的模板渲染：工具定义进 prompt（旧接口不认 tools，工具调用永远不触发）。 */
+    @JvmStatic private external fun nativeApplyChatTemplateTools(
+        tmpl: String, roles: Array<String>, contents: Array<String>,
+        toolsJson: String?, toolChoice: String?, parallelToolCalls: Boolean, addAss: Boolean): String?
+    /**
+     * 从输出文本解析 tool_calls，返回 JSON；无工具调用或解析失败返回 "null"。
+     *
+     * 必须传入**渲染时的同一个模板**：解析器是按模板推导出的 PEG，两边不一致会解析错。
+     */
+    @JvmStatic private external fun nativeParseToolCalls(text: String, toolsJson: String?, tmpl: String): String
     @JvmStatic private external fun nativeNewSampler(temp: Float, topP: Float, minP: Float, topK: Int, repPenalty: Float, penaltyN: Int, freqPenalty: Float, presencePenalty: Float, seed: Long): Boolean
     @JvmStatic private external fun nativeStartCompletion(prompt: String, maxTokens: Int): Boolean
     @JvmStatic private external fun nativeStep(): String?

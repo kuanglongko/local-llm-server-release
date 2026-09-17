@@ -62,4 +62,36 @@ App 里它是一个**实验性开关，默认关闭**。关掉时行为与不带
 - **大 ctx + GPU 层**：`gpuLayers > 0` 且 `n_ctx > 32768` 时 OpenCL compute buffer 可能分配失败，
   会自动回退纯 CPU，同时把配额复位为「自动」。
 - 首次 prefill 可能几十秒，期间只有日志在动，没有进度条。
-- 闪退定位：native 日志实时落盘并接管 stderr，导出会话日志即可直接定位原因。
+- 闪退定位见下节。
+
+## 闪退取证（崩溃探针）
+
+native 闪退发生在 `abort()` / `SIGSEGV` 之后，JVM 侧拿不到任何遗言
+（`UncaughtExceptionHandler` 覆盖不到 native abort，`llama_log_set` 缓冲里的日志也会丢）。
+所以取证不能只靠 Kotlin 日志，要靠 native 侧自己直写文件。
+
+**打开**：设置页 →「崩溃取证（探针）」→ 打开 → **完全退出 App 再启动**。
+
+**取证据**：复现闪退后重开 App → 日志页 →「导出崩溃探针」，得到 `probe-<时间戳>.txt`。
+这一份已含排查所需的全部内容：native 探针原文（含信号现场与逐 token 原始输出）、
+Kotlin 本次与上次会话全文、设备/后端/变体/Boot ID。
+
+**怎么读**：
+
+| 现象 | 含义 |
+|---|---|
+| `>> 函数名` 没有配对的 `<< 函数名` | 崩在这个 JNI 入口内部 |
+| `[parse]` / `[tools]` 最后一条 `>>>` 没有配对 `<<<` | 崩在库里那一步（渲染 / 解析） |
+| `!!! ===== SIGNAL n =====` | native 收到了信号，紧跟其后的行就是现场 |
+| 只有 `[boot]` 开头的内容 | 崩点落在 Kotlin → native 之间，native 业务还没开始跑 |
+| 一条 `[boot]` 都没有 | native 库根本没跑起来（`loadLibrary` 失败或拿的是旧包） |
+| `UnsatisfiedLinkError: nativeProbeInit` | `.so` 与 `.kt` 不是同一次构建（覆盖安装 / native 未重编） |
+
+**探针自身的兜底**：探针不问「Kotlin 有没有成功调到 nativeProbeInit」。
+native 在库加载时就自行自举（只读系统属性与包名推导目录），因此即使上面那一跳失败，
+`probe-native.log` 里也会有 `[boot]` 内容；要指定落盘目录（受控，仅调试用）：
+`setprop debug.localinference.probe.dir /data/local/tmp`。
+
+关闭探针时探针函数第一行即返回，零开销，正常使用不受影响。
+
+**注意**：探针**不改任何业务逻辑**，只加观测。它不会让闪退消失，而是让下一次闪退可归因。

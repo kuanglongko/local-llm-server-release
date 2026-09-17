@@ -21,6 +21,10 @@ class App : Application() {
         super.onCreate()
         // 尽早开文件，让 native 初始化阶段的日志也能落盘
         LogFileStore.init(this)
+        // 探针开关与日志落盘都在 Application 里就绪，保证后续任何入口
+        // （UI / 前台服务 / 系统自动拉起服务）都走同一份设置
+        LlmEngine.loadProbeSetting(this)
+        if (LlmEngine.probeEnabled) LogFileStore.append("[probe] 探针已启用（设置里开启后重启生效）")
         val prev = Thread.getDefaultUncaughtExceptionHandler()
         Thread.setDefaultUncaughtExceptionHandler { t, e ->
             runCatching {

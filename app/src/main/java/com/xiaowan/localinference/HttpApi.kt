@@ -17,7 +17,7 @@ import org.json.JSONObject
  * 绑定 127.0.0.1（端口可自定义，默认 8080），OpenAI 兼容端点：
  * GET  /health                 -> 引擎/模型/上下文状态
  * GET  /v1/models              -> 当前加载的模型（单实例）
- * POST /v1/chat/completions    -> 对话补全，stream=true 时 SSE 流式
+ * POST /v1/chat/completions    -> 对话补全，stream=true 时 SSE 流式；认 `tools`（工具调用）
  * POST /v1/completions         -> raw prompt 补全（不走 chat 模板，适合测速）
  *
  * 并发模型：每连接一线程（accept 不串行阻塞）；生成期间（busy）新请求返回 503；
@@ -64,6 +64,9 @@ object HttpApi {
     private fun emitLog(s: String) {
         Log.i(TAG, s)
         try { LlmEngine.logSink?.invoke("[http] $s") } catch (_: Exception) {}
+        // 探针模式下还要落到 native fd：HTTP 线程上的崩溃点与它前面那句日志
+        // 只隔几微秒，走 JVM 文件写会丢。
+        try { LlmEngine.probeMark("[http] $s") } catch (_: Exception) {}
     }
 
     fun start() {
@@ -343,9 +346,13 @@ object HttpApi {
         try {
             val j = JSONObject(req.body)
             val stream = j.optBoolean("stream", false)
-            val temp = j.optDouble("temperature", 0.8).toFloat()
-            val topP = j.optDouble("top_p", 0.95).toFloat()
-            val maxTok = j.optInt("max_tokens", 512).coerceIn(1, 8192)
+            // 采样参数统一走 SamplingParams 校验：非法值直接 400，不再静默降级（历史坑：
+            // top_p=0 被静默关掉、repeat_penalty<1 语义反转、min_p 默认值与 UI 不一致）。
+            // max_tokens 也在此处按 1..8192 校验（此前用 coerceIn 静默钳制）。
+            // fromRequest 已逐字段校验并给出原因；返回 null 即取值非法，直接 400。
+            val (sp, spErr) = SamplingParams.fromRequest(j)
+            if (sp == null) { writeJson(out, 400, errJson(spErr ?: "采样参数非法")); return }
+            val maxTok = sp.maxTokens
             val modelName = j.optString("model", "local").ifEmpty { "local" }
 
             val msgs = ArrayList<Pair<String, String>>()
@@ -367,6 +374,22 @@ object HttpApi {
             }
             if (msgs.isEmpty()) { writeJson(out, 400, errJson("messages is empty")); return }
 
+            // ---- 工具调用（OpenAI tools / function calling）----
+            // 请求带 tools 时必须走「工具感知」模板渲染：工具定义要进 prompt，
+            // 否则模型不知道自己有哪些函数可用，永远吐不出 tool_calls。
+            // 解析逻辑在 ToolCalls（纯函数，可离线单测），这里只做取用
+            val hasTools = ToolCalls.hasTools(j)
+            val toolsJson = if (hasTools) ToolCalls.toolsJson(j) else null
+            LlmEngine.probeMark("[http] 请求分类：has_tools=$hasTools stream=$stream " +
+                    "tools_count=${if (hasTools) j.optJSONArray("tools")?.length() ?: 0 else 0} " +
+                    "body_len=${req.body.length} thread=${Thread.currentThread().name}")
+            if (hasTools) LlmEngine.probeMark("[http] tools 原文=${toolsJson?.take(600)}")
+            val toolChoice = ToolCalls.parseToolChoice(j, hasTools)
+            val parallelToolCalls = j.optBoolean("parallel_tool_calls", true)
+            // toolChoice 带 tools 时已由 parseToolChoice 保证非 null（缺省归一成 "auto"），
+            // 这里不再显示 null，避免"看起来没传"这种会被误读的日志。
+            if (hasTools) emitLog("tools: ${j.optJSONArray("tools")!!.length()} 个，choice=${toolChoice ?: "auto"}")
+
             // 思考控制 —— 请求显式参数 > 全局默认；仅模板含 enable_thinking 时注入空 think 块（软开关）
             val kwEt = j.optJSONObject("chat_template_kwargs")?.opt("enable_thinking")
             val reqThinking: Boolean? = when {
@@ -378,7 +401,12 @@ object HttpApi {
                 else -> null
             }
             val thinkingOn = reqThinking ?: !disableThinkingDefault
-            var prompt = LlmEngine.applyChatTemplate(msgs, addAss = true)
+            // 带 tools 时优先进工具感知路径；渲染失败（无模型 / 模板不支持）回落普通路径，
+            // 与「模型不支持工具调用时退化成普通对话」的承诺一致，不会让请求整体失败。
+            var prompt = if (toolsJson != null)
+                    LlmEngine.applyChatTemplateWithTools(msgs, toolsJson, toolChoice, parallelToolCalls, addAss = true)
+                else null
+            if (prompt == null) prompt = LlmEngine.applyChatTemplate(msgs, addAss = true)
             if (!thinkingOn && LlmEngine.chatTemplate().contains("enable_thinking")) {
                 prompt = prompt + "<think>\n\n</think>\n\n"  // 追加在末尾（紧贴assistant生成后缀），置于开头会诱导模型模仿输出空think块
                 emitLog("thinking off (soft switch)")
@@ -388,7 +416,10 @@ object HttpApi {
             var n = 0
 
             synchronized(LlmEngine.genLock) {
-                LlmEngine.newSampler(temp, topP, j.optDouble("min_p", 0.05).toFloat(), topK = j.optInt("top_k", 0), repPenalty = j.optDouble("repeat_penalty", 1.0).toFloat(), penaltyN = j.optInt("repeat_last_n", 64), freqPenalty = j.optDouble("frequency_penalty", 0.0).toFloat(), presencePenalty = j.optDouble("presence_penalty", 0.0).toFloat(), seed = System.nanoTime())
+                LlmEngine.newSampler(sp.temp, sp.topP, sp.minP, seed = sp.seed,
+                    topK = sp.topK, repPenalty = sp.repeatPenalty, penaltyN = sp.repeatLastN,
+                    freqPenalty = sp.freqPenalty, presencePenalty = sp.presencePenalty)
+                emitLog("sampling ${sp.describe()}")
                 val err = LlmEngine.startCompletion(prompt, maxTok)
                 if (err != null) { writeJson(out, 400, errJson(err)); return }
                 val sb = StringBuilder()
@@ -408,9 +439,14 @@ object HttpApi {
                     for (k in minOf(tag.length - 1, str.length) downTo 1) if (str.endsWith(tag.substring(0, k))) return k
                     return 0
                 }
+                // 带 tools 时**不实时下发 content**：工具调用语法（<tool_call> / [TOOL_CALLS] 等）
+                // 与正文同处一条输出流，边生成边发会把语法标记当正文吐给客户端。改为整段生成结束后
+                // 先按模板解析出 tool_calls，再决定发 tool_calls 增量块还是纯 content。
+                // reasoning_content 不受影响：思考段不会是工具调用。
+                val bufferContent = toolsJson != null && stream
                 fun emit(text: String, asReason: Boolean) {
                     if (text.isEmpty()) return
-                    if (stream) sseEvent(out, chatChunkJson(id, modelName, created,
+                    if (stream && (!bufferContent || asReason)) sseEvent(out, chatChunkJson(id, modelName, created,
                         if (asReason) """{"reasoning_content":${text.toJsonStr()}}""" else """{"content":${text.toJsonStr()}}""", null))
                 }
                 fun feed(piece: String) {
@@ -458,19 +494,56 @@ object HttpApi {
                     sb.setLength(0)
                     sb.append((before + after).trim())
                 }
+                // ---- 工具调用解析 ----
+                // 带 tools 的请求，输出里可能含 tool_calls，语法随模板而定，交给 native 归一。
+                // 命中时正文通常为空，finish_reason 必须从 stop 改成 tool_calls，
+                // 否则客户端（OpenAI SDK / LangChain 等）不会去执行工具。
+                var toolCallsJson: String? = null
+                if (toolsJson != null) {
+                    LlmEngine.probeMark("[http] 生成结束，进入工具解析：n=$n 输出长度=${sb.length}")
+                    val parsed = LlmEngine.parseToolCalls(sb.toString(), toolsJson)
+                    if (parsed != null) {
+                        toolCallsJson = parsed.second
+                        // content 只留解析出的正文：工具语法标记不能当正文吐给客户端
+                        sb.setLength(0)
+                        sb.append(parsed.first)
+                        emitLog("tool_calls: ${JSONArray(toolCallsJson).length()} 个")
+                    }
+                }
                 if (stream) {
-                    sseEvent(out, chatChunkJson(id, modelName, created, "{}", "stop"))
+                    val fin = if (toolCallsJson != null) "tool_calls" else "stop"
+                    // 缓冲模式下补发正文（带 tools 但模型没调工具）
+                    if (bufferContent && toolCallsJson == null && sb.isNotEmpty())
+                        sseEvent(out, chatChunkJson(id, modelName, created, """{"content":${sb.toString().toJsonStr()}}""", null))
+                    // 流式下按 OpenAI 约定发 tool_calls 增量块（index/id/type/function）。
+                    // 已整段解析完成，故一次性下发而不是逐 token 拼装——客户端按 index 聚合，结果一致。
+                    // id 兜底与 native 侧同一条规则：parse 结果缺 id 时用 call_<下标>，
+                    // 不能在这里另写一份默认值，否则同一份数据在两条路径上会算出不同的 id。
+                    if (toolCallsJson != null) {
+                        for (delta in ToolCalls.streamDeltas(JSONArray(toolCallsJson)))
+                            sseEvent(out, chatChunkJson(id, modelName, created, delta, null))
+                    }
+                    sseEvent(out, chatChunkJson(id, modelName, created, "{}", fin))
                     sseEvent(out, "[DONE]")
                     sseEnd(out)
                 } else {
                     val usage = usageJson(LlmEngine.contextUsed(), n)
+                    val fin = if (toolCallsJson != null) "tool_calls" else "stop"
+                    // 有 tool_calls 时 content 按 OpenAI 规范可为 null
+                    val contentField = if (toolCallsJson != null && sb.isEmpty()) "null" else sb.toString().toJsonStr()
+                    // 必须走 ToolCalls 重新包装：native 给的是解析器原生形状（只有 id/name/arguments），
+                    // OpenAI 线上要的是 {"id":..,"type":"function","function":{..}}，
+                    // 直接透传会让 SDK 认不出 tool_calls 而静默丢掉。
+                    val toolField = if (toolCallsJson != null) ToolCalls.messageToolCallsField(JSONArray(toolCallsJson)) else ""
                     writeJson(out, 200,
                         """{"id":"$id","object":"chat.completion","created":$created,"model":"$modelName",""" +
-                        """"choices":[{"index":0,"message":{"role":"assistant","content":${sb.toString().toJsonStr()}$reasonField},"finish_reason":"stop"}],"usage":$usage}""")
+                        """"choices":[{"index":0,"message":{"role":"assistant","content":$contentField$reasonField$toolField},"finish_reason":"$fin"}],"usage":$usage}""")
                 }
             }
             emitLog("chat ok: $n tok, model=$modelName")
+            LlmEngine.probeMark("[http] handleChat 正常结束 n=$n")
         } catch (t: Throwable) {
+            LlmEngine.probeMark("[http] handleChat 抛出：${t.javaClass.name}: ${t.message}")
             try { writeJson(out, 500, errJson(t.message ?: "internal error")) } catch (_: Exception) {}
         } finally {
             busy.set(false)
@@ -483,9 +556,11 @@ object HttpApi {
         try {
             val j = JSONObject(req.body)
             val stream = j.optBoolean("stream", false)
-            val temp = j.optDouble("temperature", 0.8).toFloat()
-            val topP = j.optDouble("top_p", 0.95).toFloat()
-            val maxTok = j.optInt("max_tokens", 512).coerceIn(1, 8192)
+            // 与 /v1/chat/completions 同一套解析与校验，默认值不会两边漂移
+            // fromRequest 已逐字段校验并给出原因；返回 null 即取值非法，直接 400。
+            val (sp, spErr) = SamplingParams.fromRequest(j)
+            if (sp == null) { writeJson(out, 400, errJson(spErr ?: "采样参数非法")); return }
+            val maxTok = sp.maxTokens
             val modelName = j.optString("model", "local").ifEmpty { "local" }
             val prompt = when (val p = j.opt("prompt")) {
                 is String -> p
@@ -499,7 +574,10 @@ object HttpApi {
             var n = 0
 
             synchronized(LlmEngine.genLock) {
-                LlmEngine.newSampler(temp, topP, j.optDouble("min_p", 0.05).toFloat(), topK = j.optInt("top_k", 0), repPenalty = j.optDouble("repeat_penalty", 1.0).toFloat(), penaltyN = j.optInt("repeat_last_n", 64), freqPenalty = j.optDouble("frequency_penalty", 0.0).toFloat(), presencePenalty = j.optDouble("presence_penalty", 0.0).toFloat(), seed = System.nanoTime())
+                LlmEngine.newSampler(sp.temp, sp.topP, sp.minP, seed = sp.seed,
+                    topK = sp.topK, repPenalty = sp.repeatPenalty, penaltyN = sp.repeatLastN,
+                    freqPenalty = sp.freqPenalty, presencePenalty = sp.presencePenalty)
+                emitLog("sampling ${sp.describe()}")
                 val err = LlmEngine.startCompletion(prompt, maxTok)
                 if (err != null) { writeJson(out, 400, errJson(err)); return }
                 val sb = StringBuilder()

@@ -1,7 +1,18 @@
 name: build
 on:
   push:
-    branches: [main]
+    branches: [main, 'fix/**']
+    # 只在影响 APK 的改动上构建：docs/scripts/tools 下的内容与任何 .md 都不是构建输入
+    # （已核实：本文件全文不引用它们，app/src/main/assets 下 .md 数量为 0，
+    #  jniLibs 只取 vendor 里的 .so）。纯文档提交从此不必再写 [skip ci]。
+    # 故意不忽略 .github/**：改 workflow 自身要真跑一次，用来验证配置没写坏。
+    paths-ignore:
+      - "**.md"
+      - "docs/**"
+      - "scripts/**"
+      - "tools/**"
+      - ".gitignore"
+      - "LICENSE"
   workflow_dispatch:
 
 # 推理在应用进程内完成：预编译 librnllama 变体随仓库提交在 vendor/cui-llama.rn-v1.12.2（Gradle 以 jniLibs 源打包），
@@ -34,6 +45,18 @@ jobs:
           gradle-version: "8.10.2"
       - name: Assemble debug APK
         run: gradle :app:assembleDebug --no-daemon
+      # 版本号与提交号写进构建摘要：便于确认 APK 到底来自哪次提交
+      # （历史上出现过 fix 分支的构建 checkout 到 main 的情况，这一步用来一眼识别）
+      - name: Report APK provenance
+        run: |
+          {
+            echo "### APK 来源"
+            echo ""
+            echo "- ref: \`${GITHUB_REF_NAME}\`"
+            echo "- sha: \`${GITHUB_SHA}\`"
+            grep -E 'versionCode|versionName' app/build.gradle.kts | head -4
+            ls -l app/build/outputs/apk/debug/app-debug.apk
+          } >> "$GITHUB_STEP_SUMMARY"
       - name: Upload debug APK
         uses: actions/upload-artifact@v4
         with:

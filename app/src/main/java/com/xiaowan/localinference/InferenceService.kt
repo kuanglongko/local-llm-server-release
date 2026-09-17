@@ -32,6 +32,9 @@ class InferenceService : Service() {
         const val EXTRA_PARALLEL_N = "parallelN"
         const val EXTRA_BATCH_SIZE = "batchSize"
         const val EXTRA_UBATCH_SIZE = "ubatchSize"
+        /** 本次启动的进程 pid + 启动时刻：探针文件里靠它对齐「哪一次运行」 */
+        val BOOT_ID: String = "${android.os.Process.myPid()}-" +
+            java.text.SimpleDateFormat("MMdd-HHmmss", java.util.Locale.US).format(java.util.Date())
         // 渠道创建后 importance 即锁定，提级必须换新 ID 才生效；旧 ID 在下方删除
         private const val CHANNEL_ID = "llm_server_v2"
         private const val NOTIF_ID = 1
@@ -40,6 +43,7 @@ class InferenceService : Service() {
     override fun onBind(intent: Intent?): IBinder? = null
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        LlmEngine.probeMark("[服务] onStartCommand action=${intent?.action} startId=$startId boot=$BOOT_ID")
         when (intent?.action) {
             ACTION_STOP -> {
                 // 停止服务 = 关 HTTP + 卸载模型。

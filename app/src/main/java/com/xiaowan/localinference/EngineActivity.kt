@@ -56,6 +56,9 @@ class EngineActivity : Activity() {
     /** HTP（Hexagon NPU）开关与其状态说明。 */
     private lateinit var htpSwitch: android.widget.Switch
     private lateinit var htpHintTv: TextView
+    /** 崩溃探针开关与说明（native 直写日志 + 信号现场，专治「一调工具就闪退」取证） */
+    private lateinit var probeSwitch: android.widget.Switch
+    private lateinit var probeHintTv: TextView
     /** 标题按实际生效后端显示，不再笼统承诺"HTP/OpenCL/CPU 自动"。 */
     private lateinit var backendTitleTv: TextView
     private lateinit var thrEt: EditText
@@ -85,6 +88,10 @@ class EngineActivity : Activity() {
     private lateinit var loadBtn: Button
     private lateinit var genBtn: Button
     private lateinit var serverBtn: Button
+    /** 存活探测：从 App 内真发 HTTP 打 /health，结论写进 probeResultTv。 */
+    private lateinit var probeBtn: Button
+    private lateinit var probeResultTv: TextView
+    @Volatile private var probing = false
     private lateinit var lanCb: android.widget.CheckBox
     private lateinit var thinkCb: android.widget.CheckBox
     private lateinit var flashCb: android.widget.CheckBox
@@ -367,14 +374,28 @@ class EngineActivity : Activity() {
         // (点1): 服务开关是最高频操作，从「本地服务」分组里拿出来常驻可见
         serverBtn = btn("启动服务")
         serverBtn.setOnClickListener { toggleServer() }
-        serverBtn.setPadding(0, px(4), 0, 0)
-        pageSet.addView(serverBtn, ViewGroup.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT,
+        probeBtn = btn("存活探测")
+        probeBtn.setOnClickListener { doProbe() }
+        // 两个按钮同排：探测就是"启动/停止之后紧接着要做的那件事"，
+        // 放到下面的折叠分组里等于把最需要它的场景（服务起不来）藏起来。
+        val srvRow = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
+        srvRow.addView(serverBtn, lp(0, 1)); srvRow.addView(probeBtn, lp(0, 1))
+        pageSet.addView(srvRow, ViewGroup.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT,
             ViewGroup.LayoutParams.WRAP_CONTENT))
         serverTv = TextView(this).apply {
             textSize = 11f; setTextColor(0xFF666666.toInt())
             setPadding(0, px(2), 0, px(2))
         }
         pageSet.addView(serverTv)
+        // 探测结论常驻显示：服务连不上时用户要能反复看这份结论，
+        // 而不是"结果一闪而过，只能靠 Toast 记"。
+        probeResultTv = TextView(this).apply {
+            textSize = 11f; setTextColor(0xFF666666.toInt())
+            setPadding(0, px(2), 0, px(2))
+            setTextIsSelectable(true)   // 结论要能长按复制走（贴给别人/贴进 issue）
+            visibility = View.GONE
+        }
+        pageSet.addView(probeResultTv)
 
         val row0 = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
         val pickBtn = btn("添加模型(.gguf)")
@@ -601,6 +622,33 @@ class EngineActivity : Activity() {
         gridRowF.addView(freqEt, lp(0, 1)); gridRowF.addView(presEt, lp(0, 1))
         listOf(labRowE, gridRowE, labRowF, gridRowF).forEach { addFull(it) }
 
+        // ---- 崩溃探针 ----
+        // 为什么单独摆一个开关：这条链路的闪退此前取证不到 —— 日志回调在 abort 前会丢，
+        // JVM 的 UncaughtExceptionHandler 覆盖不到 native abort，客户端只看到连接被重置。
+        // 打开后 native 侧自己开文件直写全量日志（含原生日志与逐 token 输出），
+        // 信号 handler 会把 SIGSEGV/SIGABRT 的信号号、故障地址、触发时刻写进去。崩完重开 App 一键导出。
+        probeSwitch = android.widget.Switch(this).apply {
+            text = "崩溃探针（诊断用，需重启 App 生效）"
+            textSize = 13f
+            setPadding(0, px(14), 0, px(2))
+            isChecked = LlmEngine.probeEnabled
+        }
+        probeHintTv = label("").apply { setTextColor(0xFF666666.toInt()) }
+        probeSwitch.setOnCheckedChangeListener { _, checked ->
+            if (checked == LlmEngine.probeEnabled) return@setOnCheckedChangeListener
+            LlmEngine.setProbeEnabled(this, checked)
+            applyProbeHint()
+            Toast.makeText(this,
+                if (checked) "已开启，请完全退出并重启 App；复现闪退后重开 App 点「导出崩溃探针」"
+                else "已关闭，重启 App 后恢复常规日志",
+                Toast.LENGTH_LONG).show()
+        }
+        // (点6): 探针整块移到「重复与惩罚」之下、「还原默认设置」之上。
+        // 它是诊断入口，不是常规参数：放在面板内跟参数同构会让人误以为是调参项，
+        // 而紧贴全局操作区又能和"把上面所有分组恢复默认"的语义连起来。
+        pageSet.addView(label("── 崩溃取证（探针）──"))
+        addFull(probeSwitch); addFull(probeHintTv)
+
         // 还原默认设置（同时重置端口与局域网开关）。
         // 它作用于整页所有分组，不是「重复与惩罚」这一组的局部操作，因此打上 UNGROUPED
         // 标记留在面板外：该组默认折叠时按钮依然可见，也不会被"收起全部分组"一起藏掉。
@@ -743,7 +791,46 @@ class EngineActivity : Activity() {
         logRow.addView(logRefreshBtn, lp(0, 1)); logRow.addView(logClearBtn, lp(0, 1))
         logRow.addView(logExportBtn, lp(0, 1)); logRow.addView(logPrevBtn, lp(0, 1))
         pageLog.addView(logRow)
-        val logHint = label("日志已实时写入内部 filesDir/logs/（崩溃也不丢）；上面两个导出按钮输出到公共「下载」目录")
+        // 「导出崩溃探针」单列一行：这是排查 native abort 的主入口，不能和上面四个挤一排。
+        val logProbeRow = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
+        val logProbeBtn = btn("导出崩溃探针")
+        logProbeBtn.setOnClickListener {
+            val native = LlmEngine.probeText()
+            if (native.isBlank() && !LlmEngine.probeEnabled) {
+                Toast.makeText(this, "探针未开启：设置页打开「崩溃探针」后重启 App 再复现", Toast.LENGTH_LONG).show()
+            } else {
+                try {
+                    // 三段合一：native 原始探针（含信号现场最值钱）+ Kotlin 侧本次全文 +
+                    // 上次会话（上一次闪退那一轮就是它）
+                    val body = buildString {
+                        appendLine("==== native 探针（信号现场与全量原生日志）====")
+                        appendLine(native.ifBlank { "(空：进程未挂上探针或本次是首次启动)" })
+                        appendLine()
+                        appendLine("==== Kotlin 侧本次会话全文 ====")
+                        appendLine(LogFileStore.currentText())
+                        appendLine()
+                        appendLine("==== 上次会话（上一次闪退那一轮）====")
+                        appendLine(if (LogFileStore.previousAvailable()) LogFileStore.previousText() else "(无)")
+                        appendLine()
+                        appendLine("==== 环境 ====")
+                        appendLine("device=${LlmEngine.deviceProfile}")
+                        appendLine("backend=${LlmEngine.backendDesc} nativeTag=${LlmEngine.nativeTag}")
+                        appendLine("boot=${InferenceService.BOOT_ID} probeOn=${LlmEngine.probeEnabled} " +
+                                "attached=${LlmEngine.probeAttachedNow}")
+                    }
+                    val stamp = java.text.SimpleDateFormat("yyyyMMdd-HHmmss", java.util.Locale.US)
+                        .format(java.util.Date())
+                    val where = LogExport.saveText(this, "probe-$stamp.txt", body)
+                    Toast.makeText(this, "已导出：$where", Toast.LENGTH_LONG).show()
+                } catch (e: Throwable) {
+                    Toast.makeText(this, "导出失败: ${e.message}", Toast.LENGTH_SHORT).show()
+                }
+            }
+        }
+        logProbeRow.addView(logProbeBtn, lp(0, 1))
+        pageLog.addView(logProbeRow)
+        val logHint = label("日志已实时写入内部 filesDir/logs/（崩溃也不丢）；导出按钮输出到公共「下载」目录。" +
+            "「导出崩溃探针」= native 探针 + 本次会话 + 上次会话，排查 native 闪退只需这一份")
         logHint.setPadding(logHint.paddingLeft, px(6), logHint.paddingRight, 0)
         pageLog.addView(logHint)
         logTv = TextView(this).apply {
@@ -816,7 +903,26 @@ class EngineActivity : Activity() {
         super.onDestroy()
     }
 
+    /** 探针状态一行话：开没开、挂没挂上、文件多大（UI 上直接可判断，不必翻文件） */
+    private fun applyProbeHint() {
+        if (!::probeHintTv.isInitialized) return
+        probeHintTv.text = when {
+            !LlmEngine.probeEnabled ->
+                "关闭中。开启后 native 会自己开文件直写全量日志（含原生日志与逐 token 输出），" +
+                    "并捕获 SIGSEGV/SIGABRT 的信号号/故障地址/触发时刻；崩完重开 App 点「导出崩溃探针」，" +
+                    "把文件发给我即可定位。"
+            else -> {
+                val f = LlmEngine.probeFile
+                val size = f?.let { if (it.exists()) it.length() else 0L } ?: 0L
+                "已开启 ｜ 落盘=${f?.absolutePath ?: "(重启 App 后建立)"} ｜ 当前 ${size / 1024} KB ｜ " +
+                    "native 已挂载=${LlmEngine.probeAttachedNow}"
+            }
+        }
+        probeHintTv.setTextColor(if (LlmEngine.probeEnabled) 0xFFB26A00.toInt() else 0xFF666666.toInt())
+    }
+
     private fun renderLog() {
+        applyProbeHint()
         if (!::logTv.isInitialized) return
         logTv.text = LlmEngine.recentLogs().takeLast(120).joinToString("\n")
     }
@@ -1059,6 +1165,7 @@ class EngineActivity : Activity() {
         loadBtn.isEnabled = false
         genBtn.isEnabled = false
         serverBtn.isEnabled = false
+        probeBtn.isEnabled = false
         modelTv.text = "开始导入…"
         statusTv.text = "导入模型中…"
         ioExecutor.execute {
@@ -1084,6 +1191,7 @@ class EngineActivity : Activity() {
                     loadBtn.isEnabled = true
                     genBtn.isEnabled = true
                     serverBtn.isEnabled = true
+                    probeBtn.isEnabled = true
                 }
             }
         }
@@ -1415,6 +1523,68 @@ class EngineActivity : Activity() {
         }
     }
 
+    /**
+     * 存活探测：真发一次 GET /health，把结论写进 probeResultTv。
+     *
+     * 刻意**不**先看 HttpApi.isRunning 就短路成"服务没启动"：那个标志位只代表
+     * 本进程自认为在监听，而探测要回答的正是"端口到底通不通"。反过来也一样——
+     * 服务未启动时照发，拿到"连接被拒绝"也是一条明确结论（比一句"请先启动服务"更有用，
+     * 因为它同时证明了端口是空的）。唯一的例外是地址绑定：局域网关闭时服务只绑回环，
+     * 探测必须打 127.0.0.1，否则用户会看到"局域网 IP 不通"这种误导性结论。
+     */
+    private fun doProbe() {
+        if (probing) return   // 连点不叠加：并发探测会互相覆盖结论
+        probing = true
+        probeBtn.isEnabled = false
+        val port = portEt.text.toString().toIntOrNull()?.takeIf { it in 1024..65535 }
+            ?: ModelStore.serverPort(this)
+        // 端口框与已运行服务可能不一致（改过没重启），先如实说明用的是哪个端口，
+        // 免得用户对着"不通"的结论怀疑服务，实际只是探测了另一个端口。
+        val runningPort = HttpApi.PORT
+        val live = HttpApi.isRunning
+        val host = if (live && HttpApi.bindAll) (HttpApi.lanIp() ?: "127.0.0.1") else "127.0.0.1"
+        val probePort = if (live) runningPort else port
+        probeResultTv.visibility = View.VISIBLE
+        probeResultTv.setTextColor(0xFF666666.toInt())
+        probeResultTv.text = "探测中… GET http://$host:$probePort/health"
+        LlmEngine.probeMark("[探测] 开始 GET /health host=$host port=$probePort " +
+            "服务自报运行中=$live(端口=$runningPort) 端口框=$port")
+
+        Thread {
+            val r = HealthCheck.probe(host, probePort)
+            val v = HealthCheck.verdict(r)
+            val report = buildString {
+                append(HealthCheck.format(r, host, probePort))
+                // 端口框与探测端口不一致时补一句怎么办，避免用户只看到"不通"两个字
+                if (probePort != port) {
+                    append("\n⚠ 探测的是运行中服务的端口 $probePort；端口框里是 $port（改动需重启服务生效）")
+                }
+            }
+            ui.post {
+                probing = false
+                probeBtn.isEnabled = true
+                probeResultTv.text = report
+                probeResultTv.setTextColor(when (v) {
+                    HealthCheck.Verdict.ALIVE -> 0xFF1B7F3B.toInt()
+                    HealthCheck.Verdict.DEGRADED -> 0xFFB26A00.toInt()
+                    HealthCheck.Verdict.UNREACHABLE -> 0xFFC62828.toInt()
+                })
+                // 探测结论不只在设置页留着，聊天页状态栏也同步一份——
+                // 用户此时通常正拿着另一台设备连不上，想立刻看到结论。
+                statusTv.text = report.lineSequence().first()
+                renderLog()
+            }
+            // 探测结果本身也进日志：探针模式抓 native 闪退时，
+            // "崩之前 /health 是活是死"是区分"服务假活"与"真崩"的关键一行。
+            LlmEngine.probeMark("[探测] 结果 $v http=${r.httpCode} status=${r.status} " +
+                "model_loaded=${r.modelLoaded} busy=${r.busy} ms=${r.elapsedMs} " +
+                "err=${r.transportError ?: "-"}")
+            LlmEngine.uiLog("[探测] $v http=${r.httpCode ?: "-"} status=${r.status ?: "-"} " +
+                "模型已加载=${r.modelLoaded ?: "-"} 耗时=${r.elapsedMs}ms" +
+                (r.transportError?.let { " 原因=$it" } ?: ""))
+        }.apply { name = "health-probe"; isDaemon = true }.start()
+    }
+
     private fun startServerPoll() {
         pollRunning = true
         val r = object : Runnable {
@@ -1431,6 +1601,16 @@ class EngineActivity : Activity() {
                 } else {
                     serverBtn.text = "启动服务"
                     serverTv.text = if (LlmEngine.hasModel) "服务未运行（已加载模型，启动后直接挂载）" else "服务未运行"
+                    // 服务停了，上一次探测的结论就过期了——留着会让"服务运行中"与
+                    // "✅存活"同屏出现，比不显示更糟。数据保留（不 clear），只改标题行。
+                    if (probeResultTv.visibility == View.VISIBLE &&
+                        probeResultTv.text.startsWith("✅")
+                    ) {
+                        // 只有"结论是存活"的这一份需要作废；❌/⚠ 本来就还是在说问题，
+                        // 服务停了它们只会更准确，不必改。
+                        probeResultTv.text = probeResultTv.text
+                            .replaceFirst(Regex("^✅ 存活"), "⬜ 已过期（服务已停止）")
+                    }
                 }
                 ui.postDelayed(this, 1500)
             }
@@ -1499,15 +1679,27 @@ class EngineActivity : Activity() {
         ui.removeCallbacks(hangWatch)
         ui.postDelayed(hangWatch, 5000)
         val t0 = System.currentTimeMillis()
-        val maxTok = maxEt.text.toString().toIntOrNull() ?: 512
-        val temp = tempEt.text.toString().toFloatOrNull() ?: 0.8f
-        val topK = topKEt.text.toString().toIntOrNull() ?: 0
-        val repPen = repEt.text.toString().toFloatOrNull() ?: 1f
-        val repN = repeatLastNEt.text.toString().toIntOrNull() ?: 64
-        val topP = topPEt.text.toString().toFloatOrNull() ?: 0.95f
-        val minP = minPEt.text.toString().toFloatOrNull() ?: 0f
-        val presPen = presEt.text.toString().toFloatOrNull() ?: 0f
-        val freqPen = freqEt.text.toString().toFloatOrNull() ?: 0f
+        // 参数区的解析 / 校验复用 SamplingParams：与 HTTP 入口同一套规则，默认值只有一处。
+        // 此前 UI 侧解析失败一律“回落到默认值”，用户把 temperature 打成 1.5.0 只会静默按 0.8 跑。
+        val (sp, spErr) = SamplingParams.fromRequest(JSONObject().apply {
+            put("temperature", tempEt.text.toString().trim())
+            put("top_p", topPEt.text.toString().trim())
+            put("min_p", minPEt.text.toString().trim())
+            put("top_k", topKEt.text.toString().trim())
+            put("repeat_penalty", repEt.text.toString().trim())
+            put("repeat_last_n", repeatLastNEt.text.toString().trim())
+            put("frequency_penalty", freqEt.text.toString().trim())
+            put("presence_penalty", presEt.text.toString().trim())
+            put("max_tokens", maxEt.text.toString().trim())
+        })
+        if (sp == null) {
+            val msg = spErr ?: "采样参数非法"
+            statusTv.text = msg
+            Toast.makeText(this@EngineActivity, msg, Toast.LENGTH_SHORT).show()
+            ui.removeCallbacks(hangWatch) // 校验失败提前 return，别把卡死看门狗留着
+            return
+        }
+        val maxTok = sp.maxTokens
 
         Thread {
             var n = 0
@@ -1521,9 +1713,9 @@ class EngineActivity : Activity() {
                         LlmEngine.chatTemplate().contains("enable_thinking")) {
                         prompt = prompt + "<think>\n\n</think>\n\n"  // 追加在末尾（紧贴assistant生成后缀），置于开头会诱导模型模仿输出空think块
                     }
-                    LlmEngine.newSampler(temp, topP, minP, topK = topK,
-                        repPenalty = repPen, penaltyN = repN, freqPenalty = freqPen,
-                        presencePenalty = presPen)
+                    LlmEngine.newSampler(sp.temp, sp.topP, sp.minP, seed = sp.seed,
+                        topK = sp.topK, repPenalty = sp.repeatPenalty, penaltyN = sp.repeatLastN,
+                        freqPenalty = sp.freqPenalty, presencePenalty = sp.presencePenalty)
                     val err = LlmEngine.startCompletion(prompt, maxTok)
                     if (err != null) {
                         errd = true

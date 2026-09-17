@@ -20,3 +20,13 @@ crash_last.txt
 
 # Python 字节码（py_compile / import 产生）
 __pycache__/
+
+# 本地工具链（kotlinc / JDK / android.jar，供 scripts/kt_check.sh 与
+# tools/run_sampling_tests.sh 离线使用）。体积上百 MB，按需下载，不入库。
+.omnibot/
+
+# qemu-user 崩溃时产生的 core（ABI 验证用，不入库）
+*.core
+
+# Gradle/CMake 本地构建中间产物
+.cxx/

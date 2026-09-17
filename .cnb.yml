@@ -1,0 +1,56 @@
+$:
+  api_trigger_abicheck2:
+    - docker:
+        image: mingc/android-build-box:latest
+      stages:
+        - name: 编 APK + 产物内 ABI 自检 + 存档
+          script: |
+            set -e
+            echo "=== sha ==="; git rev-parse HEAD
+
+            if ! command -v gradle >/dev/null; then
+              curl -sSL -o /tmp/gradle.zip https://services.gradle.org/distributions/gradle-8.10.2-bin.zip
+              unzip -q /tmp/gradle.zip -d /opt
+              export PATH="/opt/gradle-8.10.2/bin:$PATH"
+            fi
+            gradle --version | head -3
+
+            echo "=== vendor 库 STL 阵营扫描（ABI 前提）==="
+            python3 tools/check_abi.py vendor/cui-llama.rn-v1.12.2/arm64-v8a/librnllama.so
+
+            echo "=== ABI 守卫单测 ==="; sh tools/run_abi_tests.sh
+            echo "=== string 布局判据单测 ==="; sh tools/run_string_layout_tests.sh
+            echo "=== 探针单测 ==="; sh tools/run_probe_tests.sh
+            echo "=== 存活探测单测 ==="; sh tools/run_health_tests.sh
+
+            echo "=== 编 APK ==="
+            export ANDROID_HOME=/opt/android-sdk
+            export ANDROID_SDK_ROOT=/opt/android-sdk
+            gradle :app:assembleDebug --no-daemon
+
+            APK=app/build/outputs/apk/debug/app-debug.apk
+            ls -l $APK
+
+            echo "=== 每个 llmjni 变体的 STL 阵营（期望 __ndk1>0 且 __cxx11=0）==="
+            for v in base dotprod i8mm hexagon; do
+              unzip -o -q $APK lib/arm64-v8a/libllmjni_$v.so -d /tmp/x
+              printf "llmjni_%s: " $v
+              python3 tools/check_abi.py /tmp/x/lib/arm64-v8a/libllmjni_$v.so
+            done
+
+            echo "=== 产物内自检 ==="
+            unzip -o -q $APK lib/arm64-v8a/libllmjni_base.so -d /tmp/y
+            SO=/tmp/y/lib/arm64-v8a/libllmjni_base.so
+            # 注意：ABI 自检的提示文案是 snprintf 的格式串，strings 只能查到格式串骨架，
+            # 不要拿完整句子来 grep（上一版就是因此误报 MISS）。
+            for s in nativeProbeInit nativeProbeMark "common_chat_templates_apply" \
+                     "self-check failed" "abi] "; do
+              if strings $SO | grep -qF "$s"; then echo "  OK   $s"; else echo "  MISS $s"; fi
+            done
+            if strings $SO | grep -q "__cxx11"; then echo "  !! 出现 __cxx11，ABI 混用"; exit 1; else echo "  OK   无 __cxx11"; fi
+
+            echo "=== 存档 APK 到 CNB 构建产物 ==="
+            mkdir -p /workspace/dist
+            cp $APK /workspace/dist/app-debug.apk
+            sha256sum /workspace/dist/app-debug.apk
+            ls -l /workspace/dist/
