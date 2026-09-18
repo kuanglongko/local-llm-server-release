@@ -10,7 +10,8 @@ Android 手机上**完全离线**的 GGUF 大模型推理 App：在应用进程�
 - **图形界面**：模型库（列表/别名/卸载）、多会话聊天、参数区、本地服务开关与**存活探测**、日志与导出
 - **HTTP 接口**：`/health`、`/v1/models`、`/v1/chat/completions`（支持 `stream`）、`/v1/completions`
 - **可调参数**：`n_ctx`、线程数、`parallel`、`batch/ubatch`、top_k / top_p / min_p、
-  repeat / frequency / presence penalty、Flash Attention、KV cache 量化（`type_k`/`type_v`）、mmap 开关、禁用思考块
+  repeat / frequency / presence penalty、Flash Attention、KV cache 量化（`type_k`/`type_v`）、mmap 开关、
+  **默认关闭思考**（App 内聊天与 HTTP 接口共用同一套软开关）
 - **推理后端**：CPU（按指令集选 4 个预编译变体）+ OpenCL GPU + **Hexagon NPU（HTP，实验性，默认关闭）**
 - **可取证**：Java 异常落 `crash_last.txt`；native stderr 实时并入会话日志，崩前最后几行不丢；
   可选「崩溃探针」把 native 日志与信号现场**不经 JVM** 直写文件，native 闪退也能导出完整现场
@@ -101,8 +102,48 @@ curl -s http://<手机IP>:<端口>/v1/chat/completions \
   那属于 UB，会让进程直接 `std::terminate`，表现为「客户端一调工具，服务端 App 闪退」。
   调用前还会先确认模板确实生成了解析器（`cp.parser` 非空），
   拦掉 abort 一类 `catch` 抓不到的路径；模型输出不匹配工具语法按纯文本正常返回。
+- **工具标记必须完整解码**：`<function` / `<param` / `</param>` / `</function>`
+  这类标记在模型词表里是 **special token**，解码时必须文本化
+  （`llama_token_to_piece` 的 `special=true`）。否则它们不进解码文本，
+  解析端永远匹配不上，表现为「接口 200 但 `tool_calls` 恒为空」且**不报任何错**。
+  详见 [HTP-STATUS.md](HTP-STATUS.md)。
 - 带 `tools` 的流式请求会**整段生成完再下发**（工具语法与正文同处一条流，
   边生成边发会把 `<tool_call>` 之类的标记当正文吐出去），因此首字延迟等于整段生成时间。
+
+### 默认关闭思考（App 内聊天 + HTTP 接口）
+
+设置页「默认关闭思考」是一个**软开关**：它不去改模型参数，而是往渲染好的 prompt 里
+补一段闭合的 think 段，替模型"预填"掉思考，让生成直接从正文开始。
+
+四点必须写清楚，否则很容易改错：
+
+- **生效判据看的是"模型会不会先想一段"，不是"模板里有没有 `enable_thinking`"**。
+  两者不是一回事：
+  - Qwen3 / SmolLM3：模板里有 `enable_thinking` 变量，开启思考时生成后缀是
+    `<|im_start|>assistant\n`，思考段由模型自己吐 `<think>`。靠"预填闭合块"压掉。
+  - LFM2.5：模板里**没有**这个变量，参数关不掉；但它的生成后缀**硬编码**就是
+    `<|im_start|>assistant\n<think>\n`。这里才是软开关真正必要的地方，
+    判据必须能从**渲染结果**里认出这个后缀。
+  - Gemma / Qwen-Instruct：既无变量、后缀也不带思考标记 -> **不注入**，
+    否则只会多出一对标签被当正文吐出来。
+
+  判据 = 模板含 `enable_thinking` **或** 渲染结果的生成后缀自带未闭合的 `<think>`。
+
+- **注入位置在 assistant 生成后缀之后**，不在 prompt 开头。放开头等于给了模型一个
+  "先输出 `<think>`"的范例，它会照抄一遍——表现就是"设了关闭思考，模型还是先想一段"。
+
+- **后缀已经吐了 `<think>` 时不能再补一个开标签**。LFM2.5 的关法是"把那个开标签闭合掉"：
+  插在最后一个 `<think>` 之后只补 `\n\n</think>\n\n`。若照旧在末尾追加整块
+  `<think>\n\n</think>\n\n`，会多出一个开标签、最早那个永不闭合，
+  整段回答被 think 状态机当思考段吞掉（表现为**回答为空**）。
+  对后缀不含 `<think>` 的模板（Qwen3）插入位置就是末尾，与既有行为逐字节相同。
+
+- **App 内聊天与 HTTP 接口共用同一份实现**（`ThinkingControl`），且两处生效判定都必须
+  传入渲染结果。请求侧覆盖优先级：`enable_thinking` >
+  `chat_template_kwargs.enable_thinking` > `reasoning_effort`（`none` 视为关）> 全局默认。
+
+以上由离线单测 `tools/run_thinking_tests.sh` 钉住，含"两条路径必须共用同一实现"、
+"生效判定必须传入渲染结果"的源码级断言。
 
 ## 支持的后端与机型
 
@@ -161,11 +202,22 @@ curl -s http://<手机IP>:<端口>/v1/chat/completions \
   `:app:assembleDebug`，artifact `apk-debug`。
 - 本地：Android Studio 或自备 Gradle 8.10.2（仓库不含 wrapper）。`compileSdk 35` / `minSdk 26` /
   `targetSdk 28` / AGP 8.7.3 / Kotlin 2.0.21 / C++17 / `ANDROID_STL=c++_static`。
-- 没有 NDK 也能做真实类型检查：`bash scripts/kt_check.sh`（15 个 `.kt`，用缓存的 kotlinc + android-35 桩）。
+- 没有 NDK 也能做真实类型检查：`bash scripts/kt_check.sh`（17 个 `.kt`，用缓存的 kotlinc + android-35 桩）。
 - 不装机、不下载模型也能跑的离线单测：
   `tools/run_sampling_tests.sh`（采样参数默认值/校验/链顺序）、
+  `tools/run_thinking_tests.sh`（思考开关：**生效判据**——模板无 `enable_thinking`
+  但后缀带 `<think>` 时必须注入、注入后**只剩一个** `<think>` 且被闭合、
+  没有思考段的模板不得注入、注入位置、请求参数覆盖优先级，以及 HTTP 与 App 内聊天
+  **必须共用同一份实现**并且**生效判定必须传入渲染结果**）、
   `tools/run_tool_call_tests.sh`（工具调用的请求解析与 OpenAI 线上响应形状，
   含 `arguments` 内嵌 JSON 的转义、并行调用的 index/id、模板一致性与解析失败兜底）、
+  `tools/run_parse_parser_tests.sh`（工具解析链路的四条成因：PEG 必须 load、
+  `add_generation_prompt` 两侧同源、`generation_prompt` 形状须等于 PEG 根节点字面量、
+  解码必须文本化 special token）、
+  `tools/run_generation_prompt_tests.py`（用真 MiniCPM5 模板复核
+  `content_len - text_len = 8` 的数值来源与「解码丢标记」的残骸形状）、
+  `tools/fetch_upstream_chat_cpp.sh`（拉上游 `common/chat.cpp` 并打印本轮结论所依赖的
+  五处实现，供人工复核——解析语义不在本仓库源码内，在 `vendor/` 预编译库里）、
   `tools/run_chat_buffer_tests.sh`（模板渲染缓冲区的边界语义，用 guard page 抓越界读）、
   `tools/run_probe_tests.sh`（崩溃探针的硬约束：fd 直写、handler 递归保护与链式转发、
   自举不依赖 JVM 调用、入参 `on=false` 时仍能真正关掉、探针关闭时零开销）、

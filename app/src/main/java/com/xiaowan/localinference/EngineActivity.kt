@@ -99,9 +99,14 @@ class EngineActivity : Activity() {
     private lateinit var serverTv: TextView
     private lateinit var listContainer: LinearLayout
     private lateinit var rootScroll: ScrollView
+    private lateinit var logTrimTv: TextView
     // ---- tab 吸顶 + 三页左右滑动 + 设置页分组折叠 ----
     private var curTab = 1
     private val pageScrollY = IntArray(3)
+    /** 日志页「跟随新行」开关：切到日志页时置位，用户一上滑即清除（与聊天页 autoFollowChat 同义）。 */
+    private var logFollowBottom = true
+    private var logLastTotal = -1
+    private var logLastTrimmed = -1
     private var selectTabFn: ((Int) -> Unit)? = null
     private lateinit var swipeDetector: GestureDetector
     private val sectionBodies = ArrayList<Triple<TextView, LinearLayout, String>>()
@@ -152,6 +157,13 @@ class EngineActivity : Activity() {
         val c = rootScroll.getChildAt(0)
         return c.bottom - (rootScroll.scrollY + rootScroll.height) <= px(32)
     }
+
+    /**
+     * 当前是否贴底（与 chatAtBottom 同一判据，日志页复用；留名是为了调用处可读）。
+     * 命名带 is 前缀：这里只表达「是否贴底」这一判断，不能与 [logFollowBottom] 这类标志位同名，
+     * 否则调用处 `logFollowBottom = logAtBottom()` 会被读成赋值给一个只读判断（编译期直接报错）。
+     */
+    private fun isLogAtBottom(): Boolean = chatAtBottom()
 
     private fun paintSection(head: TextView, title: String, open: Boolean) {
         head.text = (if (open) "▼ " else "▶ ") + title +
@@ -325,9 +337,12 @@ class EngineActivity : Activity() {
             pageChat.visibility = if (i == 0) View.VISIBLE else View.GONE
             pageSet.visibility = if (i == 1) View.VISIBLE else View.GONE
             pageLog.visibility = if (i == 2) View.VISIBLE else View.GONE
-            if (i == 2) renderLog()
+            if (i == 2) { renderLog(); logFollowBottom = true }
             if (::chatBar.isInitialized) chatBar.visibility = if (i == 0) View.VISIBLE else View.GONE
+            // 聊天页与日志页都默认贴底：日志页贴底后，新追加的行自然出现在窗口里，
+            // 不需要用户手动往下滑（切走再切回时用上一页位置，所以这里强制贴底一次）。
             if (i == 0) { autoFollowChat = true; rootScroll.post { followChatBottom() } }
+            else if (i == 2) { rootScroll.post { followLogBottom() } }
             else { val y = pageScrollY[i]; rootScroll.post { rootScroll.scrollTo(0, y) } }
         }
         chatTabBtn.setOnClickListener { selectTab(0) }
@@ -833,6 +848,17 @@ class EngineActivity : Activity() {
             "「导出崩溃探针」= native 探针 + 本次会话 + 上次会话，排查 native 闪退只需这一份")
         logHint.setPadding(logHint.paddingLeft, px(6), logHint.paddingRight, 0)
         pageLog.addView(logHint)
+        // 截断说明：默认不可见。日志页只渲染最近若干行，若 ring 里还有更早的行，
+        // 这里如实说明「显示了多少、被截掉多少、完整日志去哪儿取」——
+        // 页面上一行模型信息都没有（见 renderBackendState 的实测层分布）时，
+        // 至少能一眼判断是"没渲染到"而不是"引擎没打这行"。
+        logTrimTv = TextView(this).apply {
+            textSize = 10f; setTextColor(0xFFB26A00.toInt())
+            setPadding(0, px(2), 0, px(2))
+            setTextIsSelectable(true)
+            visibility = View.GONE
+        }
+        pageLog.addView(logTrimTv)
         logTv = TextView(this).apply {
             textSize = 10f; setTextColor(0xFF888888.toInt())
             typeface = Typeface.MONOSPACE
@@ -854,6 +880,10 @@ class EngineActivity : Activity() {
         // 用户上滑翻看历史时暂停跟随，回到底部自动恢复；布局变化（键盘挤压）后补一次跟随
         rootScroll.setOnScrollChangeListener { _: View, _: Int, _: Int, _: Int, _: Int ->
             autoFollowChat = chatAtBottom()
+            // 日志页同理：用户上滑查看历史后停止跟随，回到底部后自动恢复跟随。
+            // 判据用「是否贴底」而不是「位移方向」——恢复跟随必须是显式回到最底，
+            // 否则往下滑一点点就又开始被拽，比不跟随更难用。
+            if (curTab == 2) logFollowBottom = isLogAtBottom()
         }
         rootScroll.addOnLayoutChangeListener { _: View, _: Int, _: Int, _: Int, bottom: Int,
                                                  _: Int, _: Int, _: Int, _: Int ->
@@ -924,7 +954,35 @@ class EngineActivity : Activity() {
     private fun renderLog() {
         applyProbeHint()
         if (!::logTv.isInitialized) return
-        logTv.text = LlmEngine.recentLogs().takeLast(120).joinToString("\n")
+        val lines = LlmEngine.recentLogs()
+        val total = lines.size
+        val shown = minOf(total, LOG_VIEW_LINES)
+        logTv.text = lines.takeLast(shown).joinToString("\n")
+        if (curTab != 2) return
+        val trimmed = total - shown
+        if (logLastTotal != total || logLastTrimmed != trimmed) {
+            // 截断说明单独一行，且在滑动容器内、不随日志内容一起滚动（页头常驻）。
+            logTrimTv.visibility = if (trimmed > 0) View.VISIBLE else View.GONE
+            if (trimmed > 0)
+                logTrimTv.text = "仅显示最近 $shown 行（更早的 $trimmed 行已滚出窗口；" +
+                    "要完整日志请用上方「导出」）"
+            logLastTotal = total; logLastTrimmed = trimmed
+        }
+        // 与聊天页同样只跟随「用户本来就在底部」的情形：上滑查看历史时不许被拽回底部。
+        // 注意 ring 是 2000 行、这里只渲染最近 120 行，所以「贴底」判据不能用控件高度——
+        // 用 once-once 标志：切到日志页时置位，用户一上滑即清除。
+        if (logFollowBottom) rootScroll.post { followLogBottom() }
+    }
+
+    /**
+     * 日志页贴底。渲染完立刻 post，依赖的是同一个 measure/layout 周期，
+     * 因此不必等下一帧（日志风暴下来回等待会明显滞后）。
+     */
+    private fun followLogBottom() {
+        if (curTab != 2 || !logFollowBottom) return
+        if (!::rootScroll.isInitialized || rootScroll.childCount == 0) return
+        val c = rootScroll.getChildAt(0)
+        rootScroll.scrollTo(0, (c.bottom - rootScroll.height).coerceAtLeast(0))
     }
 
     // ---- 模型库 ----
@@ -1708,11 +1766,17 @@ class EngineActivity : Activity() {
             val sb = StringBuilder()
             try {
                 synchronized(LlmEngine.genLock) {
-                    var prompt = LlmEngine.applyChatTemplate(messages, addAss = true)
-                    if (ModelStore.disableThinking(this@EngineActivity) &&
-                        LlmEngine.chatTemplate().contains("enable_thinking")) {
-                        prompt = prompt + "<think>\n\n</think>\n\n"  // 追加在末尾（紧贴assistant生成后缀），置于开头会诱导模型模仿输出空think块
-                    }
+                    // 思考开关与 HTTP 入口同一套实现（ThinkingControl），此处不再自己拼字符串。
+                    // 判定必须带上渲染结果：LFM2.5 这类模型的"思考开"是模板后缀硬编码的
+                    // （模板里没有 enable_thinking 变量），只看模板原文判不出来。
+                    val chatTemplate = LlmEngine.chatTemplate()
+                    val thinkingOn = !ModelStore.disableThinking(this@EngineActivity)
+                    val rendered = LlmEngine.applyChatTemplate(messages, addAss = true)
+                    val soft = ThinkingControl.softSwitchApplies(thinkingOn, chatTemplate, rendered)
+                    var prompt = if (soft) ThinkingControl.applyToPrompt(rendered, thinkingOn, chatTemplate)
+                                 else rendered
+                    LlmEngine.uiLog("[聊天] 思考=" + (if (thinkingOn) "开" else "关") +
+                            "软开关=" + (if (soft) "已注入空 think 块" else "不适用"))
                     LlmEngine.newSampler(sp.temp, sp.topP, sp.minP, seed = sp.seed,
                         topK = sp.topK, repPenalty = sp.repeatPenalty, penaltyN = sp.repeatLastN,
                         freqPenalty = sp.freqPenalty, presencePenalty = sp.presencePenalty)
@@ -1797,6 +1861,13 @@ class EngineActivity : Activity() {
 
     companion object {
         private const val REQ_PICK = 42
+
+        /**
+         * 日志页一次渲染多少行。ring 有 2000 行，一次全塞进 TextView 会让主线程排版明显变慢，
+         * 而日志页默认贴底、用户关心的是**最新**那些行（探针摘要就在尾部）。
+         * 被截掉的旧行不静默丢弃：页头有「仅显示最近 N 行」的说明，完整日志走导出。
+         */
+        private const val LOG_VIEW_LINES = 120
         private const val REQ_STORE = 43
         private const val HANG_SEC = 30L
     }

@@ -592,6 +592,30 @@ object LlmEngine {
         }
     }
 
+    /**
+     * 串行化所有「动模型状态」的操作（加载 / 卸载 / 换模型）。
+     *
+     * 为什么非要它：0.9.70 那次「初次安装后乱码」的日志里，同一个进程里
+     * `>> loadModel` 出现了 **两次**，分别来自 tid=8596 与 tid=8695，间隔 4 秒、
+     * 各自都跑满了约 24 秒，两条 `<< loadModel` 才前后脚返回。
+     * 之后那一轮生成 300 token 全是词表碎片（` patribora@akar站©站站()||]>=...`），
+     * 且**正好卡在 max_tokens 上限**〔n=300＝max_tokens〕——典型的长出垃圾然后撞上限。
+     * 卸载再重新加载（只剩一条 loadModel）后，同一个模型、同一个请求立刻正常。
+     *
+     * 结论：这不是模型/解码器坏了，是**两个加载同时动同一份 native 状态**。
+     * 加载耗时 20 秒以上，而 UI 早把「加载模型」按钮重新置灰前的窗口、服务启动时的
+     * 自动挂载、切后台回来后的恢复，都可能在同一时刻各提一次加载。
+     *
+     * 互斥只保护「状态迁移」，不防抖（不合并请求）：后到的请求排队执行，
+     * 语义仍是"最后调用的那次生效"。这样既不会并发，也不会把用户的加载请求悄悄吞掉——
+     * 吞掉请求会让界面显示"已加载"而 native 里其实还是旧模型，比并发更难查。
+     */
+    private val loadLock = Any()
+
+    /** 正在加载中：用于 UI 与日志判据（日志里必须能一眼看出"已有一次加载在跑"）。 */
+    @Volatile var loadInFlight: Boolean = false
+        private set
+
     /** 加载 GGUF 模型并建上下文。返回错误信息，null=成功。 */
     fun loadModel(
         path: String,
@@ -605,6 +629,30 @@ object LlmEngine {
         parallelN: Int = 0,
         batchSize: Int = 0,
         ubatchSize: Int = 0
+    ): String? = synchronized(loadLock) {
+        if (loadInFlight) uiLog("[加载] 已有一次加载在进行中，本次排队等待其结束（并发加载会把 native 状态弄脏，见 loadLock 注释）")
+        loadInFlight = true
+        try {
+            loadModelLocked(path, nGpuLayers, nCtx, nThreads, flashAttn, useMmap,
+                cacheK, cacheV, parallelN, batchSize, ubatchSize)
+        } finally {
+            loadInFlight = false
+        }
+    }
+
+    /** [loadModel] 的实体；调用方已持有 [loadLock]，这里不再加锁（避免重入与锁序问题）。 */
+    private fun loadModelLocked(
+        path: String,
+        nGpuLayers: Int,
+        nCtx: Int,
+        nThreads: Int,
+        flashAttn: Boolean,
+        useMmap: Boolean,
+        cacheK: Int,
+        cacheV: Int,
+        parallelN: Int,
+        batchSize: Int,
+        ubatchSize: Int
     ): String? {
         // 未初始化不再抛 IllegalStateException（后台线程未捕获 → 整机闪退），
         // 改为自动重试 init，仍失败则把原因作为错误字符串返回给 UI 显示。
@@ -731,13 +779,16 @@ object LlmEngine {
      * 语法随模板变化（Qwen 的 `<tool_call>`、Llama 的 `[TOOL_CALLS]` 等），
      * 由 native 侧 `common_chat_parse` 按模板归一，Kotlin 侧不做正则猜测。
      */
-    fun parseToolCalls(text: String, toolsJson: String): Pair<String, String?>? {
+    fun parseToolCalls(text: String, toolsJson: String, addAss: Boolean = true): Pair<String, String?>? {
         if (text.isEmpty()) return null
         val tmpl = chatTemplate()
         probeMark("[工具] 即将调用 nativeParseToolCalls：text_len=${text.length} " +
-                "tools_len=${toolsJson.length} tmpl_len=${tmpl.length} " +
+                "tools_len=${toolsJson.length} tmpl_len=${tmpl.length} add_ass=${addAss} " +
                 "text_head=${text.take(200).replace("\n", "\\n")}")
-        val raw = try { nativeParseToolCalls(text, toolsJson, tmpl) } catch (t: Throwable) {
+        // addAss 必须与**渲染时**同一个值：解析器是按模板推导的 PEG，而 cp.generation_prompt
+        // （会被 common_chat_parse 前拼到输入上、进而决定 PEG 根节点能否匹配）随
+        // add_generation_prompt 变化。两边不一致 = 根节点前缀对不上 = tool_calls 恒为 0。
+        val raw = try { nativeParseToolCalls(text, toolsJson, tmpl, addAss) } catch (t: Throwable) {
             probeMark("[工具] nativeParseToolCalls 抛出异常：${t.javaClass.name}: ${t.message}")
             uiLog("[工具] 解析失败：${t.message}")
             null
@@ -816,9 +867,9 @@ object LlmEngine {
     /** 中断当前生成（下一次 step 返回 null）。 */
     fun abort() = nativeAbort()
 
-    /** 释放采样器/上下文/模型。 */
-    fun unload() {
-        if (!loaded) return
+    /** 释放采样器/上下文/模型。与 [loadModel] 共用同一把锁：卸载与加载交错同样会污染 native 状态。 */
+    fun unload() = synchronized(loadLock) {
+        if (!loaded) return@synchronized
         genActive = false   // 换模型/卸载时复位，避免旧计数串进下一轮
         nativeFreeSampler()
         nativeUnloadModel()
@@ -863,7 +914,8 @@ object LlmEngine {
      *
      * 必须传入**渲染时的同一个模板**：解析器是按模板推导出的 PEG，两边不一致会解析错。
      */
-    @JvmStatic private external fun nativeParseToolCalls(text: String, toolsJson: String?, tmpl: String): String
+    @JvmStatic private external fun nativeParseToolCalls(
+        text: String, toolsJson: String?, tmpl: String, addAss: Boolean): String
     @JvmStatic private external fun nativeNewSampler(temp: Float, topP: Float, minP: Float, topK: Int, repPenalty: Float, penaltyN: Int, freqPenalty: Float, presencePenalty: Float, seed: Long): Boolean
     @JvmStatic private external fun nativeStartCompletion(prompt: String, maxTokens: Int): Boolean
     @JvmStatic private external fun nativeStep(): String?

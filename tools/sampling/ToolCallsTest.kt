@@ -130,13 +130,35 @@ fun main() {
     // 解析器是按模板推导出的 PEG，两边模板不一致（App 里选了自定义模板、
     // 解析时却让 chat 层自选内置）会解析错甚至触发 native 断言。
     // nativeParseToolCalls 的第三个参数就是为此存在，这里钉住调用方必须传模板。
+    val cpp = java.io.File("app/src/main/cpp/llama_jni.cpp").readText()
+    // 只取 parseToolCallsImpl 的函数体：渲染路径同样有 add_generation_prompt，不能误命中
+    fun cppParse(): String {
+        val start = cpp.indexOf("static jstring parseToolCallsImpl")
+        return if (start < 0) "" else cpp.substring(start)
+    }
     val src = java.io.File("app/src/main/java/com/xiaowan/localinference/LlmEngine.kt").readText()
     c3("nativeParseToolCalls 带 tmpl 形参（模板一致性）",
-        src.contains("nativeParseToolCalls(text: String, toolsJson: String?, tmpl: String)"))
+        src.contains("text: String, toolsJson: String?, tmpl: String, addAss: Boolean"))
     // 形参名会随探针埋点调整，但"必须传模板变量、不能就地再取一次"这条语义不能松：
     // 渲染与解析之间若重新取一次模板，两边可能取到不同结果。
     c3("parseToolCalls 调用时把模板变量传进去",
-        src.contains("nativeParseToolCalls(text, toolsJson, tmpl)"))
+        src.contains("nativeParseToolCalls(text, toolsJson, tmpl, addAss)"))
+
+    // ---- add_generation_prompt 一致性：这是 tool_calls 恒为 0 的第二条真因 ----
+    // cp.generation_prompt（会被 common_chat_parse 前拼到输入上、决定 PEG 根节点能否匹配）
+    // 随 add_generation_prompt 变化。解析侧以前写死 false、渲染侧传 true，
+    // 于是解析侧算出的前缀是 "<|im_start|>assistant\n<think>\n"（30B），
+    // 而 PEG 根节点要的是 "<|im_start|>assistant\n"（22B），差的 8B 正是 "<think>\n"
+    // —— 与真机日志 content_len - text_len = 8 精确吻合，根节点一上来就匹配不上。
+    // 下面四条钉死"两边必须同源、且不得再写死"。
+    c3("parseToolCalls 把 addAss 透传进 native",
+        src.contains("nativeParseToolCalls(text, toolsJson, tmpl, addAss)"))
+    c3("parseToolCalls 对 addAss 有默认值且与渲染侧同取 true",
+        src.contains("fun parseToolCalls(text: String, toolsJson: String, addAss: Boolean = true)"))
+    c3("native parse 侧不再写死 add_generation_prompt = false",
+        !cppParse().contains("in.add_generation_prompt = false;"))
+    c3("native parse 侧 add_generation_prompt 取自 addAss",
+        cpp.contains("in.add_generation_prompt = (addAss == JNI_TRUE);"))
     c3("nativeApplyChatTemplateTools 也接收模板参数",
         src.contains("nativeApplyChatTemplateTools(") && src.contains("tmpl: String"))
 
@@ -152,7 +174,6 @@ fun main() {
     // ---- 崩因回归（native 侧）：空串必须前置判掉、且解析那一跳必须有 try/catch ----
     // vendor 库对空串是 throw 而不是返回 AUTO，异常穿过 JNI 帧即 SIGABRT。
     // 这两条防线任何一条缺失都会让"未传 tool_choice 的 agent 请求"重新变成闪退。
-    val cpp = java.io.File("app/src/main/cpp/llama_jni.cpp").readText()
     c3("native 对空 tool_choice 做前置判断（不把空串喂给库）",
         cpp.contains("toolChoice.empty()"))
     c3("native 空串前置判断走的是显式 AUTO",

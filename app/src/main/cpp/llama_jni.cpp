@@ -10,6 +10,7 @@
 #include <vector>
 #include <cctype>
 #include <cstdio>
+#include <variant>          // std::get_if：从 PEG arena 现场取根节点字面量（见 parse 输入对齐）
 #include <csignal>
 #include <ctime>
 #include <cerrno>
@@ -91,6 +92,14 @@ static void jp(const char * fmt, ...) {
     va_end(ap);
     if (n > 0) probe_raw(buf, (size_t) (n > (int) sizeof(buf) - 1 ? (int) sizeof(buf) - 1 : n));
 }
+
+// 探针工具（escape_for_probe / 取 PEG 根节点字面量 / generation_prompt 对齐）
+// 单独拆成一份头文件：宿主下能独立编译并跑单测。
+// 为什么值得拆 —— 这三段都是**纯字符串/纯数据**运算，却是本轮修复的核心判定；
+// 留在本文件里就只能靠 review 肉眼保证（本文件在宿主上编不过：jni.h / llama.h /
+// chat.h 都是 NDK 与真机的）。拆出去之后真机与单测共用同一份实现。
+#include "probe_util.h"
+
 
 // ---- 探针自举：把「探针装反了方向」这个 bug 一次性钉死 ----
 //
@@ -370,17 +379,37 @@ static std::string take_complete_utf8(std::string & buf) {
     return out;
 }
 
-static std::string token_to_piece(llama_token t) {
+// token -> 文本片段。
+//
+// **special 必须传 true**（llama.h: "If true, special tokens are rendered in the output."）。
+// 历史故障（真机日志 0.9.69）：模型输出被记成
+//         name="get_weather"> name="city">Beijing
+// —— 恰好是完整工具调用 <function name="get_weather"> <param name="city">Beijing</param> </function>
+// 把 MiniCPM5 的 preserved_tokens（"<function" / "<param" / "</param>" / "</function>"）
+// **逐个删掉**之后的样子。这些标记在词表里是 special token，special=false 时
+// llama_token_to_piece 直接跳过不吐 —— 于是解码出来的文本里连工具标记都没有，
+// PEG 的 tool_open(p.literal("<function name=\"")) 永远匹配不上，tool_calls 恒为 0。
+//
+// 这是与「解析器没 load」「前缀没对齐」并列的**第四条独立成因**，且发生在最上游：
+// 解码阶段就把标记弄丢了，后面怎么修解析都对不上。
+// 传 true 只影响 special token 的**文本化**，不改变采样、不改变 EOG 判定
+// （EOG 仍由 llama_vocab_is_eog 单独判、在那之前就 return）。
+// 代价是正文里若真出现 "<|im_end|>" 这类控制 token，现在也会按字面吐出 ——
+// 但那本来就是模型输出的一部分，且比"静默丢标记"可查得多。
+static std::string token_to_piece(llama_token t, bool renderSpecial) {
     char buf[256];
-    int n = llama_token_to_piece(S.vocab, t, buf, sizeof(buf), 0, false);
+    int n = llama_token_to_piece(S.vocab, t, buf, sizeof(buf), 0, renderSpecial);
     if (n < 0) { // 缓冲不足，按需扩
         std::vector<char> big((size_t)(-n) + 8);
-        n = llama_token_to_piece(S.vocab, t, big.data(), (int32_t) big.size(), 0, false);
+        n = llama_token_to_piece(S.vocab, t, big.data(), (int32_t) big.size(), 0, renderSpecial);
         if (n < 0) return "";
         return std::string(big.data(), (size_t) n);
     }
     return std::string(buf, (size_t) n);
 }
+
+// 解码主路径：**必须**把 special token 文本化，否则工具调用标记会被静默丢掉（见上）。
+static inline std::string token_to_piece(llama_token t) { return token_to_piece(t, /*renderSpecial=*/true); }
 
 extern "C" {
 
@@ -791,6 +820,9 @@ Java_com_xiaowan_localinference_LlmEngine_nativeStep(JNIEnv * env, jclass) {
 
     llama_token tok = llama_sampler_sample(S.smpl, S.ctx, -1);
     llama_sampler_accept(S.smpl, tok);
+    // EOG **必须**在这一步之后立刻判掉，且要在 token_to_piece 之前 ——
+    // 因为 token_to_piece 现在按 renderSpecial=true 走，会把 special token 文本化，
+    // 而 <|im_end|> 这类结束标记正是 EOG。先判 EOG 就保证它不会漏进正文。
     if (llama_vocab_is_eog(S.vocab, tok)) return nullptr;
 
     // 把采样出的 token 喂回 KV
@@ -798,6 +830,8 @@ Java_com_xiaowan_localinference_LlmEngine_nativeStep(JNIEnv * env, jclass) {
     if (llama_decode(S.ctx, b) != 0) return nullptr;
     S.n_used++; S.n_rem--;
 
+    // token_to_piece(tok) 内部走 renderSpecial=true：工具标记（<function/<param/…）
+    // 是模型词表里的 special token，不文本化就会被丢掉，解析端再也对不上（见其注释）。
     S.pending += token_to_piece(tok);
     std::string out = take_complete_utf8(S.pending);
     // take_complete_utf8 已保证不吐半截序列，仍走安全解码做双保险：
@@ -1080,7 +1114,7 @@ Java_com_xiaowan_localinference_LlmEngine_nativeApplyChatTemplateTools(
 // 返回值形如：{"content":"...","toolCalls":[{"name":"get_weather","arguments":"{\"city\":\"北京\"}"}]}
 // parse 失败返回 "null"（调用方按纯文本处理）。
 static jstring parseToolCallsImpl(
-        JNIEnv * env, jstring jtext, jstring jtoolsJson, jstring jtmpl) {
+        JNIEnv * env, jstring jtext, jstring jtoolsJson, jstring jtmpl, jboolean addAss) {
     if (!S.model || !jtext) { jp("<< parseToolCalls 无模型/无文本 -> null\n"); return env->NewStringUTF(kNoToolCalls); }
 
     const char * tp = env->GetStringUTFChars(jtext, nullptr);
@@ -1124,7 +1158,22 @@ static jstring parseToolCallsImpl(
 
     common_chat_templates_inputs in;
     in.use_jinja = true;
-    in.add_generation_prompt = false;
+    // ── 关键分叉点：解析侧的 add_generation_prompt 必须与渲染侧**同一个值** ──
+    // cp.generation_prompt 是「带生成后缀的整段 prompt」减「不带的」的公共前缀之后的剩余部分
+    // （上游 common_chat_template_generation_prompt_impl），而 common_chat_parse 会把它
+    // **前拼**到输入上（effective_input = generation_prompt + input）。
+    // 因此这个量就是 PEG 根节点要匹配的那个字面前缀。
+    //
+    // 之前这里写死 false，与渲染侧的 true 分叉，真机后果（0.9.68/0.9.69 日志）：
+    //   MiniCPM5 模板在 add_generation_prompt 下才会吐 "<|im_start|>assistant\n"，
+    //   加上 enable_thinking（C++ 默认 true）再吐 "<think>\n"，于是
+    //       解析侧 generation_prompt = "<|im_start|>assistant\n<think>\n"（30B）
+    //   而 PEG 根节点要的是   literal("<|im_start|>assistant\n")（22B）
+    //   差的那 8B 正是 "<think>\n" —— 与日志里 content_len - text_len = 8 精确吻合。
+    //   根节点一上来就匹配不上，PEG 回退到纯内容，tool_calls 恒为 0、content 吃下全文。
+    // 这是「崩得响」之外那种「哑得不响」的静默降级，比崩溃更难查（不报错、不崩溃、
+    // 只在客户端表现为接口 200 但没收到工具调用）。
+    in.add_generation_prompt = (addAss == JNI_TRUE);
     if (!toolsJson.empty() && toolsJson != kNoToolCalls) {
         try {
             auto j = nlohmann::ordered_json::parse(toolsJson);
@@ -1201,6 +1250,139 @@ static jstring parseToolCallsImpl(
     jp("[parse] parser_params 构造完成（已 load PEG，root=%d n=%zu）\n",
        (int) pp.parser.root(), pp.parser.size());
 
+    // ══════════════════════════════════════════════════════════════════════
+    // 第三条真因：`generation_prompt` 的形状与 PEG 根节点的字面量不一致
+    // ══════════════════════════════════════════════════════════════════════
+    // common_chat_parse 会**自己**把 params.generation_prompt 前拼到输入上：
+    //     effective_input = params.generation_prompt + input
+    // 而 PEG 的根节点是一个**字面量**（MiniCPM5 为 "<|im_start|>assistant\n"）。
+    // 库要求输入以这个字面量开头；两者形状不一致时根节点一上来就匹配不上，
+    // PEG 回退成"整段都是 content" —— tool_calls 恒为 0，不报错、不崩溃。
+    //
+    // generation_prompt 由上游 common_chat_template_generation_prompt_impl 算出：
+    // 同一模板渲染 add_generation_prompt=false / =true 两次，取公共前缀之后的剩余部分。
+    // MiniCPM5 在 add_generation_prompt=true 且 enable_thinking（C++ 默认 true）时，
+    // 这个量是 "<|im_start|>assistant\n" + "<think>\n"（30B），而根节点要的是 22B。
+    //
+    // 关于那个「+8」：**它只是这段历史的线索，不是当前的判据**。
+    // 0.9.68/0.9.69 两份日志的 content_len - text_len 都是 8，与 30 - 22 吻合，
+    // 当时据此定位到"解析侧 generation_prompt 比根节点多一个 <think>\n"。
+    // 但**差值本身不能反过来证明修复有效**：Kotlin 侧的 text_len 是 UTF-16 code unit、
+    // 这边 content_len 是 UTF-8 字节，输出里只要有一个汉字这两个数就不可比。
+    // 所以本轮不再把「差值」当验收条件，改用两条**同构**的判据（见下面日志）：
+    //   · generation_prompt == root_literal（两边都是这边量的字节数）
+    //   · effective_input 以 root_literal 开头
+    //
+    // 对齐规则（实现与单测都在 probe_util.h，这里只调用）：
+    //   · 已对齐              -> 一个字节都不动；
+    //   · 字面量 + 尾巴       -> 尾巴前移到输入最前，effective_input 逐字节等价；
+    //   · 形状不符（不以字面量开头）-> 库给的 generation_prompt 原样保留，
+    //                            只把字面量补进输入最前，保证 effective_input 以它开头。
+    // 根节点字面量**从 arena 现场取**，不写死任何模板名 —— 写死等于把这条路绑死在
+    // MiniCPM5/Qwen 一家上，换个模板（llama 的 <|start_header_id|>、gemma 等）就静默
+    // 失效，正是本项目反复踩的那类"不崩但不干活"。
+    {
+        const std::string gp = pp.generation_prompt;
+        // 从 PEG 现场取根节点字面量（实现见 probe_util.h，宿主下有单测兜住）。
+        // 取不到（根非 literal / 越界 / 空串）时 rootLiteral 为空 -> 不改写、按原样交给库。
+        const root_literal_probe_result rootProbe =
+            probe_root_literal<common_peg_arena, common_peg_literal_parser>(pp.parser);
+        const std::string & rootLiteral = rootProbe.literal;
+
+        jp("[parse] 输入对齐：root_is_literal=%d root_literal=%s%s%s\n",
+           (int) rootProbe.isLiteral, escape_for_probe(rootLiteral, 60).c_str(),
+           rootProbe.why.empty() ? "" : "  why=", rootProbe.why.c_str());
+
+        const std::string textOriginal = text;   // 改写前的输入（回退用）
+        gen_prompt_align_result al = align_generation_prompt(gp, rootLiteral, text);
+
+        // ── 逐字节等价性自检（情形① 才需要） ──
+        // 情形① 是"尾巴前移"，理论上 effective_input 应与改写前**完全相同**：
+        //     gp + text  ==  (rootLiteral + tail) + text  ==  rootLiteral + (tail + text)
+        // 真算出两边比对一次。不等就说明改写动了语义 —— 宁可整个放弃改写
+        // （按原样交给库），也不让这次修复把原本能工作的输入改坏。
+        // 这是"一定不要引入新问题"的底线做法：新增路径永远只能更保守。
+        std::string effectiveHead;
+        {
+            if (al.mode == 1) {
+                const bool equivalent = (al.generation_prompt + al.input) == (gp + textOriginal);
+                if (!equivalent) {
+                    jp("[parse] ⚠ 输入对齐：改写后 effective_input 与原「前缀+输入」不一致 -> 回退为不改写\n");
+                    jlog("[tools] generation_prompt 对齐会改变输入语义，已回退为不改写（保守）");
+                    al.generation_prompt = gp;
+                    al.input             = textOriginal;
+                    al.patched.clear();
+                    al.changed           = false;
+                    al.mode              = 0;
+                }
+            }
+            pp.generation_prompt = al.generation_prompt;
+            text                 = al.input;
+            effectiveHead        = pp.generation_prompt + text;
+        }
+
+        if (al.mode == 1) {
+            jp("[parse] 输入对齐：generation_prompt %zuB -> %zuB（尾部 %s 共 %zuB 前移到输入，"
+               "effective_input 与原「前缀+输入」逐字节等价）\n",
+               gp.size(), al.generation_prompt.size(),
+               escape_for_probe(al.patched, 60).c_str(), al.patched.size());
+        } else if (al.mode == 2) {
+            jp("[parse] 输入对齐：generation_prompt 不以 root_literal 开头 -> 原样保留 %zuB，"
+               "只把字面量 %s 前拼进输入（%zuB）\n",
+               gp.size(), escape_for_probe(rootLiteral, 60).c_str(), al.patched.size());
+        } else {
+            jp("[parse] 输入对齐：无需改写（根非字面量 / 已对齐 / 已回退）\n");
+        }
+
+        jp("[parse] generation_prompt_len=%zu generation_prompt=%s\n",
+           pp.generation_prompt.size(), escape_for_probe(pp.generation_prompt, 120).c_str());
+        jp("[parse] effective_input_len=%zu effective_input_head=%.160s\n",
+           effectiveHead.size(), escape_for_probe(effectiveHead.substr(0, 160), 200).c_str());
+        // 判据（下次照这几行看）：
+        //   root_is_literal=1 且 generation_prompt == root_literal            -> 根节点能匹配上
+        //   effective_input_head 以 root_literal 开头                         -> 输入前缀也对齐了
+        // 两条都满足却仍是 tool_calls=0，才说明问题不在前缀对齐上（那时的第一嫌疑
+        // 是模型压根没按模板语法输出，而不是解析器这边）。
+        if (rootProbe.isLiteral && pp.generation_prompt != rootLiteral) {
+            jp("[parse] ⚠ 输入对齐：generation_prompt 与 root_literal 不一致 -> 大概率仍会 tool_calls=0\n");
+        }
+    }
+
+    // ══════════════════════════════════════════════════════════════════════
+    // 四级成因的日志分流：把「解析侧的问题」与「解码侧的问题」分开
+    // ══════════════════════════════════════════════════════════════════════
+    // 本 PR 一共定位了四条独立成因，任何一条单独存在都会让 tool_calls 恒为 0：
+    //   ① pp.parser 没 load（PEG 空 arena -> 静默降级成纯内容）
+    //   ② 解析侧 add_generation_prompt 与渲染侧不一致（前缀来源就不同）
+    //   ③ generation_prompt 的形状 ≠ PEG 根节点字面量（MiniCPM5 恒带 "<think>\n"）
+    //   ④ **解码时 special token 没文本化**（`<function`/`<param` 等被直接丢掉）
+    // ①②③ 都在"喂给解析器的东西"上，已在上面的代码里修掉。
+    // ④ 发生在更上游的 nativeStep（见 token_to_piece 的注释），也已修掉。
+    //
+    // 下面这段只做**日志分流**，不改输入：如果 text 看起来像"被删掉工具标记"的片段，
+    // 就直接指向④，避免下次又在解析器上绕圈。
+    {
+        // MiniCPM5 的工具标记。它们既是 PEG 的 tool_open/tool_close 字面量，
+        // 也是模型词表里的 special token —— 同一个东西，两个身份。
+        static const char * kToolMarkers[] = { "<function", "<param", "</param>", "</function>" };
+        bool hasAnyMarker = false;
+        for (const char * m : kToolMarkers) {
+            if (text.find(m) != std::string::npos) { hasAnyMarker = true; break; }
+        }
+        // 「像内层片段」：以 " name=" / "> name=" 开头（正是 <function / <param 被删后的残骸），
+        // 且整段没有任何完整工具标记。这个形状在真机日志里出现过（0.9.69）。
+        const bool looksStripped =
+            !hasAnyMarker &&
+            (text.compare(0, 6, " name=") == 0 || text.compare(0, 7, "> name=") == 0);
+        if (looksStripped) {
+            jp("[parse] ⚠ 解码侧可疑：text 以 %s 开头且不含任何工具标记；"
+               "形状与 special token 未文本化的残骸一致 -> 先确认 token_to_piece 走的是 renderSpecial=true"
+               "（真机 0.9.69 的 text_head 正是这个形状）\n",
+               escape_for_probe(text.substr(0, 40), 60).c_str());
+            jlog("[tools] 解码文本疑似丢失工具标记（special token 未文本化），解析大概率拿不到 tool_calls");
+        }
+    }
+
     common_chat_msg msg;
     jp("[parse] >>> common_chat_parse 开始（如果这一行后面没有 <<<，崩点就是它）\n");
     try {
@@ -1242,10 +1424,10 @@ static jstring parseToolCallsImpl(
 // 调用方按纯文本处理，绝不让异常穿过 JNI 帧。
 JNIEXPORT jstring JNICALL
 Java_com_xiaowan_localinference_LlmEngine_nativeParseToolCalls(
-        JNIEnv * env, jclass, jstring jtext, jstring jtoolsJson, jstring jtmpl) {
+        JNIEnv * env, jclass, jstring jtext, jstring jtoolsJson, jstring jtmpl, jboolean addAss) {
     JNI_SPAN("parseToolCalls");
     try {
-        return parseToolCallsImpl(env, jtext, jtoolsJson, jtmpl);
+        return parseToolCallsImpl(env, jtext, jtoolsJson, jtmpl, addAss);
     } catch (const std::exception & e) {
         jp("!! parseToolCalls 边界捕获异常: %s -> null\n", e.what());
         jlog("[tools] 解析边界捕获异常，按纯文本处理: %s", e.what());

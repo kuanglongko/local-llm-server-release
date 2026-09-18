@@ -21,7 +21,47 @@ $:
             echo "=== ABI 守卫单测 ==="; sh tools/run_abi_tests.sh
             echo "=== string 布局判据单测 ==="; sh tools/run_string_layout_tests.sh
             echo "=== 探针单测 ==="; sh tools/run_probe_tests.sh
-            echo "=== 存活探测单测 ==="; sh tools/run_health_tests.sh
+            echo "=== 工具解析单测（PEG load）==="; sh tools/run_parse_parser_tests.sh
+            # 前缀对齐：钉住"输入有没有按 PEG 根节点要求对齐"这条判定。
+            # 它是 tool_calls 恒为 0 那类故障的收口条件，产物是**字符串** ——
+            # 错了不崩不报错，只会静默解析不出工具调用。宿主下用真字节比对，
+            # 跑的与真机是**同一份** probe_util.h（不靠 review 肉眼保证）。
+            echo "=== PEG 根节点前缀对齐单测 ==="; sh tools/run_root_literal_probe_tests.sh
+            # 日志页显示：钉住"数据在、界面看不见"这类故障（0.9.70 真机报「加载后不显示
+            # 层数与显存」）。纯静态断言，只读源码，不依赖任何工具链。
+            echo "=== 日志页显示单测 ==="; sh tools/run_log_page_tests.sh
+            echo "=== 并发加载防护单测 ==="; sh tools/run_garbled_output_tests.sh
+
+            # --- 宿主侧 Kotlin 单测（存活探测）---
+            # run_health_tests.sh 需要 kotlinc + JDK + android.jar + json.jar，
+            # 都放在 /workspace/.omnibot/toolchain。镜像里没有，这里按需拉一份。
+            # 拉不到就 REQUIRED=0 退化为 SKIP（打印原因），不因此拖垮 AFK 编包 ——
+            # 与「单测失败必须拦住」区分开：缺工具链是环境问题，不是代码问题。
+            echo "=== 存活探测单测（无工具链则 SKIP）==="
+            TC=/workspace/.omnibot/toolchain
+            mkdir -p "$TC"
+            if [ ! -x "$TC/kotlinc/bin/kotlinc" ]; then
+              curl -fsSL -o /tmp/kotlinc.zip \
+                https://github.com/JetBrains/kotlin/releases/download/v2.0.21/kotlin-compiler-2.0.21.zip \
+                && unzip -q -o /tmp/kotlinc.zip -d "$TC" \
+                || echo "!! kotlinc 拉取失败，稍后退化为 SKIP"
+            fi
+            if ! ls -d "$TC"/jdk-*/bin/java >/dev/null 2>&1; then
+              curl -fsSL -o /tmp/jdk.tgz \
+                https://github.com/adoptium/temurin17-binaries/releases/download/jdk-17.0.12%2B7/OpenJDK17U-jdk_x64_linux_hotspot_17.0.12_7.tar.gz \
+                && tar -xzf /tmp/jdk.tgz -C "$TC" \
+                || echo "!! JDK 拉取失败，稍后退化为 SKIP"
+            fi
+            if [ ! -f "$TC/android-35/android.jar" ] && [ -f /opt/android-sdk/platforms/android-35/android.jar ]; then
+              mkdir -p "$TC/android-35"
+              cp /opt/android-sdk/platforms/android-35/android.jar "$TC/android-35/android.jar"
+            fi
+            if [ ! -f /tmp/json.jar ]; then
+              curl -fsSL -o /tmp/json.jar \
+                https://repo1.maven.org/maven2/org/json/json/20240303/json-20240303.jar \
+                || echo "!! json.jar 拉取失败，稍后退化为 SKIP"
+            fi
+            REQUIRED=0 sh tools/run_health_tests.sh
 
             echo "=== 编 APK ==="
             export ANDROID_HOME=/opt/android-sdk

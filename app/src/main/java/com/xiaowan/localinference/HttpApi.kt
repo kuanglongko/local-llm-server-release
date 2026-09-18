@@ -390,25 +390,19 @@ object HttpApi {
             // 这里不再显示 null，避免"看起来没传"这种会被误读的日志。
             if (hasTools) emitLog("tools: ${j.optJSONArray("tools")!!.length()} 个，choice=${toolChoice ?: "auto"}")
 
-            // 思考控制 —— 请求显式参数 > 全局默认；仅模板含 enable_thinking 时注入空 think 块（软开关）
-            val kwEt = j.optJSONObject("chat_template_kwargs")?.opt("enable_thinking")
-            val reqThinking: Boolean? = when {
-                j.has("enable_thinking") -> j.optBoolean("enable_thinking", true)
-                kwEt is Boolean -> kwEt
-                kwEt is Number -> kwEt.toInt() != 0
-                kwEt is String -> kwEt.lowercase() !in listOf("false", "0", "off")
-                j.optString("reasoning_effort", "").isNotEmpty() -> j.optString("reasoning_effort") != "none"
-                else -> null
-            }
-            val thinkingOn = reqThinking ?: !disableThinkingDefault
+            // 思考控制 —— 请求显式参数 > 全局默认；软开关注入在 ThinkingControl 里，与 App 内聊天共用。
+            val thinkingOn = ThinkingControl.resolve(disableThinkingDefault, ThinkingControl.requestThinkingOverride(j))
+            val chatTemplate = LlmEngine.chatTemplate()
             // 带 tools 时优先进工具感知路径；渲染失败（无模型 / 模板不支持）回落普通路径，
             // 与「模型不支持工具调用时退化成普通对话」的承诺一致，不会让请求整体失败。
             var prompt = if (toolsJson != null)
                     LlmEngine.applyChatTemplateWithTools(msgs, toolsJson, toolChoice, parallelToolCalls, addAss = true)
                 else null
             if (prompt == null) prompt = LlmEngine.applyChatTemplate(msgs, addAss = true)
-            if (!thinkingOn && LlmEngine.chatTemplate().contains("enable_thinking")) {
-                prompt = prompt + "<think>\n\n</think>\n\n"  // 追加在末尾（紧贴assistant生成后缀），置于开头会诱导模型模仿输出空think块
+            // 判定要看渲染结果：LFM2.5 这类模型的"思考开"是模板后缀硬编码的
+            // （模板里没有 enable_thinking 变量），只能靠渲染后的后缀识别。
+            if (ThinkingControl.softSwitchApplies(thinkingOn, chatTemplate, prompt)) {
+                prompt = ThinkingControl.applyToPrompt(prompt, thinkingOn, chatTemplate)
                 emitLog("thinking off (soft switch)")
             }
             val id = "chatcmpl-local-${System.currentTimeMillis()}"
@@ -501,7 +495,9 @@ object HttpApi {
                 var toolCallsJson: String? = null
                 if (toolsJson != null) {
                     LlmEngine.probeMark("[http] 生成结束，进入工具解析：n=$n 输出长度=${sb.length}")
-                    val parsed = LlmEngine.parseToolCalls(sb.toString(), toolsJson)
+                    // addAss=true：与上面 applyChatTemplateWithTools(..., addAss = true) 同一取值。
+                    // 解析侧的 generation_prompt 随它变化，而它决定 PEG 根节点要匹配的前缀。
+                    val parsed = LlmEngine.parseToolCalls(sb.toString(), toolsJson, addAss = true)
                     if (parsed != null) {
                         toolCallsJson = parsed.second
                         // content 只留解析出的正文：工具语法标记不能当正文吐给客户端
