@@ -185,6 +185,68 @@ fun main() {
     ck("无响应永远是不可达（不受任何文本影响）",
         HealthCheck.verdict(HealthCheck.parse("", 1, "status ok")) == HealthCheck.Verdict.UNREACHABLE)
 
+    // ---- 14. 回显正文上限：常态响应必须完整回显，残片绝不能悄悄发出去 ----
+    //
+    // 两条都来自真机反馈（2026-09-20）：
+    //   ① 用户贴出的「响应原文」被切在第 200 字符，而真机上 /health 的正文约 221 字符
+    //      —— 截出来的残片天然非法 JSON，报告里却挂着"响应体不是合法 JSON"这句警告，
+    //      于是一份**报告自己造的截断**被读成了服务端在返回坏 JSON；
+    //   ② 反方向也不行：回显的是完整正文时，报告后面照样跟着"截断处不是响应的问题"，
+    //      在"对方回的是 HTML"这种结论下，这句免责声明在解释一段不存在的东西。
+    // 判据不是"少显示一段没关系"，而是**给出去的证据必须能被独立复核**：
+    // 要么完整，要么明说截断，且不在没有截断时凭空解释截断。
+    val longBody = "{\"status\":\"ok\",\"model_loaded\":false,\"model\":null,\"model_desc\":\"" +
+        "x".repeat(HealthCheck.BODY_PREVIEW_CHARS * 2) + "\"}"
+    val longR = HealthCheck.parse(resp(longBody), 1)
+    val longReport = HealthCheck.format(longR, "127.0.0.1", 8080)
+    ck("超长正文的回显不超过上限（不能让几十 KB 的 HTML 灌进结论区）",
+        longReport.length < longBody.length)
+    ck("超长正文的回显必须标注已截断（否则复制出来的是天然非法 JSON）",
+        longReport.contains("已截断"))
+    ck("截断说明要带上完整长度（用户据此知道原响应是完好的）",
+        longReport.contains(longBody.length.toString()))
+    ck("截断说明要澄清不是服务端的问题（否则红字结论会被读反）",
+        longReport.contains("不是响应的问题"))
+    // 关键：真机那份 221 字符的 /health 正文必须**完整**出现在报告里 ——
+    // 上限存在的理由是拦 HTML，不是拦本服务自己的响应。
+    val realWorld = """{"status":"ok","model_loaded":true,"model":"qwen3 0.6B Q8_0",""" +
+        """"ctx_used":39,"ctx_size":8192,"busy":false,"port":8083,"generating":false,""" +
+        """"cancelled":false,"kv_cache_valid":true,"kv_reuse_tokens":0,"kv_prefill_tokens":5}"""
+    val realR = HealthCheck.parse(resp(realWorld), 2)
+    ck("真机那份 221 字符 /health 正文是合法 JSON（不是服务端的错）", realR.jsonParsed)
+    ck("真机正文长度在本版上限之内（这就是 200 -> 4096 要修的事）",
+        realWorld.length < HealthCheck.BODY_PREVIEW_CHARS)
+    ck("真机正文的判定是 ALIVE（解析与判定都没被长度影响）",
+        HealthCheck.verdict(realR) == HealthCheck.Verdict.ALIVE)
+    // 顺手钉住：能复现用户那份报告的状态（DEGRADED）。
+    // 用户的「探测失败」正是这种形状：它根本不是解析失败，是模型/状态没给全。
+    // 注意比对的必须是**降级后**的这份正文：`realWorld` 里是 model_loaded=true，
+    // 拿它去比于是一辈子不命中——这正是此前那条陈旧断言报红的原因（不是代码错，
+    // 是断言自己期待了一份报告里不可能出现的字符串）。
+    val degradedRealBody = realWorld.replace("\"model_loaded\":true", "\"model_loaded\":false")
+    val degradedReal = HealthCheck.parse(resp(degradedRealBody), 4)
+    val degradedReport = HealthCheck.format(degradedReal, "127.0.0.1", 8083)
+    ck("复现用户那份报告：回显的正文必须是完整 221 字符，不带截断标注",
+        degradedReport.contains(degradedRealBody) && !degradedReport.contains("已截断"))
+    ck("正文完整且非 JSON 结论时不谈截断（免责声明只在真截断时给）",
+        HealthCheck.format(HealthCheck.parse(resp("<html>portal</html>"), 1), "127.0.0.1", 8080)
+            .let { it.contains("未被截断") && !it.contains("已截断") })
+    ck("正文与判定一致（合法 JSON 时被降级）要说明结论不来自这段预览",
+        degradedReport.contains("与判定一致"))
+    // 反例：正文没超上限时**不得**出现"已截断"，那是纯噪音，还会让人以为响应残缺。
+    ck("短文正文不得误报截断",
+        !HealthCheck.format(HealthCheck.parse(resp(HEALTH_OK), 1), "127.0.0.1", 8080).contains("已截断"))
+    // 【已随实现更新】此前这里断言「存活报告不回显正文」。
+    // 现行实现改成**任何**有正文的响应都回显（并标注它与判定一致），理由是
+    // 「全绿」也要能独立复核：用户点存活探测就是想拿一份可复制的证据，
+    // 全绿时省掉原文，等于把"凭什么说它活着"这句藏起来。
+    // 所以这条改为钉住新语义，而不是删除——免得回显又被顺手改回"只在非全绿时给"。
+    val aliveBodyReport = HealthCheck.format(HealthCheck.parse(resp(HEALTH_OK), 1), "127.0.0.1", 8080)
+    ck("存活报告也回显正文（全绿同样要给可复核的证据）",
+        aliveBodyReport.contains("响应原文") && aliveBodyReport.contains(HEALTH_OK))
+    ck("存活报告的回显要标注与判定一致（不能孤立地贴一段原文）",
+        aliveBodyReport.contains("与判定一致"))
+
     println()
     println(if (fail == 0) "=== HealthCheckTest 全部通过 ===" else "=== HealthCheckTest 失败 $fail 项 ===")
     if (fail != 0) kotlin.system.exitProcess(1)

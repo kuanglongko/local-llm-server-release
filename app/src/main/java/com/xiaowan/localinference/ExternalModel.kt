@@ -59,7 +59,10 @@ object ExternalModel {
         if (!f.isAbsolute || !f.isFile || f.length() <= 0) return false
         val list = all(ctx).toMutableList()
         if (list.any { it.name == name }) return false
-        if (File(ctx.getExternalFilesDir(null), "models/$name").isFile) return false
+        // 用 ModelStore.modelsDir() 而不是自己拼 getExternalFilesDir(null)：
+        // 后者在外部存储不可用时返回 null，File(null, child) 会静默变成相对 CWD 的路径 ——
+        // 于是这个去重判据在那种环境下**静默失效**（不报错，只是永远判 False）。
+        if (File(ModelStore.modelsDir(ctx), name).isFile) return false
         list += Ref(name, path, uri)
         ctx.getSharedPreferences(PREFS, Context.MODE_PRIVATE).edit()
             .putString(key(name), "$path$SEP$uri")

@@ -100,6 +100,14 @@ static_assert(offsetof(common_chat_templates_inputs, tool_choice)            == 
 static_assert(offsetof(common_chat_templates_inputs, parallel_tool_calls)    == 116, "inputs.parallel_tool_calls 偏移变了");
 static_assert(offsetof(common_chat_templates_inputs, reasoning_format)       == 120, "inputs.reasoning_format 偏移变了");
 static_assert(offsetof(common_chat_templates_inputs, enable_thinking)        == 124, "inputs.enable_thinking 偏移变了");
+
+// ⚠ 上面这条断言只保证「字段位置对」，**钉不住"有没有给它赋值"**：
+//     enable_thinking 是 C++ 默认 true 的 bool，不赋值 = 恒为"思考开"，
+//     编译期、运行期都不报错 —— 真机表现是「勾了默认关闭思考也没用」。
+//     2026-09-19 就是踩在这里：MiniCPM5 模板按它决定生成后缀吐不吐 "<think>\n"，
+//     而 llama_jni.cpp 三处 common_chat_templates_inputs 此前一处都没设过它。
+//     现在三处（无 tools 渲染 / 带 tools 渲染 / 解析）都必须显式赋值，
+//     由 tools/run_thinking_tests.sh 的源码级断言钉死。
 static_assert(offsetof(common_chat_templates_inputs, now)                    == 128, "inputs.now 偏移变了（此字段占 8B，其后才是 chat_template_kwargs）");
 static_assert(offsetof(common_chat_templates_inputs, chat_template_kwargs)   == 136, "inputs.chat_template_kwargs 偏移变了");
 static_assert(offsetof(common_chat_templates_inputs, add_bos)                == 160, "inputs.add_bos 偏移变了");

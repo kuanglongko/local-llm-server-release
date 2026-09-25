@@ -17,8 +17,8 @@ android {
         // 版本规则：versionName 恒为 0.9.<versionCode>，两者在同一次提交里一起改。
         // 本文件注释里请勿写出 versionName 紧跟等号与引号的形式——发布器按该形式定位
         // 并改写版本号，全文命中数不等于 1 会直接中止发布。
-        versionCode = 70
-        versionName = "0.9.70"
+        versionCode = 133
+        versionName = "0.9.133"
         ndk {
             // llama.cpp rnllama 构建仅面向 arm64；Hexagon HTP/OpenCL 均在此 ABI
             abiFilters += listOf("arm64-v8a")

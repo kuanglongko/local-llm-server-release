@@ -70,6 +70,82 @@ object LlmEngine {
     /** 生成互斥锁：UI 测试页与本地 HTTP 服务共用，保证同一时刻只有一路生成。 */
     val genLock = Any()
 
+    /**
+     * 生成循环内**除了 `LlmEngine.step()` 之外**唯一该做的收尾判定：本轮是否已被取消。
+     *
+     * 为什么收在引擎里而不是让每个调用方各自查标志位：
+     * 「谁在跑」与「取消打给谁」必须对同一个对象生效（见 [RequestCancel] 文件头，
+     * 那里记着「迟到的取消停掉别人的轮次」这个真实事故）。把归属状态放在引擎内，
+     * 任何一条新入口（HTTP / UI / 以后可能有的别的）都不会漏登记、也不会登记错。
+     *
+     * 生成期**不逐毫秒轮询**取消标志：`nativeStep()` 一步就是一个 token，粒度天然
+     * 是一步一判；本轮已经结束（[step] 返回 null）之后再取消也不会有人读它。
+     */
+    val currentCancel: RequestCancel.Token? get() = RequestCancel.currentToken()
+
+    /**
+     * 引擎此刻是否在跑一轮生成（含 HTTP 生成与 App 内聊天）。
+     *
+     * 与 [RequestCancel.active] 取同一个真值：取消归属就是「这一轮正在跑」的登记。
+     * 两者各算各的，迟早会出现「`/v1/abort` 说停了、忙检查还说在跑」这种对不上的状态。
+     *
+     * **覆盖范围是「prefill 成功 → 收尾」**（登记与摘除各在一端）。更早的
+     * 「请求已受理、还在渲染 prompt」那段不在其中 —— 那一段由 HttpApi 的 `busy`
+     * 覆盖，忙检查必须两半都看（见 `HttpApi.isGenerating` 的注释）。
+     */
+    val isGenerating: Boolean get() = RequestCancel.active
+
+    /**
+     * 生成开始：登记取消归属并返回本轮 token，交给调用方在循环里逐 step 判定。
+     *
+     * 必须在持 [genLock] 时调用（[startCompletion] 之后立刻）。**不**放进
+     * [startCompletion] 里做，是因为 prefill 失败时那一轮根本没跑起来，
+     * 此时登记了就得有人负责摘除，多一条容易漏的路径。
+     */
+    fun beginCancelable(): RequestCancel.Token {
+        val t = RequestCancel.enter()
+        // 把本轮的 native 编号绑进 token —— 取消打回 native 时要靠它核对归属。
+        // 取值时机正确性：调用方在 `startCompletion` **成功后**、仍在 `genLock` 内
+        // 调本函数，而 native 的编号在 startCompletion 入口自增。单实例引擎 +
+        // 生成循环持 `genLock`，所以此刻 `nativeCurrentEpoch()` 就是本轮编号，
+        // 不存在"取到别人编号"的窗口（拿不到 ctx/smpl 编不出的场景见 native 侧注释）。
+        t.bindNativeEpoch(runCatching { nativeCurrentEpoch() }.getOrDefault(0L))
+        return t
+    }
+
+    /** 生成结束（正常/异常/取消任一）：摘除取消归属。重复调用安全。 */
+    fun endCancelable(t: RequestCancel.Token) = RequestCancel.leave(t)
+
+    /**
+     * 请求取消**当前正在生成的那一轮**，并把归属一路送到 native。
+     *
+     * 这是**唯一**的取消入口（`/v1/abort`、心跳/断连探测、App 停止按钮都走它）：
+     *   · 没有轮次在跑 -> 返回 null，什么也不做（"取消了不存在的请求"必须可判定）；
+     *   · 有轮次在跑   -> 标记 token + 带编号调 `nativeAbort`。
+     *
+     * 为什么必须收在一处：Kotlin 侧的 `cancel.requested` 只覆盖"循环自己查标志"
+     * 这一条路径（`kotlin` 循环在 `step()` 之前查），**管不到 prefill** ——
+     * prefill 是一次阻塞的 native 调用，唯一能打断它的是 native 的 `S.abort`。
+     * 此前没有任何路径把取消送到 native，于是"取消"在 prefill 阶段完全无效，
+     * 表现为「点了停止，还要等这一大段 prompt 算完」。
+     */
+    fun requestAbort(): RequestCancel.Token? {
+        val t = RequestCancel.cancelCurrent() ?: return null
+        abortRound(t)
+        return t
+    }
+
+    /**
+     * 已持有本轮 token 的调用方（心跳 / 断连探测：它们按"这一次探测判定离开"自己
+     * `cancel.request()` 过）在这里补上"送到 native"那一跳。
+     *
+     * 与 [requestAbort] 分开是因为归属已经确定：重复 `cancelCurrent()` 会踩到
+     * "取消一次不成、再取消一次成功"的错觉（第二次会打到**下一个**轮次上）。
+     */
+    fun abortRound(t: RequestCancel.Token) {
+        runCatching { nativeAbort(t.nativeEpoch) }
+    }
+
     // ---- 崩溃探针 ----
     // 为什么要有它：这条链路上的闪退此前取证不到 —— 日志回调在 abort 前会丢，
     // JVM 的 UncaughtExceptionHandler 覆盖不到 native abort，客户端只看到连接被重置。
@@ -111,6 +187,8 @@ object LlmEngine {
      *   · 符号确实不在库里 → 上面两行都在，仍报 UnsatisfiedLinkError。
      * 另外 native 侧现在会自行自举探针（JNI_OnLoad），所以**即使这一跳失败**，
      * probe-native.log 里也应该有 `[boot]` 开头的内容 —— 一条都没有，才说明 native 完全没跑起来。
+     * （前提：用户确实开了探针。自举**只记不写**，文件只由本函数这次调用建立；
+     *  用户没开时自举事件只进 logcat，不建文件、不落盘 —— 别把它读成"native 没跑"。）
      *
      * 为什么必须在 backendInit 之前：backendInit 里的 `llama_log_set` 只选一次 sink，
      * 且探针要能接住 backendInit 自身与后续模型加载、渲染、解析各阶段的崩溃。
@@ -122,7 +200,6 @@ object LlmEngine {
      * @return null=挂载成功；否则为失败原因（用于 UI 直接提示，不静默失败）
      */
     fun startProbe(ctx: android.content.Context): String? {
-        if (!probeEnabled) return null
         return try {
             val dir = java.io.File(ctx.applicationContext.filesDir, "logs")
             if (!dir.exists()) dir.mkdirs()
@@ -130,19 +207,27 @@ object LlmEngine {
             // nativeProbeInit 在 libllmjni_<tag>.so 里（不在 libcpufeat.so），
             // 库没加载就调只会拿到 UnsatisfiedLinkError。这里先挡一道，把原因说清楚。
             //
-            // 注意这一跳失败**不代表取证失败**：native 侧在 JNI_OnLoad 里会自行自举探针，
-            // 所以日志里「Kotlin 挂载失败」但 probe-native.log 有 `[boot]` 内容是正常组合
-            // —— 那说明崩点就在 Kotlin → native 之间，而不是 native 内部。
-            if (nativeTag == null) return "native 库尚未加载（loadNative 未成功），探针无处挂载"
-            probeAttached = nativeProbeInit(dir.absolutePath, true)
-            if (!probeAttached) return "nativeProbeInit 返回 false（文件打不开或无写权限）"
+            // 注意这一跳失败**不代表取证失败**：native 侧在 JNI_OnLoad 里会自行跑一次
+            // 自举（**只记不写**），所以日志里「Kotlin 挂载失败」但 probe-native.log 有
+            // `[boot]` 内容是正常组合 —— 那说明崩点就在 Kotlin → native 之间，而不是 native 内部。
+            if (nativeTag == null) return if (probeEnabled) "native 库尚未加载（loadNative 未成功），探针无处挂载" else null
+            // ⚠ 「关」也必须**显式**告知 native。
+            // 此前 !probeEnabled 时直接 return，native 侧永远收不到那次 on=false 的调用，
+            // 于是它只能靠自举（无条件打开）猜 —— 用户在设置页关掉探针，native 照样
+            // 全量落盘并把日志 sink 换成空操作。现在开关在这里有**唯一**的事实来源。
+            probeAttached = nativeProbeInit(dir.absolutePath, probeEnabled)
+            if (!probeEnabled) return null
+            if (!probeAttached) {
+                return "nativeProbeInit 返回 false（可能被自举开关属性强关，或文件打不开/无写权限；" +
+                    "logcat 搜 `probe:` 与 `probe boot:` 看原因）"
+            }
             probeMark("Kotlin 侧已挂载探针，${
                 java.text.SimpleDateFormat("MM-dd HH:mm:ss", java.util.Locale.US)
                     .format(java.util.Date())} abi=${android.os.Build.SUPPORTED_ABIS.firstOrNull()}")
             null
         } catch (t: Throwable) {
             probeAttached = false
-            "探针挂载异常：${t.javaClass.simpleName}: ${t.message}"
+            if (probeEnabled) "探针挂载异常：${t.javaClass.simpleName}: ${t.message}" else null
         }
     }
 
@@ -401,7 +486,30 @@ object LlmEngine {
         /** true=来自上次预读的持久缓存（本次未重新读 header）；UI 需如实标注来源。 */
         val cached: Boolean = false)
 
-    @Volatile private var probePath: String? = null
+    /**
+     * 文件身份 = 路径 + 大小 + mtime，**预读缓存唯一的命中判据**。
+     *
+     * 只按路径命中的写法会静默用错：模型文件可以被**就地替换**（外部路径重新下载完成、
+     * 续传落盘、adb push 覆盖），路径一个字没变而内容全换。此时旧判定会被继续当成
+     * 「这个文件的真实量化」，一路写进 [probeGguf] 的返回值、loadModel 的 HTP 判定
+     * 与 `[HTP判定]` 日志 —— 表现是"文件名与实际类型不符"的提示指向一个已经不存在的文件。
+     *
+     * `peekGguf` 的持久缓存**本来**就是 size+mtime 双校验（"文件被替换或续传完成自动失效"），
+     * 而内存缓存这一层此前只有路径 —— 两处口径分叉，正是判据漂移的起点。
+     * 现在两侧共用本判据，不再各写一份近似。
+     */
+    private class ProbeIdentity(val path: String, val length: Long, val mtime: Long) {
+        override fun equals(other: Any?): Boolean =
+            other is ProbeIdentity && other.path == path && other.length == length && other.mtime == mtime
+        override fun hashCode(): Int = path.hashCode() * 31 * 31 + length.hashCode() * 31 + mtime.hashCode()
+    }
+
+    private fun probeIdentityOf(path: String): ProbeIdentity {
+        val f = java.io.File(path)
+        return ProbeIdentity(path, f.length(), f.lastModified())
+    }
+
+    @Volatile private var probeId: ProbeIdentity? = null
     @Volatile private var probeVal: GgufProbe? = null
 
     /** 最近一次预读结果；null=读不出（非 GGUF / header 损坏 / 该库无此符号）。 */
@@ -409,14 +517,22 @@ object LlmEngine {
 
     /** 只对「当前已加载模型」成立的预读结果；path 不匹配（换了文件没重载）时返回 null，UI 应忽略。 */
     val htpProbeForLoaded: GgufProbe?
-        get() = if (probePath != null && probePath == currentPath) probeVal else null
+        get() = if (probeId?.path != null && probeId!!.path == currentPath) probeVal else null
 
     /** 文件名标称与实际类型不符（只看当前已加载模型）。true 时 UI 亮色提示；判定已按实际类型走，不需重载。 */
     val quantMismatch: Boolean?
         get() = htpProbeForLoaded?.let { !labelsMatch(loadedQuant, it.realQuant) }
 
+    /**
+     * 预读 GGUF header（不加载权重，毫秒级）。命中内存缓存时**不再打 native**，
+     * 命中判据是 [ProbeIdentity]：路径、大小、mtime 三者全同才算同一个文件。
+     *
+     * 为什么不能只看路径：[probeIdentityOf] 的注释里写了那条静默故障的完整链路 ——
+     * 就地替换后的旧判定会一直被当成"这个文件的真实量化"用下去。
+     */
     fun probeGguf(path: String): GgufProbe? {
-        if (probePath == path) return probeVal
+        val id = probeIdentityOf(path)
+        if (probeId == id) return probeVal
         val a = try {
             nativeProbeGguf(path)
         } catch (t: Throwable) {
@@ -425,7 +541,7 @@ object LlmEngine {
         }
         val p = if (a != null && a.size >= 4 && a[0].isNotEmpty() && a[1] != "-1")
             GgufProbe(a[0], a[1].toIntOrNull() ?: -1, a[2] == "1", a[3]) else null
-        probePath = path
+        probeId = id
         probeVal = p
         return p
     }
@@ -443,7 +559,8 @@ object LlmEngine {
      */
     fun peekGguf(ctx: android.content.Context, f: java.io.File): GgufProbe? {
         val path = f.absolutePath
-        if (probePath == path && probeVal != null) return probeVal
+        val id = ProbeIdentity(path, f.length(), f.lastModified())
+        if (probeId == id && probeVal != null) return probeVal
         val sp = ctx.applicationContext.getSharedPreferences(PREFS, android.content.Context.MODE_PRIVATE)
         sp.getString(probePersistKey(path), null)?.let { tag ->
             val p = tag.split('|', limit = 6)
@@ -463,7 +580,7 @@ object LlmEngine {
     fun forgetProbe(ctx: android.content.Context, path: String) {
         ctx.applicationContext.getSharedPreferences(PREFS, android.content.Context.MODE_PRIVATE)
             .edit().remove(probePersistKey(path)).apply()
-        if (probePath == path) { probePath = null; probeVal = null }
+        if (probeId?.path == path) { probeId = null; probeVal = null }
     }
 
     /**
@@ -661,8 +778,7 @@ object LlmEngine {
         }
         // 模型库支持切换：加载新路径前先卸载旧模型，避免泄漏旧上下文
         if (hasModel) {
-            nativeFreeSampler()
-            nativeUnloadModel()
+            unloadLocked()
             currentPath = null
         }
         // i8mm/dotprod/base 是纯 CPU 变体，里面根本没有 OpenCL/Hexagon 后端；
@@ -686,6 +802,12 @@ object LlmEngine {
             if (mismatch)
                 uiLog("⚠ 文件名写的是 $quant，实际是 ${probe.realQuant}；已按实际类型判定，不必为此重新加载")
         }
+        // 加载前先把 repack 档位交给 native（**显式**下发，未设过传 -1 而非 0）：
+        // 与 `load_mode` / `devices` 同一课 —— 开关必须落在仓库自己的判定上，
+        // 且"没设过"要能与"显式设为 0"区分开，否则用户关掉之后下一轮会静默回到库默认。
+        // appCtx 未就绪时传 -1（未设过）：与 npuQuotaPct 的兜底同一个口径，
+        // 不读 prefs 比读错 prefs 安全。
+        setRepackMode(appCtx?.let { ModelStore.extraBufts(it) } ?: -1)
         // 加载前先清计数，保证下面的 [HTP参与] 摘要只描述这一次加载
         HtpProbe.reset()
         val quota = npuQuotaPct()
@@ -719,20 +841,86 @@ object LlmEngine {
     fun contextSize(): Int = nativeCtxSize()
     fun contextUsed(): Int = nativeCtxUsed()
 
+    /**
+     * KV 前缀复用的可观测面：`last_reuse`（上一轮复用了多少 token）与
+     * `lastPrefillTokens`（上一轮**新算**了多少 token）。
+     *
+     * 为什么必须暴露到 Kotlin：复用是**纯加速**，它不改变任何接口状态 ——
+     * 没有这两个数，"缓存到底有没有生效"就只能去读 native 日志，
+     * 而 native 日志默认是关的（探针要人先开）。收到 /health 里之后，
+     * 任何一次真实请求都能顺带把缓存命中率读出来。
+     */
+    val lastReuseTokens: Int get() = runCatching { nativeKvCacheStats()[0] }.getOrDefault(0)
+    val lastPrefillTokens: Int get() = runCatching { nativeKvCacheStats()[1] }.getOrDefault(0)
+
+    /**
+     * 已经跑完 prefill 的轮次数。与 [kvCacheValid] **必须成对读**：
+     * `kvRounds == 0` = 从未跑过任何请求（冷启动）；
+     * `kvRounds > 0 && !kvCacheValid` = 跑过、但账本已被作废（abort / 换模型 /
+     * prompt 超长）。只看 [kvCacheValid] 的话这两种处境完全同形 ——
+     * 一个是正常的冷启动，一个是取消或故障，读 `/health` 的人无从分辨。
+     */
+    val kvRounds: Int get() = runCatching { nativeKvCacheStats()[2] }.getOrDefault(0)
+
+    /**
+     * 本轮已进 KV 账本的生成 token 数（见 [nativeRoundLedgerTokens]）。
+     * 供生成循环在取消收尾时记一行"账本里有 X、下发了 Y"，不要用它做判定。
+     */
+    val roundLedgerTokens: Int get() = runCatching { nativeRoundLedgerTokens() }.getOrDefault(0)
+
+    /**
+     * KV 账本是否有效。false = **下一轮必然全量 prefill**（换模型 / 卸载 /
+     * 上一轮解码失败 / prompt 超长之后都是这个状态）。
+     */
+    val kvCacheValid: Boolean get() = runCatching { nativeKvCacheValid() }.getOrDefault(false)
+
+    /**
+     * 主动丢弃 prompt 缓存。存在的理由：**显式开关**比"等它自己失效"可控。
+     * 用户换了一整套 system prompt / 把模板改了之后，旧前缀本来就匹配不上
+     * （复用判据是逐 token 比前缀，不匹配自然不复用），但那时候 KV 里还留着一大段
+     * 用不上的数据白占显存 —— 在手机上这直接等于少了几 MB 可用 KV 空间。
+     */
+    fun resetKvCache() = runCatching { nativeKvCacheReset() }
+
+
     /** 取模型内置 chat 模板（Jinja 原文），空串=未知。 */
     fun chatTemplate(): String = nativeChatTemplate()
 
-    /** 用模型模板渲染多轮对话。roles/contents 等长；失败回落到 ChatML。 */
-    fun applyChatTemplate(messages: List<Pair<String, String>>, addAss: Boolean = true): String {
+    /**
+     * 用模型模板渲染多轮对话。roles/contents 等长；失败回落到 ChatML。
+     *
+     * [thinkingOn] 是这一轮**最终**的思考开关（请求覆盖 > 全局默认，见 `ThinkingControl.resolve`），
+     * 传给库的 `common_chat_templates_inputs::enable_thinking`。
+     *
+     * **必须传**：C++ 侧这个字段默认是 `true`，而 MiniCPM5 的模板按它决定生成后缀吐不吐
+     * `<think>\n` —— 不传就等于"思考永远开着"，设置页「默认关闭思考」在这类模型上恒不生效
+     * （2026-09-19 真机报障的第一个成因）。模板里没有 `enable_thinking` 变量时传下去不改变
+     * 渲染结果（LFM2.5），那类由 `ThinkingControl` 的软开关兜底，所以两条路径共用同一个取值。
+     */
+    fun applyChatTemplate(
+        messages: List<Pair<String, String>>,
+        addAss: Boolean = true,
+        thinkingOn: Boolean = true
+    ): RenderedPrompt {
         val roles = Array(messages.size) { messages[it].first }
         val contents = Array(messages.size) { messages[it].second }
-        val rendered = nativeApplyChatTemplate(chatTemplate(), roles, contents, addAss)
-        if (rendered != null) return rendered
-        // 回落：ChatML
+        val rendered = nativeApplyChatTemplate(chatTemplate(), roles, contents, addAss, thinkingOn)
+        if (rendered != null) return RenderedPrompt.parse(rendered)
+        // 回落：ChatML。**回落路径不得声明"思考段已开"** ——
+        // ChatML 拼出来的后缀里没有 <think>，模型输出里的 `</think>` 是它自己吐的，
+        // 必须由状态机去解析配对；这里若报 openAtStart=true，整段回答会被当思考段吞掉。
         val sb = StringBuilder()
         for ((r, c) in messages) sb.append("<|im_start|>").append(r).append('\n').append(c).append("<|im_end|>\n")
         if (addAss) sb.append("<|im_start|>assistant\n")
-        return sb.toString()
+        // 回落路径的生成后缀是**宿主自己拼的**那段（见上一行）—— 这里必须显式带上，
+        // 否则结构化输出的 grammar 又会退回"库自算的那个尾巴"，与真 prompt 分叉。
+        // 值取自 RequestContext.CHATML_GEN_SUFFIX（唯一来源，与上一行逐字一致，
+        // 由守卫断言两处字面量相同）；addAss=false 时**必须**是空串而不是 null：
+        // 空串 = "确认没有生成后缀"，null = "不知道" —— 后者会让 native 按
+        // "有生成后缀"推导 grammar（见 RequestContext.genPromptArg 的注释）。
+        return RenderedPrompt(
+            sb.toString(), openAtStart = false,
+            generationSuffix = if (addAss) RequestContext.CHATML_GEN_SUFFIX else "")
     }
 
     /**
@@ -754,8 +942,9 @@ object LlmEngine {
         toolsJson: String,
         toolChoice: String? = null,
         parallelToolCalls: Boolean = true,
-        addAss: Boolean = true
-    ): String? {
+        addAss: Boolean = true,
+        thinkingOn: Boolean = true
+    ): RenderedPrompt? {
         if (toolsJson.isBlank() || toolsJson == "[]" || toolsJson == "null") return null
         val roles = Array(messages.size) { messages[it].first }
         val contents = Array(messages.size) { messages[it].second }
@@ -763,9 +952,12 @@ object LlmEngine {
         probeMark("[工具] 即将渲染带 tools 的 prompt：msgs=${messages.size} tools_len=${toolsJson.length} " +
                 "chat_template_len=${tmpl.length}（=0 表示模型没带模板）choice=${toolChoice ?: "auto"}")
         return try {
-            val r = nativeApplyChatTemplateTools(tmpl, roles, contents, toolsJson, toolChoice, parallelToolCalls, addAss)
+            // thinkingOn 也要传：库的 enable_thinking 与上面那段同理，且它会影响
+            // generation_prompt（进而影响工具解析的前缀对齐），渲染侧与解析侧必须同源。
+            val r = nativeApplyChatTemplateTools(
+                tmpl, roles, contents, toolsJson, toolChoice, parallelToolCalls, addAss, thinkingOn)
             probeMark("[工具] 带 tools 渲染返回：${if (r == null) "null（回落无工具路径）" else "len=${r.length}"}")
-            r
+            r?.let { RenderedPrompt.parse(it) }
         } catch (t: Throwable) {
             uiLog("[工具] 模板渲染失败，回落无工具路径：${t.message}")
             null
@@ -779,7 +971,12 @@ object LlmEngine {
      * 语法随模板变化（Qwen 的 `<tool_call>`、Llama 的 `[TOOL_CALLS]` 等），
      * 由 native 侧 `common_chat_parse` 按模板归一，Kotlin 侧不做正则猜测。
      */
-    fun parseToolCalls(text: String, toolsJson: String, addAss: Boolean = true): Pair<String, String?>? {
+    fun parseToolCalls(
+        text: String,
+        toolsJson: String,
+        addAss: Boolean = true,
+        thinkingOn: Boolean = true
+    ): Pair<String, String?>? {
         if (text.isEmpty()) return null
         val tmpl = chatTemplate()
         probeMark("[工具] 即将调用 nativeParseToolCalls：text_len=${text.length} " +
@@ -788,7 +985,10 @@ object LlmEngine {
         // addAss 必须与**渲染时**同一个值：解析器是按模板推导的 PEG，而 cp.generation_prompt
         // （会被 common_chat_parse 前拼到输入上、进而决定 PEG 根节点能否匹配）随
         // add_generation_prompt 变化。两边不一致 = 根节点前缀对不上 = tool_calls 恒为 0。
-        val raw = try { nativeParseToolCalls(text, toolsJson, tmpl, addAss) } catch (t: Throwable) {
+        // thinkingOn 同理必须与**渲染时**同一个值：它决定 cp.generation_prompt 的形状
+        // （MiniCPM5 在 enable_thinking=true 下多一段 "<think>\n"），而那个量会被
+        // common_chat_parse 前拼到输入上。两边不一致 = PEG 根节点前缀对不上 = tool_calls 恒为 0。
+        val raw = try { nativeParseToolCalls(text, toolsJson, tmpl, addAss, thinkingOn) } catch (t: Throwable) {
             probeMark("[工具] nativeParseToolCalls 抛出异常：${t.javaClass.name}: ${t.message}")
             uiLog("[工具] 解析失败：${t.message}")
             null
@@ -812,11 +1012,36 @@ object LlmEngine {
      *
      * 入参由 [SamplingParams.check] 校验过，native 侧不再重复兜底：
      * NaN/Inf、越界值都会让 llama.cpp 的采样器行为未定义。
+     *
+     * [generationPrompt] 是这一轮**实际渲染出来的**生成后缀（prompt 里模型要接着续写的那段尾巴）。
+     * 它只在带 `response_format` 时有意义，用途是让 GBNF 约束与真实 prompt 对齐 ——
+     * 详见 [ResponseFormat.GenerationPrompt] 的注释（不对齐的后果是「输出前面多一段
+     * 模型自己吐的生成标记」）。
      */
     fun newSampler(temp: Float, topP: Float, minP: Float, seed: Long = 0,
                    topK: Int = 0, repPenalty: Float = 1f, penaltyN: Int = 0,
-                   freqPenalty: Float = 0f, presencePenalty: Float = 0f): Boolean =
-        nativeNewSampler(temp, topP, minP, topK, repPenalty, penaltyN, freqPenalty, presencePenalty, seed)
+                   freqPenalty: Float = 0f, presencePenalty: Float = 0f,
+                   stops: List<String> = emptyList(),
+                   responseFormat: ResponseFormat = ResponseFormat.None,
+                   generationPrompt: String? = null,
+                   chatTemplateOverride: String? = null,
+                   thinkingOn: Boolean = true): Boolean =
+        nativeNewSampler(temp, topP, minP, topK, repPenalty, penaltyN, freqPenalty, presencePenalty, seed,
+            // 空列表传 null（而不是空数组）：native 侧据此判断"要不要挂 stop 采样器"，
+            // 挂一个什么都不匹配的采样器只是白搭一次链上调用。
+            if (stops.isEmpty()) null else stops.toTypedArray(),
+            // 三态映射（None -> null / JsonObject -> "" / JsonSchema -> 原文）的唯一来源，
+            // 不在这里另判一次（两处各判一次必然漂移）。
+            JsonSchemaFormat.schemaArg(responseFormat),
+            // 生成后缀：null 表示"无 / 未知"，native 侧退回 `add_generation_prompt=true` 的旧口径。
+            generationPrompt,
+            // 模板：必须与**渲染侧同一份**。传 null/空串 = 让库按模型自选 ——
+            // 那是引入本特性之前的行为，但库内自选的那份与运行时模板可能不是同一份，
+            // grammar 会按别的模板算（或干脆产不出来），且不报错。
+            chatTemplateOverride,
+            // 思考开关：**必须与渲染侧同一个值**，理由见 nativeNewSampler 的说明与
+            // gbnf_from_json_schema 的判据 ④。回落 ChatML 那条路也把它带下去。
+            thinkingOn)
 
     /**
      * 开始一轮生成：清 KV -> tokenize(含 BOS) -> 分块 prefill。
@@ -843,8 +1068,23 @@ object LlmEngine {
         genPromptTok = contextUsed().coerceAtLeast(0)
         genPrefillMs = (t1 - t0).coerceAtLeast(1L)
         genTok = 0; genT0 = t1; genActive = true
+        // 这里报的是**本轮整段 prompt 的 token 数**（= n_used，含被复用的那截），
+        // 不是"本次新算了多少" —— 后者由下面那行单列。
+        //
+        // 为什么必须分成两行：复用生效时 genPromptTok 会**变大**（prompt 更长），
+        // 而 prefillMs 会变小，于是 tok/s 看起来"变快了很多"，但那是分母变了，
+        // 不是模型变快了。`prefill X tok / Yms` 与 native 的 `新算 N / 复用 M`
+        // 两条一起看才判得准（第一轮 N==X、M==0，之后 M 应显著大于 0）。
         uiLog("${LogFileStore.TAG_TIME} prefill %d tok / %dms = %.1f tok/s".format(
                 genPromptTok, genPrefillMs, genPromptTok * 1000.0 / genPrefillMs))
+        val newTok = lastPrefillTokens
+        val reused = lastReuseTokens
+        if (reused > 0) {
+            uiLog("${LogFileStore.TAG_TIME} KV 前缀复用：复用 %d tok / 新算 %d tok（共 %d）".format(
+                    reused, newTok, genPromptTok))
+        } else {
+            uiLog("${LogFileStore.TAG_TIME} KV 前缀复用：未命中，全量 prefill %d tok".format(newTok))
+        }
         return null
     }
 
@@ -862,21 +1102,75 @@ object LlmEngine {
         val ms = (android.os.SystemClock.elapsedRealtime() - genT0).coerceAtLeast(1L)
         uiLog("${LogFileStore.TAG_TIME} decode %d tok / %dms = %.1f tok/s ｜ 引擎=%s HTP=%s".format(
                 genTok, ms, genTok * 1000.0 / ms, nativeTag ?: "?", htpRequested))
+        // 内存这一栏必须有一个**推理态**的数：此前唯一的 RSS 探针打在 loadModel 里，
+        // 于是"加载完成态"被当成"跑起来的占用"，优化时瞄错了时刻（见 native 那段注释）。
+        val peak = runCatching { nativeRssPeakMb() }.getOrDefault(-1)
+        if (peak > 0) uiLog("${LogFileStore.TAG_MEM} 推理期 RSS 峰值 %d MB（加载态读数见 [mmap释放]，两者成对读）".format(peak))
     }
 
-    /** 中断当前生成（下一次 step 返回 null）。 */
-    fun abort() = nativeAbort()
+    /**
+     * 中断当前生成（下一次 step 返回 null）。
+     *
+     * 保留这个公开名（UI 侧历史调用点），但**必须**带上归属：裸的无编号取消会把
+     * 一个迟到的调用打到下一轮上（见 `RequestCancel` 文件头与本文件 [requestAbort]）。
+     * 没有轮次在跑时它演化为 no-op —— 这正是我们要的语义：取消不存在的轮次不该
+     * 产生任何副作用，也不该"预支"给下一次。
+     */
+    fun abort(): RequestCancel.Token? = requestAbort()
 
     /** 释放采样器/上下文/模型。与 [loadModel] 共用同一把锁：卸载与加载交错同样会污染 native 状态。 */
-    fun unload() = synchronized(loadLock) {
-        if (!loaded) return@synchronized
+    fun unload() = synchronized(loadLock) { unloadLocked() }
+
+    /**
+     * [unload] 的实体；调用方已持有 [loadLock]（与 `loadModelLocked` 同一约定，
+     * 避免重入与锁序问题）。换模型那条路径也走它 —— 卸载的**副作用**（释放后
+     * 报读、归还未释放的匿名页）只有一处，不会出现"这条路做了、那条路漏了"。
+     */
+    private fun unloadLocked() {
+        if (!loaded) return
         genActive = false   // 换模型/卸载时复位，避免旧计数串进下一轮
         nativeFreeSampler()
+        // 释放这一幕必须**当场报读**：`[内存] 卸载 RSS …` 由 native 在
+        // `llama_model_free` 前后各量一次 VmRSS 得到。此前卸载这条路径上
+        // 一行读数都没有，用户只能去任务管理器看"占用降不下来"，
+        // 日志静默（0.9.130 现场）。
         nativeUnloadModel()
         currentPath = null
         // 卸载要连预读状态一起作废，否则 UI 会继续显示上一个模型的信息（误导）
-        probePath = null
+        probeId = null
         probeVal = null
+        // 释放之后再把"还没还给内核的页"补一脚（见 [reclaimReleasedHeap]）：
+        // 卸载完还留在 RSS 里的只剩下这一类，这一脚是**净收益**，且只跑一次。
+        reclaimReleasedHeap()
+    }
+
+    /**
+     * 把"已 free、但还没归还内核的匿名页"补一次 `madvise(MADV_DONTNEED)`，并报前后 RSS。
+     *
+     * 为什么必须有这一脚：**CPU 侧的默认分配器会缓存刚释放的堆段**（glibc 的
+     * `M_TRIM_THRESHOLD`/`M_MMAP_THRESHOLD`、scudo 的 size class 缓存，Android 上
+     * 是后者）。它的直接后果是 —— repack 的匿名拷贝、KV、compute buffer 虽然都
+     * `free` 了，**VmRSS 照样不降**。于是应用列表里显示的占用一直很高，
+     * 看起来像"repack 根本没省"，而实际省下来的只是"还没归还"。
+     * 只有 `malloc_trim(0)`（把空闲堆段还给内核）或整进程重启能把这段要回来。
+     *
+     * 判据（与 `[mmap释放]` 同一套写法，**自证**）：前后各读一次 VmRSS 打进日志。
+     *
+     * 为什么只在**卸载后空闲**这一刻做，不在加载后做：`malloc_trim` 会把页还掉，
+     * 下一次分配又要重新缺页（代价是加载/首轮推理变慢）；而 `madvise(MADV_DONTNEED)`
+     * 对**已释放**的块没有副作用（它们本来就不该被读）。空闲时调用是净收益。
+     *
+     * 为什么**必须**在 native 里做而不是 Kotlin：判据是"运行期拿到的 `mallinfo`/RSS
+     * 真实变化"，而且是 native 自己 malloc 出来的匿名页；Kotlin 那侧的 System/API
+     * 看不见这些块，也唤不动 native 的分配器。**不 fork 任何子进程** ——
+     * 本仓库此前在 native probe 里用 `fork`+`execl` 读系统属性，在国产 ROM 上被
+     * 域策略整族拦掉（见 `probe_getprop` 那段），同一种病不再犯一次。
+     *
+     * 失败**不影响任何结果**：最坏就是"没多还这一份"，与不做之前完全一致。
+     */
+    private fun reclaimReleasedHeap() {
+        val log = runCatching { nativeReclaimReleasedHeap() }.getOrNull() ?: return
+        if (log.isNotEmpty()) uiLog(log)
     }
 
     // ---- native ----
@@ -902,24 +1196,106 @@ object LlmEngine {
     @JvmStatic private external fun nativeModelDesc(): String
     @JvmStatic private external fun nativeCtxSize(): Int
     @JvmStatic private external fun nativeCtxUsed(): Int
+    /**
+     * KV 前缀复用统计，返回 int[3] = {上一轮复用的 token 数, 上一轮新算的 token 数,
+     * 已跑完 prefill 的轮次数}。与 [lastReuseTokens] / [lastPrefillTokens] /
+     * [kvRounds] 成对，见那边的说明。
+     */
+    @JvmStatic private external fun nativeKvCacheStats(): IntArray
+    /** KV 账本是否有效（下一轮能否复用）。 */
+    @JvmStatic private external fun nativeKvCacheValid(): Boolean
+    /** 丢弃 prompt 缓存（清 KV 并作废账本）。 */
+    @JvmStatic private external fun nativeKvCacheReset()
     @JvmStatic private external fun nativeChatTemplate(): String
     @JvmStatic private external fun nativeApplyChatTemplate(
-        tmpl: String, roles: Array<String>, contents: Array<String>, addAss: Boolean): String?
+        tmpl: String, roles: Array<String>, contents: Array<String>, addAss: Boolean,
+        thinkingOn: Boolean): String?
     /** 带 tools 的模板渲染：工具定义进 prompt（旧接口不认 tools，工具调用永远不触发）。 */
     @JvmStatic private external fun nativeApplyChatTemplateTools(
         tmpl: String, roles: Array<String>, contents: Array<String>,
-        toolsJson: String?, toolChoice: String?, parallelToolCalls: Boolean, addAss: Boolean): String?
+        toolsJson: String?, toolChoice: String?, parallelToolCalls: Boolean, addAss: Boolean,
+        thinkingOn: Boolean): String?
     /**
      * 从输出文本解析 tool_calls，返回 JSON；无工具调用或解析失败返回 "null"。
      *
      * 必须传入**渲染时的同一个模板**：解析器是按模板推导出的 PEG，两边不一致会解析错。
      */
     @JvmStatic private external fun nativeParseToolCalls(
-        text: String, toolsJson: String?, tmpl: String, addAss: Boolean): String
-    @JvmStatic private external fun nativeNewSampler(temp: Float, topP: Float, minP: Float, topK: Int, repPenalty: Float, penaltyN: Int, freqPenalty: Float, presencePenalty: Float, seed: Long): Boolean
+        text: String, toolsJson: String?, tmpl: String, addAss: Boolean, thinkingOn: Boolean): String
+    /**
+     * [stops] 为 null / 空表示不带 stop 序列；[schema] 为 null 表示不约束输出格式（见 [ResponseFormat]）。
+     * [genPrompt] 为这一轮实际渲染出的生成后缀；null 表示"无 / 未知"，native 侧退回旧口径
+     * （见 [ResponseFormat.GenerationPrompt]）。
+     * [tmpl] 为这一轮的 chat 模板原文（与渲染侧同源）；空串表示"按模型自选"。
+     */
+    @JvmStatic private external fun nativeNewSampler(temp: Float, topP: Float, minP: Float, topK: Int, repPenalty: Float, penaltyN: Int, freqPenalty: Float, presencePenalty: Float, seed: Long, stops: Array<String>?, schema: String?, genPrompt: String?, tmpl: String?, thinkingOn: Boolean): Boolean
     @JvmStatic private external fun nativeStartCompletion(prompt: String, maxTokens: Int): Boolean
     @JvmStatic private external fun nativeStep(): String?
-    @JvmStatic private external fun nativeAbort()
+    /**
+     * 取消编号为 [roundEpoch] 的那一轮生成。编号由 [nativeCurrentEpoch] 在轮次开始时取得。
+     * 编号与当前轮次不一致（或为 0）时**一律不生效** —— 宁漏停，不错停；见 native 侧注释。
+     */
+    @JvmStatic private external fun nativeAbort(roundEpoch: Long)
+    /** 取当前轮次编号（供 [beginCancelable] 绑定归属；未在生成时是"最后一次的编号"）。 */
+    @JvmStatic private external fun nativeCurrentEpoch(): Long
+    /**
+     * 本轮已进 KV 账本的生成 token 数。取消收尾时与"已下发的步数"对账：
+     * 两者不等 = 有一段内容引擎算过、客户端没收到（E-4 的可观测面，**不回滚**）。
+     */
+    @JvmStatic private external fun nativeRoundLedgerTokens(): Int
+    /**
+     * 权重重排（repack）档位：`0` = 关、`1` = 开、其它 = **没设过**（native 落回库默认）。
+     *
+     * 走 JNI 参数而不是系统属性：属性那条链要 `fork` + `exec /system/bin/getprop`，
+     * 在真机上读不到时**与"没设过"同形**（见 native `model_use_extra_bufts` 的注释），
+     * 而这一档是"少一份匿名拷贝"的唯一旋钮，判定必须落在仓库自己的存储上。
+     *
+     * 命名：本方法原名 `nativeSetExtraBufts`，与**库内部字段** `use_extra_bufts` 同名，
+     * 于是日志/设置页/代码三处对"这一档叫什么"各叫各的（用户对着日志找不着设置项）。
+     * 0.9.127 起统一叫 `repack`，并为跨版本改名留一个**别名**（见下）。
+     */
+    // 注意：本方法（以及下面的旧名别名）在 native 侧的定义**必须落在**
+    // `extern "C"` 作用域内。少了那层链接规格，C++ 会重整符号名，
+    // JVM 就找不到它 —— 0.9.125 装机后正是这么报 UnsatisfiedLinkError 的
+    // （0.9.126 修；守卫见 run_mmap_device_guard 第 ⑩ 条，按**结构**钉，
+    // 不按"名字在文件里出现过"钉）。
+    @JvmStatic private external fun nativeSetRepack(mode: Int)
+
+    /**
+     * 旧名别名（0.9.127 起弃用）：**只有**在装到了不含 [nativeSetRepack] 的旧 .so
+     * （覆盖安装少解压某个 ABI 变体）时才可能命中，命中即有日志、不静默 ——
+     * 否则就是"改名把功能改哑了，而日志看不出为什么"。
+     */
+    @JvmStatic private external fun nativeSetExtraBufts(mode: Int)
+
+    /**
+     * 把档位交给 native；优先新名，**只在**新名缺失时才回退旧名。
+     * 为什么不是"两个都调"：两个符号在同一个 .so 里写同一个变量，都调等于
+     * 把"到底哪条链生效"重新变成不可观测 —— 本轮要修的正是这个病。
+     */
+    private fun setRepackMode(mode: Int) {
+        try {
+            nativeSetRepack(mode)
+        } catch (t: UnsatisfiedLinkError) {
+            uiLog("[repack] ⚠ 本包 native 未导出 nativeSetRepack（旧 .so？）→ 回退旧名；" +
+                "档位来源在日志里会写成旧名，报告问题时请一并附上本行")
+            try {
+                nativeSetExtraBufts(mode)
+            } catch (t2: UnsatisfiedLinkError) {
+                uiLog("[repack] ⚠ 旧名也不可用 → 本轮档位落回库默认（设置页的值**未生效**）")
+            }
+        }
+    }
+
+    /** 推理期 RSS 峰值（MB）；-1 = 还没跑过任何一轮或读不到。见 native `rss_note_peak`。 */
+    @JvmStatic private external fun nativeRssPeakMb(): Int
+
+    /**
+     * 卸载后补一脚"把已释放的匿名页还给内核"，返回该打的一行日志（空串 = 无需报读）。
+     * 见 [reclaimReleasedHeap] 的注释：这一脚对付的是"free 了但 RSS 不降"的分配器缓存。
+     */
+    @JvmStatic private external fun nativeReclaimReleasedHeap(): String
+
     @JvmStatic private external fun nativeFreeSampler()
     @JvmStatic private external fun nativeUnloadModel()
 }

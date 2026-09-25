@@ -47,7 +47,11 @@ class InferenceService : Service() {
         when (intent?.action) {
             ACTION_STOP -> {
                 // 停止服务 = 关 HTTP + 卸载模型。
-                // 保证下次「启动服务」必走完整加载流程：切换的 ctx/线程/GPU 参数生效、日志刷新。
+                // ⚠ 必须先 `HttpApi.stop()` 再卸载模型：stop() 会置 desired=false
+                // （看门狗据此**不**自愈），并收敛在途连接 —— 若顺序反了，
+                // 卸载期间一个还在途的生成请求会打到已卸载的引擎上
+                // （`LlmEngine.unload()` 只持 `loadLock`，不持 `genLock`，也不看 `hasModel`）。
+                HttpApi.stop()
                 if (LlmEngine.hasModel) {
                     try {
                         LlmEngine.unload()
@@ -58,8 +62,8 @@ class InferenceService : Service() {
                 } else {
                     LlmEngine.uiLog("[服务] 已停止（无已加载模型）")
                 }
-                HttpApi.stop()
                 HttpApi.currentModel = null
+                // 保证下次「启动服务」必走完整加载流程：切换的 ctx/线程/GPU 参数生效、日志刷新。
                 stopForeground(STOP_FOREGROUND_REMOVE)
                 stopSelf()
                 return START_NOT_STICKY
@@ -71,6 +75,8 @@ class InferenceService : Service() {
                     HttpApi.appContext = applicationContext
                     HttpApi.PORT = ModelStore.serverPort(applicationContext)
                     HttpApi.bindAll = ModelStore.lanAccess(applicationContext)
+                    applyCorsWhitelist(applicationContext)
+                    applyApiToken(applicationContext)
                     HttpApi.start()
                     LlmEngine.uiLog("[服务] 检测到已加载模型，直接挂载: ${LlmEngine.modelDesc()}（未重新加载）")
                     Thread {
@@ -83,6 +89,10 @@ class InferenceService : Service() {
                 val path = intent.getStringExtra(EXTRA_MODEL_PATH)
                 if (path.isNullOrBlank()) {
                     LlmEngine.uiLog("[服务] 启动失败：无已加载模型且未指定模型路径")
+                    // 收尾与 ACTION_STOP 同一条纪律：先 HttpApi.stop() 再 stopSelf()。
+                    // 只 stopSelf() 的话 watchdog 每 30s 探活、连续 2 次失败就重启 listener，
+                    // 而这里的 desired 仍为 true —— 要靠 onDestroy() 兜（它是异步的，慢于 30s）。
+                    HttpApi.stop()
                     stopSelf(); return START_NOT_STICKY
                 }
                 val ctxSize = intent.getIntExtra(EXTRA_CTX, 4096)
@@ -106,6 +116,8 @@ class InferenceService : Service() {
                 HttpApi.PORT = ModelStore.serverPort(applicationContext)
                 // 注入局域网访问开关
                 HttpApi.bindAll = ModelStore.lanAccess(applicationContext)
+                applyCorsWhitelist(applicationContext)
+                applyApiToken(applicationContext)
                 // 注入思考默认开关
                 HttpApi.disableThinkingDefault = ModelStore.disableThinking(applicationContext)
                 HttpApi.start()
@@ -142,6 +154,8 @@ class InferenceService : Service() {
                     HttpApi.appContext = applicationContext
                     HttpApi.PORT = ModelStore.serverPort(applicationContext)
                     HttpApi.bindAll = ModelStore.lanAccess(applicationContext)
+                    applyCorsWhitelist(applicationContext)
+                    applyApiToken(applicationContext)
                     HttpApi.disableThinkingDefault = ModelStore.disableThinking(applicationContext)
                     HttpApi.start()
                     LlmEngine.uiLog("[服务] 检测到系统重启服务，自动恢复: ${mf.name}")
@@ -178,11 +192,49 @@ class InferenceService : Service() {
                     }.start()
                 } else {
                     LlmEngine.uiLog("[服务] 系统重启服务但未找到已选模型，自动停止")
+                    HttpApi.stop()
                     stopSelf()
                 }
             }
         }
         return START_STICKY
+    }
+
+    /**
+     * 把 Bearer token 从设置注入 [ApiAuth]。
+     *
+     * 与 [applyCorsWhitelist] 同一个道理：不接这一步，"设置页填了 token"就只是
+     * 存进了 prefs，服务端压根不认 —— 而那种失效**完全不报错**：用户以为开了鉴权，
+     * 实际接口仍然裸奔（或反过来，token 永远对不上）。三个启动分支都要走这一步，
+     * 漏掉任何一个都会制造"同一个设置有的路径生效、有的不生效"。
+     *
+     * 空 token = 鉴权关闭（保持旧行为），不做任何隐式兜底。
+     */
+    private fun applyApiToken(ctx: android.content.Context) {
+        val t = ModelStore.apiToken(ctx)
+        ApiAuth.token = t
+        LlmEngine.uiLog(if (t.isEmpty()) "[服务] 鉴权未开启（生成端点不要求 token）"
+                        else "[服务] 鉴权已开启：仅 /v1/ 生成端点要求 Authorization: Bearer")
+    }
+
+    /**
+     * 把 CORS 白名单从设置注入 [HttpApi]。
+     *
+     * 为什么在白名单**默认集之外**还要接这一步：默认只放行回环与本机 IP，
+     * 局域网内**另一台机器**上的前端（例如 PC 上的 Open WebUI）默认不在里面。
+     * 用户加了来源就必须真的生效 —— 一个"填了没用"的白名单，最终会把所有人
+     * 逼回 `Access-Control-Allow-Origin: *`，那正是本次刻意不做的形态。
+     *
+     * 逐条规范化；**非法串直接丢弃并留日志**，绝不静默变成"放行一切"。
+     */
+    private fun applyCorsWhitelist(ctx: android.content.Context) {
+        CorsPolicy.enabled = ModelStore.corsEnabled(ctx)
+        CorsPolicy.clearOrigins()
+        for (raw in ModelStore.corsExtraOrigins(ctx)) {
+            if (!CorsPolicy.addOrigin(raw)) {
+                LlmEngine.uiLog("[服务] CORS 白名单条目无效已忽略: $raw")
+            }
+        }
     }
 
     private fun buildNotification(text: String): Notification {
@@ -216,6 +268,10 @@ class InferenceService : Service() {
     }
 
     override fun onDestroy() {
+        // 非用户意图的销毁（系统回收、OEM 冻结杀进程）也走 stop()：
+        // 本进程的监听 socket 与在途连接必须收敛，不留给"进程内的僵尸 LISTEN"。
+        // 注意这与 A-2 的 desired 语义**不冲突**：服务真销毁了就不该再自愈，
+        // 下次启动由 ACTION_START / STICKY 分支重新置 desired。
         HttpApi.stop()
         super.onDestroy()
     }

@@ -1,6 +1,7 @@
 package com.xiaowan.localinference
 
 import android.content.Context
+import android.util.Log
 import org.json.JSONArray
 import org.json.JSONObject
 import java.io.File
@@ -15,6 +16,14 @@ import java.io.File
 object SessionStore {
 
     const val MAX_SESSIONS = 50   // 上限，超出提示先删旧的
+
+    /** 发给模型的历史字符数上限，防撑爆 ctx。裁剪留痕见 [capChars]。 */
+    const val MAX_CHARS = 24000
+
+    /** 裁剪时**保底保留**的消息条数（至少留住最近一轮问答）。 */
+    const val MIN_MSGS = 2
+
+    private const val TAG = "SessionStore"
     private const val DIR = "sessions"
     private const val CUR = "sessions_current.txt"
     private const val LEGACY = "chat_session.json"
@@ -195,10 +204,46 @@ object SessionStore {
         var msgs = (0 until arr.length()).map { arr.getJSONObject(it) }.toMutableList()
         while (msgs.isNotEmpty() && msgs[0].optString("role") == "assistant") msgs.removeAt(0)
         while (msgs.size > 40) msgs.removeAt(0)
-        while (msgs.sumOf { it.optString("content").length } > 24000 && msgs.size > 2) msgs.removeAt(0)
+        capChars(ctx, id, msgs)
         val kept = JSONArray()
         msgs.forEach { kept.put(it) }
         o.put("messages", kept).put("updatedAt", System.currentTimeMillis())
         runCatching { fileOf(ctx, id)?.writeText(o.toString()) }
+    }
+
+    /**
+     * 字符数上限（[MAX_CHARS]）的落实。
+     *
+     * 旧写法把两件事塞进同一个 while 条件：
+     * `while (sum > MAX_CHARS && msgs.size > 2) msgs.removeAt(0)`
+     * 而 `size > 2` 是**先决条件**不是保底 —— 消息数正好为 2 时整条循环短路，
+     * 「保险丝」在**最需要它**的场景（一轮问答各上万字，例如贴整段代码让它改）
+     * 恰好完全失效：注释声称最多 24k 字符，实况可以远超，且没有任何提示。
+     *
+     * 现在拆成两级，且**两级都做**（只丢历史不够：「两条各 12k+12k」时条数已是保底，
+     * 而每条单独看都不超限，总长仍会突破上限）：
+     * 1. 先从最早的历史开始丢，丢到下限 [MIN_MSGS] 条为止；
+     * 2. 若仍超限，从**最新**的一条往前逐条截断（保留每条开头 —— 提问/结论在开头），
+     *    直到总长落回上限内。
+     *
+     * 留痕很重要 —— 否则症状是 native 侧静默截断 prompt 前半段，表现为「答非所问」。
+     */
+    private fun capChars(ctx: Context, id: String, msgs: MutableList<JSONObject>) {
+        fun total() = msgs.sumOf { it.optString("content").length }
+        val before = total()
+        while (msgs.size > MIN_MSGS && total() > MAX_CHARS) msgs.removeAt(0)
+        if (total() <= MAX_CHARS) return
+        // 从最新往前截，把超出的部分摊到各条上（先动最新的，越老的历史越完整）。
+        var over = total() - MAX_CHARS
+        for (i in msgs.indices.reversed()) {
+            if (over <= 0) break
+            val cur = msgs[i].optString("content")
+            val cut = minOf(over, cur.length)
+            if (cut > 0) {
+                msgs[i].put("content", cur.substring(0, cur.length - cut))
+                over -= cut
+            }
+        }
+        Log.w(TAG, "会话 $id 超过 $MAX_CHARS 字符（$before -> ${total()}），已裁剪最早历史并截断末条")
     }
 }

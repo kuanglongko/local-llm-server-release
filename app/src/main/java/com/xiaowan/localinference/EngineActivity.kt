@@ -83,8 +83,48 @@ class EngineActivity : Activity() {
     private lateinit var pageLog: LinearLayout
     private lateinit var stopBtn: Button
     private lateinit var clearBtn: Button
+    /**
+     * 本页「停止」按钮的**一次性**意图。生命周期严格是**一轮生成**：
+     * 置位方是按钮回调（主线程），读取方是生成线程，**每一轮开跑时清零**
+     * （位置见 [doGenerate] 里的注释：`genLock` 之内、`startCompletion` 之前）。
+     *
+     * ══════════════════════════════════════════════════════════════════
+     * 为什么必须清零（Issue #154：停一次之后整个 App 再也生成不了）
+     * ══════════════════════════════════════════════════════════════════
+     * 它此前是**进程级**字段：`doGenerate()` 里从来没有把它复位过，于是
+     * 「按下停止」= 把 `stopRequested` **永久**置为 true。表现分两层：
+     *
+     *   · 看得见的一层：本页后续每一轮的生成循环
+     *     `while (n < maxTok && !stopRequested && ...)` 第一判就是 false ——
+     *     一个 token 都不生成，而 `generating`/`genBtn`/`statusTv` 全按"跑完一轮"
+     *     正常收尾（`done = true`）。UI 上点「生成」像在跑，实际是空转，
+     *     且**不会抛异常、不会打日志**，只有真的盯着 `n=0` 才看得出来。
+     *   · 更坏的一层：`generating` 由 finally 复位，所以上面那个空转是"瞬间结束"的，
+     *     但它同时把**会话相关的一票守卫**（`showSessionDialog` / `doCreateSession`
+     *     的 `if (generating) return` 只是其一）与 `genBtn.isEnabled` 卷进同一段
+     *     竞态里；用户读到的是「点生成没反应 / 切不了会话 / 开不了新对话」，
+     *     而这一切的起点只是"刚才按过一次停止"。
+     *
+     * 为什么不在**收尾**清零、而放在**开跑前**：清零属于"新一轮开始"这个动作。
+     * 收尾那条路径上，前面还排着几个提前 `return` 的分支（模型未加载、参数非法、
+     * prompt 为空），每个分支都得各自记得清一次 —— 漏一条，同一个毛病就原样
+     * 复发（"停一次，之后再点生成还是零 token"）。放在生成线程**真正开跑**
+     * 那一行，因果是单向的：谁开跑，谁负责让上一轮的停止意图作废。
+     * HTTP 路径不读这个字段（它有自己的 `RequestCancel.Token`），所以这里
+     * 的生命周期与"跨请求残留"无关。
+     */
     @Volatile private var stopRequested = false
     private lateinit var mmapEt: EditText
+    /**
+     * repack 档位：`null` = 没设过（→ 库默认开）、`0` = 关、`1` = 开。
+     *
+     * 为什么是**单选组**而不是上一版的输入框：上一版把它做成一个 13sp 的输入框，
+     * 说明写着"留空=默认开"，而真机实测里用户**连它有没有生效都判不出来** ——
+     * 输入框不显示"当前是哪一个档"，`""`（没设过）与"填了又被清掉"在界面上同形。
+     * 三档互斥、且"没设过"本身就是一个可见档位，单选组才是它该有的形态。
+     */
+    private var repackMode: Int? = null
+    private var repackGroup: android.widget.RadioGroup? = null
     private lateinit var loadBtn: Button
     private lateinit var genBtn: Button
     private lateinit var serverBtn: Button
@@ -93,6 +133,14 @@ class EngineActivity : Activity() {
     private lateinit var probeResultTv: TextView
     @Volatile private var probing = false
     private lateinit var lanCb: android.widget.CheckBox
+    /** CORS 开关（白名单式，默认开）+ 额外来源输入框。 */
+    private lateinit var corsCb: android.widget.CheckBox
+    private lateinit var corsExtraEt: EditText
+    private lateinit var corsHintTv: TextView
+    /** 接口鉴权：token 只读展示框 + 生成/复制/关闭。 */
+    private lateinit var authEt: EditText
+    private lateinit var authRow: LinearLayout
+    private lateinit var authHintTv: TextView
     private lateinit var thinkCb: android.widget.CheckBox
     private lateinit var flashCb: android.widget.CheckBox
     private lateinit var portEt: EditText
@@ -128,6 +176,8 @@ class EngineActivity : Activity() {
     private var importing = false
     private val ioExecutor = Executors.newSingleThreadExecutor()
     private var pollRunning = false
+    /** 模型库列表的渲染代际：只允许最新一次取数的结果落到视图上（见 refreshModelList） */
+    private var modelListGen = 0
 
     private fun px(dp: Int) = (dp * resources.displayMetrics.density).toInt()
 
@@ -283,6 +333,60 @@ class EngineActivity : Activity() {
         return r
     }
 
+    /**
+     * repack 档位的**三档单选组**：没设过（库默认，开）/ 关 / 开。
+     *
+     * 为什么三档都要显式给出来，而不是"留空=默认"：
+     * 上一版就是个留空即默认的输入框，而"没设过"在界面上**看不见** ——
+     * 用户既不知道当前是哪一档，也没法在改过之后回到"跟随库默认"。
+     * 更关键的是 native 侧要靠这个区分"谁定的档"（日志里的「来源」），
+     * 所以第三种状态必须在 UI 上同样可选、且与 `0` 明显并列。
+     *
+     * 与上面的 NPU 配额组同一套写法（`View.generateViewId()` + 加完再 `check()`）：
+     *   · id 用运行时生成，不新开 res/values/ids.xml —— 本仓库的资源文件只有
+     *     `strings.xml`，为一个 UI 常量新开一类资源不值当；
+     *   · 初始选中**不能**在 addView 之前预置 `isChecked`（RadioGroup 在
+     *     onChildViewAdded 里记账，预置会让 checkedId 与显示脱钩 —— 见上面配额组那段），
+     *     所以先记下"该勾哪个"的 id，加完再 `check()`；
+     *   · 「还原默认设置」要回勾这一档，因此 id 存在字段 `repackDefaultId` 上。
+     */
+    private var repackDefaultId = View.NO_ID
+
+    private fun repackRadioGroup(): android.widget.RadioGroup {
+        val g = android.widget.RadioGroup(this).apply { orientation = android.widget.RadioGroup.VERTICAL }
+        var initId = View.NO_ID
+        // 显式标注 `Int?`：`"…" to null` 会被推成 `Pair<String, Nothing?>`，
+        // 三个混在一起虽能推出 `Int?`，但写明白了才不会被后续改动悄悄改窄。
+        listOf(
+            "没设过（跟随库默认 = 开）" to (null as Int?),
+            "关（省一份匿名拷贝，CPU 侧可能变慢）" to 0,
+            "开（显式打开重排，与默认一致）" to 1
+        ).forEach { pair ->
+            val rb = android.widget.RadioButton(this).apply {
+                text = pair.first; textSize = 13f; tag = pair.second
+                id = View.generateViewId()
+                if (repackMode == pair.second) initId = id
+                if (pair.second == null) repackDefaultId = id
+            }
+            // 必须 MATCH_PARENT + 权重 0：`lp(0, 1)` 会给出「宽=0dp、weight=1」的
+            // 横向参数，而本组是 VERTICAL —— weight 在纵向 LinearLayout 里分的是**高度**，
+            // 于是每个 RadioButton 被拉成整屏高的空块（三档就是三大片空白，文字挤在中间），
+            // 表现正是"全是空白、没法调"。宽同理由 0dp 撑不开。见 run_repack_lp_guard.sh。
+            g.addView(rb, LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT))
+        }
+        if (initId != View.NO_ID) g.check(initId)
+        g.setOnCheckedChangeListener { grp, id ->
+            val v = grp.findViewById<android.widget.RadioButton>(id)?.tag as? Int
+            if (v == repackMode) return@setOnCheckedChangeListener
+            repackMode = v
+            persistParams()
+            LlmEngine.uiLog("[repack] 设置页档位已改为 " + (v?.toString() ?: "没设过") +
+                "；重新加载模型后日志会给出 [repack] / [repack结果] 两行作为凭据")
+        }
+        return g
+    }
+
     private fun lp(w: Int, weight: Int) = LinearLayout.LayoutParams(
         if (w == 0) 0 else ViewGroup.LayoutParams.WRAP_CONTENT,
         ViewGroup.LayoutParams.WRAP_CONTENT, weight.toFloat()).apply {
@@ -391,10 +495,15 @@ class EngineActivity : Activity() {
         serverBtn.setOnClickListener { toggleServer() }
         probeBtn = btn("存活探测")
         probeBtn.setOnClickListener { doProbe() }
+        // 「打开测试页」与「存活探测」是一对：探测回答"通不通"，
+        // 测试页回答"通的是不是我要的东西"（能不能真聊一句）。
+        val webBtn = btn("打开测试页")
+        webBtn.setOnClickListener { openWebPage() }
         // 两个按钮同排：探测就是"启动/停止之后紧接着要做的那件事"，
         // 放到下面的折叠分组里等于把最需要它的场景（服务起不来）藏起来。
         val srvRow = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
         srvRow.addView(serverBtn, lp(0, 1)); srvRow.addView(probeBtn, lp(0, 1))
+        srvRow.addView(webBtn, lp(0, 1))
         pageSet.addView(srvRow, ViewGroup.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT,
             ViewGroup.LayoutParams.WRAP_CONTENT))
         serverTv = TextView(this).apply {
@@ -453,17 +562,87 @@ class EngineActivity : Activity() {
             isChecked = ModelStore.lanAccess(this@EngineActivity)
         }
         pageSet.addView(lanCb)
-        // 默认关闭思考（SmolLM3/Qwen3 等混合思考模型；客户端 enable_thinking 参数可覆盖）
-        thinkCb = android.widget.CheckBox(this).apply {
-            text = "默认关闭思考（客户端可用 enable_thinking 覆盖）"
+
+        // ---- 接口鉴权（Bearer token）----
+        //
+        // 为什么放进「本地服务」段：端口、局域网开关、CORS、token 说的都是
+        // **"谁能以什么方式连上这个服务"** —— 它们本来就是一组，不属于生成参数。
+        // 仍紧跟 CORS：两者是同一件事的两半 —— CORS 决定"浏览器肯不肯把响应交给
+        // 页面"，token 决定"谁有资格调用"，只开一个都不算能安全地用。
+        //
+        // token 用**只读输入框**展示而不是只放进提示文字里：它要能被选中、复制、
+        // 粘进 Open WebUI / curl。用 EditText 而不是 TextView 是因为长按选择文本
+        // 在 EditText 上是标配交互，用户不用学。
+        pageSet.addView(label("── 接口鉴权（仅生成端点）──"))
+        authRow = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
+        authEt = field("未开启（生成端点不要求 token）", ModelStore.apiToken(this@EngineActivity)).apply {
+            isEnabled = false            // 只读：允许选中/复制，但不接受手改（避免手抄出错）
+            setTextIsSelectable(true)
+            textSize = 12f
+        }
+        authRow.addView(authEt, lp(0, 1))
+        val authBtnCol = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+        authBtnCol.addView(btn("生成 token").apply {
+            setOnClickListener {
+                val t = ApiAuth.regenerate()
+                ModelStore.setApiToken(this@EngineActivity, t)
+                ApiAuth.token = t
+                refreshAuthUi()
+                LlmEngine.uiLog("[鉴权] 已生成新 token（长度 ${t.length}），仅 /v1/ 生成端点要求它")
+            }
+        })
+        authBtnCol.addView(btn("复制").apply {
+            setOnClickListener {
+                val t = ModelStore.apiToken(this@EngineActivity)
+                if (t.isEmpty()) {
+                    LlmEngine.uiLog("[鉴权] 还没有 token，先点「生成 token」")
+                    statusTv.text = "还没有 token，先点「生成 token」"
+                    return@setOnClickListener
+                }
+                copyToClipboard(t)
+            }
+        })
+        authBtnCol.addView(btn("关闭鉴权").apply {
+            setOnClickListener {
+                ModelStore.setApiToken(this@EngineActivity, "")
+                ApiAuth.token = ""
+                refreshAuthUi()
+                LlmEngine.uiLog("[鉴权] 已关闭：生成端点恢复为不要求 token（与升级前同行为）")
+            }
+        })
+        authRow.addView(authBtnCol)
+        pageSet.addView(authRow)
+        authHintTv = label(authHintText()).apply { setTextColor(0xFFB26A00.toInt()) }
+        pageSet.addView(authHintTv)
+        refreshAuthUi()
+
+        // ---- CORS（白名单式）----
+        //
+        // 为什么把开关和"额外来源"都放在页面上，而不是只写进 README：
+        // 与 parallelN 那条说明同一个理由 —— 调参的人就在这一页。
+        // 但这里更硬：CORS 是**安全边界**，页面上的措辞必须让人当场明白
+        // 「放行 = 任何网页都能调这台手机」，否则它会被当成一个"打不开就勾上"的开关。
+        corsCb = android.widget.CheckBox(this).apply {
+            text = "允许浏览器跨源调用（CORS，白名单式）"
             textSize = 13f
-            isChecked = ModelStore.disableThinking(this@EngineActivity)
+            isChecked = ModelStore.corsEnabled(this@EngineActivity)
             setOnCheckedChangeListener { _, b ->
-                ModelStore.setDisableThinking(this@EngineActivity, b)
-                HttpApi.disableThinkingDefault = b
+                ModelStore.setCorsEnabled(this@EngineActivity, b)
+                HttpApi.corsEnabled = b
             }
         }
-        pageSet.addView(thinkCb)
+        pageSet.addView(corsCb)
+        val corsRow = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
+        corsExtraEt = field("", ModelStore.corsExtraOrigins(this@EngineActivity).joinToString("\n"))
+        corsExtraEt.setSingleLine(false)
+        corsExtraEt.setOnFocusChangeListener { _, has ->
+            if (!has) saveCorsExtra()
+        }
+        corsRow.addView(corsExtraEt, lp(0, 1))
+        pageSet.addView(corsRow)
+        corsHintTv = label(corsHintText()).apply { setTextColor(0xFFB26A00.toInt()) }
+        pageSet.addView(corsHintTv)
+
         // flash attention 开关（开启后 KV cache 额外支持 24=iq4_nl；iq4_xs 无 KV LUT，不支持）
         flashCb = android.widget.CheckBox(this).apply {
             text = "启用 Flash Attention（cache K=iq4_nl(24) 或 cache V 已量化时必须开启）"
@@ -499,6 +678,10 @@ class EngineActivity : Activity() {
         presEt  = paramField("pres", "0")
         freqEt  = paramField("freq", "0")
         mmapEt  = paramField("mmap", "1")
+        // 没设过（`null`）不是 "1"：库默认本来就是开，写死 "1" 会让
+        // "用户没碰过"与"用户显式开"在日志里同形，而 native 要靠这个区分来源。
+        // 传进 UI 的原始值就是持久化的原始值（字面量，不做归一）。
+        repackMode = (savedParams["repack"] ?: "").takeIf { it == "0" || it == "1" }?.toInt()
         val paramWatcher = object : android.text.TextWatcher {
             override fun afterTextChanged(s: android.text.Editable?) { persistParams() }
             override fun beforeTextChanged(s: CharSequence?, a: Int, b: Int, c: Int) {}
@@ -606,20 +789,78 @@ class EngineActivity : Activity() {
         val labRowB = labRow("cache K（0=f16, 8=q8_0, 2=q4_0, 24=iq4_nl 需开flash）", "cache V（同左，V量化必须开flash）", "mmap（1=默认省内存）")
         val gridRowB = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
         gridRowB.addView(cacheKEt, lp(0, 1)); gridRowB.addView(cacheVEt, lp(0, 1)); gridRowB.addView(mmapEt, lp(0, 1))
-        val labRowG = labRow("parallelN 并行序列数", "batchSize 逻辑批大小", "ubatchSize 物理批大小")
+        val labRowG = labRow("parallelN 并行序列数（当前未生效）", "batchSize 逻辑批大小", "ubatchSize 物理批大小")
         val gridRowG = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
         gridRowG.addView(parallelNEt, lp(0, 1)); gridRowG.addView(batchSizeEt, lp(0, 1)); gridRowG.addView(ubatchSizeEt, lp(0, 1))
+        // parallelN 的说明必须写在输入框**旁边**，不能只留在 README 里：
+        // 它现在只把 n_seq_max 传给库（llama_jni.cpp），而服务端仍是**单并发** ——
+        // 生成循环持 LlmEngine.genLock，第二个请求直接 503（App 内聊天占用时同样 503）。
+        // 也就是说填多大都**不产生并发能力**，只有一个吃满 n_ctx 的代价。
+        // 不说明的话，调参的人会以为"没变快 = 手机不行"，而真相是这个旋钮现在拧不动。
+        // 真并发 slot 调度属 Issue #40 第 3 项，**已搁置**（手机端收益太小）；
+        // 该行随功能一起保留、不删输入框 —— 删掉会让已保存的参数无处可改，
+        // 且未来若恢复此特性还要改回 UI 与持久化两处。
+        val parallelNHintTv = label("parallelN 当前不产生并发：服务端仍是单并发（第二个请求直接 503，不会排队）。" +
+            "填 >1 只是把 n_seq_max 传给库，**不会**让多个请求同时跑，反而会按份数瓜分 n_ctx → 单请求可用上下文变小。" +
+            "建议保持 1。真并发 slot 调度已搁置（手机端收益太小）。").apply {
+            setTextColor(0xFFB26A00.toInt())
+        }
         // 布局：HTP 开关提到「加载与性能」分组之上（它决定 native 变体选择、需重启，
         // 与"改后重新加载模型生效"的参数不属同一类）；cache K/V/mmap 行移到 parallelN 行之后，
         // 使 mmap 说明紧邻其输入框
         pageSet.addView(label("── NPU / Hexagon（HTP，改后需重启 App）──"))
         listOf(htpSwitch, quotaGroup, quotaHint, htpHintTv).forEach { addFull(it) }
         pageSet.addView(label("── 加载与性能（改后需重新加载模型）──"))
-        listOf(labRowA, gridRowA, gpuHintTv, labRowG, gridRowG, labRowB, gridRowB).forEach { addFull(it) }
-        pageSet.addView(label("mmap=0 为无映射直读（内存占用约翻倍，仅供诊断推理卡顿）"))
+        listOf(labRowA, gridRowA, gpuHintTv, labRowG, gridRowG, parallelNHintTv, labRowB, gridRowB).forEach { addFull(it) }
+        // (用户点1) mmap 的说明必须**紧跟 mmap 输入框**：上一版把它放在 repack 三档之后，
+        // 于是 mmap 的设置框与它的说明被 repack 那一整块（标签 + 三档 + 提示）隔开，
+        // 读的人得自己把两段接起来。这里插回 gridRowB（含 mmapEt）正下方，
+        // 与上面 parallelN 的处理同一条规矩：说明紧邻其输入框。
+        addFull(label("mmap=0 为无映射直读（内存占用约翻倍，仅供诊断推理卡顿）").apply {
+            setTextColor(0xFF666666.toInt())
+        })
+        // 为什么把 repack 抬成设置项：它此前只有系统属性一条通道，而真机上
+        // `getprop` 读不到时**与"没设过"同形** —— 用户按说明设了、日志却说"库默认"，
+        // 一轮实测白跑（见 native `model_use_extra_bufts` 的注释）。抬到这里之后，
+        // 档位在 App 内可设、随参数持久化、并由 `[repack]` 一行报出来源。
+        addFull(labRow("repack 权重重排（q4_K/q6_K 另存一份匿名拷贝；改后需重新加载模型）"))
+        repackGroup = repackRadioGroup()
+        addFull(repackGroup!!)
+        // 注意：`.apply { }` 要挂在 **label(...) 的返回值**上，不能挂在
+        // `addFull(...)` 上 —— 后者的返回类型是 Unit（`pageSet.addView` 的结果被
+        // 丢弃），`setTextColor` 在那里根本不存在，编译器会报 unresolved reference。
+        // 这一档的**主要功能与注意事项**只留一行，紧贴三档：
+        // 上方**已**有一行 "repack 权重重排（…改后需重新加载模型）" 报功能，
+        // 这里只补三个必须当场知道的操作要点 —— 省什么、付什么、改完怎么确认。
+        // 曾经这里还堆着两段长文（日志两行怎么对账、0.9.127 的 LayoutParams 缺陷），
+        // 用户反馈"太啰嗦"。排查过程属于 README / HTP-STATUS 那一层，
+        // 设置页只留"按钮干什么、要注意什么"。
+        // ⚠ 文案只讲机制、不带读数：曾经这里写着「真机 22 层那轮 1137 MiB」，那是
+        // **`gpu_layers=22` 那一格**的峰值（不是"CPU 有 22 层"），且三个读数全是
+        // 默认档（=开）下量的、**从没做过开关对照** —— 用户拿 `gpu_layers=0` 去比
+        // 会对不上（可能是 0），反倒怀疑档位没落地，和后半句"选了关却是 1"混成一个症状。
+        // 数值属于 README / HTP-STATUS 那一层，且写在那里也要连量条件一起写。
+        addFull(label("关：省下随 CPU 层数增长的一份匿名拷贝（只是权重的第二份排布，精度不变），" +
+            "代价是 CPU 侧可能变慢。改后需重新加载模型，并在日志里确认 [repack结果] 的落值" +
+            "（选了「关」却是 1 = 档位没落到库上）。").apply {
+            setTextColor(0xFF666666.toInt())
+        })
         addFull(flashCb); addFull(flashHint)   // (点2): FA 属加载期参数，紧跟 cache K/V
 
         pageSet.addView(label("── 生成与采样（对话时生效）──"))
+        // 默认关闭思考（SmolLM3/Qwen3 等混合思考模型；客户端 enable_thinking 参数可覆盖）。
+        // 从「本地服务」段挪到「生成与采样」段：它决定的是**生成本身**，
+        // 与下面几个采样参数同一类；留在服务段会跟端口/CORS/鉴权这些"怎么连"的开关混在一起。
+        thinkCb = android.widget.CheckBox(this).apply {
+            text = "默认关闭思考（客户端可用 enable_thinking 覆盖）"
+            textSize = 13f
+            isChecked = ModelStore.disableThinking(this@EngineActivity)
+            setOnCheckedChangeListener { _, b ->
+                ModelStore.setDisableThinking(this@EngineActivity, b)
+                HttpApi.disableThinkingDefault = b
+            }
+        }
+        addFull(thinkCb)
         val labRowC = labRow("max tokens 生成长度上限", "temperature 温度", "top_p（0.95 默认）")
         val gridRowC = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
         gridRowC.addView(maxEt, lp(0, 1)); gridRowC.addView(tempEt, lp(0, 1)); gridRowC.addView(topPEt, lp(0, 1))
@@ -664,6 +905,28 @@ class EngineActivity : Activity() {
         pageSet.addView(label("── 崩溃取证（探针）──"))
         addFull(probeSwitch); addFull(probeHintTv)
 
+        // ---- 丢弃 prompt 缓存（KV 前缀复用）----
+        // 多轮对话默认会复用上一轮已经算进 KV 的那段前缀（只算"新增的那部分"），
+        // 长 system prompt / 带 tools 的固定段收益最大。这个按钮是**手动兜底**：
+        // 换了 system prompt、改了模板之后旧前缀本来就匹配不上（判据是逐 token 比前缀），
+        // 但那几 MB KV 会一直占着显存直到被覆盖 —— 手机上就等于可用上下文凭空变少。
+        // 所以给一个显式出口，而不是"等它自己失效"。
+        pageSet.addView(label("── 推理缓存（KV 前缀复用）──"))
+        addFull(label("多轮对话会复用上一轮已算好的 prompt 前缀，只算新增部分。换 system 提示词后点下面按钮可立即释放旧缓存。").apply {
+            setTextColor(0xFF666666.toInt())
+        })
+        val kvBtn = btn("丢弃 prompt 缓存")
+        kvBtn.setOnClickListener {
+            LlmEngine.resetKvCache()
+            // 提示必须报**结果**而不是"已点击"：缓存本来就可能是空的
+            //（首轮 / 刚换过模型），笼统地说"已清空"会和 /health 里
+            // kv_cache_valid=false 的现象对不上。
+            Toast.makeText(this,
+                "已释放：下一轮将全量重算 prompt（之后自动重新建立缓存）",
+                Toast.LENGTH_LONG).show()
+        }
+        addFull(kvBtn)
+
         // 还原默认设置（同时重置端口与局域网开关）。
         // 它作用于整页所有分组，不是「重复与惩罚」这一组的局部操作，因此打上 UNGROUPED
         // 标记留在面板外：该组默认折叠时按钮依然可见，也不会被"收起全部分组"一起藏掉。
@@ -681,6 +944,9 @@ class EngineActivity : Activity() {
             minPEt.setText("0"); cacheKEt.setText("0"); cacheVEt.setText("0")
             parallelNEt.setText("1"); batchSizeEt.setText("2048"); ubatchSizeEt.setText("512")
             presEt.setText("0"); freqEt.setText("0"); mmapEt.setText("1")
+            repackMode = null
+            if (repackDefaultId != View.NO_ID) repackGroup?.check(repackDefaultId)
+            persistParams()
             portEt.setText("8080"); lanCb.isChecked = false
             ModelStore.setServerPort(this, 8080)
             ModelStore.setLanAccess(this, false)
@@ -724,7 +990,21 @@ class EngineActivity : Activity() {
         genBtn.setOnClickListener { doGenerate() }
         stopBtn = btn("停止")
         stopBtn.setOnClickListener {
-            if (generating) { stopRequested = true; LlmEngine.abort(); statusTv.text = "停止中…" }
+            // 停止按钮同时接受两种意图，否则「点了没反应」正是最难解释的那种现象：
+            //   · 本页聊天在生成（generating）      -> 停它（原来的行为）；
+            //   · 本页没生成、但 HTTP 请求在跑      -> 停那一轮（此前这里完全没反应，
+            //     用户只能去别的客户端断开；`/v1/abort` 与按钮现在打的是同一个东西）。
+            // 两条都走 RequestCancel 的**当前轮次**，不存在"停错对象"的可能。
+            val httpBusy = HttpApi.isGenerating
+            if (!generating && !httpBusy && !RequestCancel.active) {
+                Toast.makeText(this, "当前没有正在生成的请求", Toast.LENGTH_SHORT).show()
+                return@setOnClickListener
+            }
+            if (generating) { stopRequested = true; statusTv.text = "停止中…" } else { statusTv.text = "正在停止外部请求…" }
+            // 走 LlmEngine.requestAbort（唯一入口）：同时标记 token 并把**带归属的**取消
+            // 送到 native。只标记 token 的话，prefill 阶段（一次阻塞的 native 调用）
+            // 停不下来 —— 用户会看到"点了停止没反应"，直到那一大段 prompt 算完。
+            LlmEngine.requestAbort()
         }
         clearBtn = btn("清空对话")
         clearBtn.setOnClickListener {
@@ -927,9 +1207,46 @@ class EngineActivity : Activity() {
         startServerPoll()
     }
 
+    /**
+     * 退出 App 时**主动释放模型**（含 `[内存] 卸载 RSS …` 与归还空闲堆段）。
+     *
+     * 为什么必须显式做：在此之前本仓库**没有任何退出路径**释放模型 —— `onDestroy` 只清
+     * 监听与线程池，模型要靠系统杀进程才回收。于是"占用降不下来"只能靠用户去设置页
+     * 点「卸载模型」，而**没有任何一行日志会提醒他**；0.9.130 现场正是这样：
+     * 用户改完 repack 档位重新加载、看到内存也降了一点，但应用列表里的占用一直很高。
+     *
+     * 为什么放在 `onDestroy` 之后：销毁只在"Activity 真的要走"时才发生（旋转/多窗口
+     * 重建也会走它），所以在它里面判定 `isFinishing` —— 旋转重建会**保活**服务，
+     * 此时释放再重载白付一次加载代价；而 `isFinishing == true` 是"这次退出是终局"的
+     * 判据。服务在跑时提前返回：那说明保活是用户显式开的（`/v1/models` 还在对外服务），
+     * 释放模型等于把服务打成 503 —— 服务停掉时它自己会调 `LlmEngine.unload()`
+     * （见 InferenceService 的 ACTION_STOP）。
+     *
+     * @return true = 本次真的做了释放（日志已落），false = 有意不释放（原因已写进状态栏）
+     */
+    private fun unloadOnExit(): Boolean {
+        if (!LlmEngine.hasModel) return false
+        val serving = HttpApi.isRunning
+        LlmEngine.uiLog("[退出] 正在释放模型（持有模型退出会一直占着内存，直到系统杀进程）")
+        LlmEngine.unload()
+        HttpApi.currentModel = null
+        LlmEngine.uiLog(
+            if (serving) "[退出] 模型已释放，服务仍在运行 —— 模型没了，生成会返回 503"
+            else "[退出] 模型已释放（见上一行 [内存] 卸载 RSS … 的前后读数）"
+        )
+        return true
+    }
+
     override fun onDestroy() {
         pollRunning = false
         LlmEngine.logSink = null  // 防 Activity 泄漏（Handler 持引用继续 post）
+        // 这个 executor 是每次 onCreate 现建的，不关就会随每次重建各留一个线程；
+        // 而它跑的任务（lambda / 视图更新）都捕获了 this，等于可观测的 Activity 泄漏。
+        // shutdownNow：队列里排着的任务在 Activity 已销毁后没有任何存在意义。
+        ioExecutor.shutdownNow()
+        // 退出即释放（判定与理由见 unloadOnExit）：必须放在 super.onDestroy() **之前**，
+        // 否则还要跟已拆掉的视图/监听抢资源。释放只碰 native 与 shared prefs，安全。
+        if (isFinishing) unloadOnExit()
         super.onDestroy()
     }
 
@@ -987,32 +1304,45 @@ class EngineActivity : Activity() {
 
     // ---- 模型库 ----
 
-    @SuppressLint("SetTextI18n")
+    /**
+     * 刷新模型库列表。
+     *
+     * **取数与渲染分离**：`ModelStore.rows()` 要走 prefs（`getAll` 一次）+ `listFiles`
+     * + 每行一次 `stat`，耗时随模型数线性增长（N=50 时可达数百毫秒）—— 所以它必须在
+     * `ioExecutor` 上跑，主线程只做 `removeAllViews` + `addView`。
+     *
+     * 代际号 [modelListGen] 用来丢弃过期结果：连点两次选中时，先发的那次可能后回，
+     * 拿旧快照去渲染会让列表"闪回"上一个选中态。
+     */
     private fun refreshModelList() {
-        listContainer.removeAllViews()
+        val myGen = ++modelListGen
         val sel = modelFile?.name
-        val models = ModelStore.list(this)
-        if (models.isEmpty()) {
+        ioExecutor.execute {
+            val rows = runCatching { ModelStore.rows(this) }.getOrNull()
+            ui.post { if (myGen == modelListGen) renderModelList(rows.orEmpty(), sel) }
+        }
+    }
+
+    @SuppressLint("SetTextI18n")
+    private fun renderModelList(rows: List<ModelStore.Row>, sel: String?) {
+        listContainer.removeAllViews()
+        if (rows.isEmpty()) {
             listContainer.addView(TextView(this).apply {
                 text = "（模型库为空：点“添加模型”选择第一个 GGUF）"
                 textSize = 12f; setPadding(0, px(4), 0, px(4))
             })
         }
-        for (f in models) {
+        for (r in rows) {
+            val f = r.file
+            val isSel = f.name == sel
             val row = LinearLayout(this).apply {
                 orientation = LinearLayout.HORIZONTAL
                 gravity = Gravity.CENTER_VERTICAL
             }
-            val isSel = f.name == sel
-            val ext = ModelStore.isExternal(this, f.name)
-            val missing = ext && !f.isFile
             val tv = TextView(this).apply {
-                text = run {
-                    val al = ModelStore.aliasOf(this@EngineActivity, f.name)
-                    (if (isSel) "● " else "○ ") + (if (ext) "🔗 " else "") + al +
-                        (if (al != f.name.removeSuffix(".gguf")) " · ${f.name}" else "") +
-                        if (missing) "  ⚠ 原文件已丢失" else "  (${f.length() / 1048576} MB)"
-                }
+                text = (if (isSel) "● " else "○ ") + (if (r.external) "🔗 " else "") + r.alias +
+                    (if (r.alias != f.name.removeSuffix(".gguf")) " · ${f.name}" else "") +
+                    if (r.missing) "  ⚠ 原文件已丢失" else "  (${r.bytes / 1048576} MB)"
                 textSize = 13f
                 if (isSel) setTypeface(typeface, Typeface.BOLD)
                 setPadding(0, px(6), 0, px(6))
@@ -1022,7 +1352,7 @@ class EngineActivity : Activity() {
                 promptAlias(f, true)
                 true
             }
-            val del = btn(if (ext) "解" else "删")
+            val del = btn(if (r.external) "解" else "删")
             del.textSize = 11f
             del.setPadding(px(8), 0, px(8), 0)
             del.setOnClickListener { confirmDelete(f) }
@@ -1533,7 +1863,8 @@ class EngineActivity : Activity() {
             "cacheK" to cacheKEt.text.toString(), "cacheV" to cacheVEt.text.toString(),
             "parallelN" to parallelNEt.text.toString(), "batchSize" to batchSizeEt.text.toString(), "ubatchSize" to ubatchSizeEt.text.toString(),
             "pres" to presEt.text.toString(), "freq" to freqEt.text.toString(),
-            "mmap" to mmapEt.text.toString()))
+            "mmap" to mmapEt.text.toString(),
+            "repack" to (repackMode?.toString() ?: "")))
     }
 
     private fun toggleServer() {
@@ -1590,6 +1921,119 @@ class EngineActivity : Activity() {
      * 因为它同时证明了端口是空的）。唯一的例外是地址绑定：局域网关闭时服务只绑回环，
      * 探测必须打 127.0.0.1，否则用户会看到"局域网 IP 不通"这种误导性结论。
      */
+    /**
+     * 保存「额外放行的来源」。
+     *
+     * 刻意**不清洗、不改写用户输入**（只做去空行），但**逐条规范化后判断非法**：
+     * 把 `http://A:80` 悄悄改成 `http://a` 会让用户照着回填时对不上，
+     * 而"填错但没人说"正是白名单类配置最典型的坏法 —— 所以非法条目直接报出来。
+     */
+    private fun saveCorsExtra() {
+        if (!::corsExtraEt.isInitialized) return
+        val raw = corsExtraEt.text.toString()
+        ModelStore.setCorsExtraOrigins(this, raw)
+        val bad = raw.split('\n', ',').map { it.trim() }.filter { it.isNotEmpty() }
+            .filter { CorsPolicy.normalize(it).isEmpty() }
+        if (bad.isNotEmpty()) {
+            LlmEngine.uiLog("[CORS] 以下来源写法非法、已忽略（需要 http(s)://host[:port]，不带路径）: " +
+                bad.joinToString(" "))
+        }
+        // 立即生效（不必重启服务）：来源是请求期的判据，不是绑定期的。
+        for (o in ModelStore.corsExtraOrigins(this)) CorsPolicy.addOrigin(o)
+        if (::corsHintTv.isInitialized) {
+            corsHintTv.text = corsHintText()
+        }
+    }
+
+    /**
+     * 鉴权那一栏的说明文案。**必须当场说清三件事**，否则用户会凭想象使用：
+     *   · 只有哪几个端点要 token（否则会以为 `/health` 也要，然后把它填进探针配置，
+     *     结果是"探针报不可达"）；
+     *   · 第三方 UI 该往哪儿填（`Authorization: Bearer`，也就是多数 UI 的「API Key」框）；
+     *   · 它**不是**访问控制（与 CORS 一样，`curl` / 脚本从来不受这两者约束）。
+     */
+    private fun authHintText(): String {
+        val on = ModelStore.apiToken(this).isNotEmpty()
+        val head = if (on) "鉴权**已开启**：POST /v1/chat/completions、POST /v1/completions、" +
+            "POST /v1/abort 要求 `Authorization: Bearer <token>`。"
+        else "鉴权**未开启**：生成端点不要求 token（与升级前同行为）。"
+        return head +
+            "GET /health、GET /v1/models、GET / 自带测试页与 OPTIONS 预检**一律免鉴权**" +
+            "（否则服务自身的存活探测会把自己判成不可达、浏览器预检也会被拦）。" +
+            "第三方 UI 把 token 填进它的「API Key」框即可（走的就是 Authorization: Bearer）。" +
+            "**它不是访问控制**：token 只挡没带凭据的调用方，挡不住同网段能直连的设备；" +
+            "请在可信网络使用。"
+    }
+
+    /** 生成/清除 token 之后刷新这一栏的展示与文案（两处都要改，不能只改一处）。 */
+    private fun refreshAuthUi() {
+        if (!::authEt.isInitialized) return
+        val t = ModelStore.apiToken(this)
+        authEt.setText(t)
+        authEt.hint = "未开启（生成端点不要求 token）"
+        // 提示里**不回显** token 片段：截图 / Issue 里飞出去就白做了。
+        if (::authHintTv.isInitialized) authHintTv.text = authHintText()
+    }
+
+    /**
+     * 把 token 复制进剪贴板。
+     *
+     * 为什么值得一个按钮：token 的唯一用途就是被**抄进别的客户端**，
+     * 而它 24 位、混大小写 —— 让用户在手机上手抄必然出错，出错的表现是
+     * "401 token 不正确"，用户会以为鉴权本身坏了。复制把这条抄写环节删掉。
+     */
+    private fun copyToClipboard(text: String) {
+        try {
+            val cm = getSystemService(Context.CLIPBOARD_SERVICE) as android.content.ClipboardManager
+            cm.setPrimaryClip(android.content.ClipData.newPlainText("local-llm-server token", text))
+            statusTv.text = "token 已复制到剪贴板"
+            LlmEngine.uiLog("[鉴权] token 已复制到剪贴板（不写日志内容）")
+        } catch (t: Throwable) {
+            // 部分 ROM 限制后台剪贴板访问：不要静默失败，把 token 显示出来让用户手动复制。
+            statusTv.text = "复制失败：${t.message}；请长按上面的框手动复制"
+            LlmEngine.uiLog("[鉴权] 复制失败: ${t.message}")
+        }
+    }
+
+    private fun corsHintText(): String {
+        val extra = ModelStore.corsExtraOrigins(this)
+        val head = "额外放行的来源（每行一个，如 http://192.168.1.10:3000）。"
+        val tail = "留空 = 只放行本机（localhost / 本机 IP）与 file:// 打开的页面。" +
+            "**不要填 \"*\"**：本接口无鉴权，回 \"*\" 等于你在浏览器里打开的任何一个网页" +
+            "都能调用这台手机的模型。" +
+            "同源访问（浏览器直接打开 http://手机IP:端口/ 的自带测试页）不需要 CORS。"
+        return head + tail + if (extra.isEmpty()) "" else "\n当前额外放行 " + extra.size + " 条。"
+    }
+
+    /**
+     * 用浏览器打开服务端的「自带测试页」。
+     *
+     * 为什么值得一个按钮：这个页面存在的全部意义就是"能马上验证手机上的服务通不通"，
+     * 而它的地址（本机 IP + 端口）恰恰是用户最容易抄错的东西（用 127.0.0.1 在别的
+     * 设备上打开、端口抄成旧的）。按钮直接按**当前实际绑定**拼地址，把这条抄写环节删掉。
+     *
+     * 服务没在跑时不打开空白页，而是明说原因（与"探测"按钮的态度一致：
+     * 结论要能指导下一步动作）。
+     */
+    private fun openWebPage() {
+        if (!HttpApi.isRunning) {
+            LlmEngine.uiLog("[CORS] 自带测试页打不开：服务未启动")
+            statusTv.text = "服务未启动，先在设置页点「启动服务」"
+            return
+        }
+        val host = if (HttpApi.bindAll) (HttpApi.lanIp() ?: "127.0.0.1") else "127.0.0.1"
+        val url = "http://$host:${HttpApi.PORT}/"
+        LlmEngine.uiLog("[CORS] 打开自带测试页: $url")
+        try {
+            startActivity(Intent(Intent.ACTION_VIEW, android.net.Uri.parse(url)))
+        } catch (t: Throwable) {
+            // 设备上没有浏览器（或 OEM 拦截了外部 Intent）时不要静默失败：
+            // 把地址显示出来让用户自己复制，比"点了没反应"有用。
+            statusTv.text = "无法打开浏览器，请手动访问 $url"
+            LlmEngine.uiLog("[CORS] 打开浏览器失败: ${t.message}；地址 $url")
+        }
+    }
+
     private fun doProbe() {
         if (probing) return   // 连点不叠加：并发探测会互相覆盖结论
         probing = true
@@ -1599,6 +2043,9 @@ class EngineActivity : Activity() {
         // 端口框与已运行服务可能不一致（改过没重启），先如实说明用的是哪个端口，
         // 免得用户对着"不通"的结论怀疑服务，实际只是探测了另一个端口。
         val runningPort = HttpApi.PORT
+        // 这里取 `isRunning`（实际状态）而不是 `isDesiredRunning`：探测要回答的是
+        // "端口到底通不通"，所以"按哪个端口去打"必须贴当前真实绑定。
+        // 意图标志（desired）是给看门狗判"该不该自愈"用的，两者语义不同，别混用。
         val live = HttpApi.isRunning
         val host = if (live && HttpApi.bindAll) (HttpApi.lanIp() ?: "127.0.0.1") else "127.0.0.1"
         val probePort = if (live) runningPort else port
@@ -1652,7 +2099,8 @@ class EngineActivity : Activity() {
                     serverBtn.text = "停止服务"
                     val host = if (HttpApi.bindAll) HttpApi.lanIp() ?: "127.0.0.1" else "127.0.0.1"
                     serverTv.text = if (LlmEngine.hasModel) {
-                        "服务运行中: http://$host:${HttpApi.PORT}/v1（模型: ${LlmEngine.modelDesc()}）"
+                        "服务运行中: http://$host:${HttpApi.PORT}/v1（模型: ${LlmEngine.modelDesc()}）\n" +
+                            "自带测试页: http://$host:${HttpApi.PORT}/ （浏览器直接打开即可聊）"
                     } else {
                         "服务运行中: http://$host:${HttpApi.PORT}/v1（无模型：/v1/models 为空，生成返回 503）"
                     }
@@ -1764,19 +2212,42 @@ class EngineActivity : Activity() {
             var done = false
             var errd = false
             val sb = StringBuilder()
+            // 取消归属（见上面 beginCancelable 处）。finally 里必须摘除，否则 App 侧
+            // 每生成一次就留下一个"永远在跑"的轮次，之后 /v1/abort 会打空。
+            var cancel: RequestCancel.Token? = null
             try {
                 synchronized(LlmEngine.genLock) {
+                    // 上一轮「停止」的意图在本轮开跑前作废（Issue #154）。
+                    //
+                    // 位置有两处讲究，都不能挪：
+                    //   · 在 `synchronized(genLock)` **之内**：锁外清零会与「主线程
+                    //     刚点完停止」的那一瞬间交错（清零把那一轮的停止意图抹掉，
+                    //     用户看到的是"点了停止反而开始生成"）。持锁之后，本轮与
+                    //     上一轮的停止意图已经全无关系。
+                    //   · 在 `startCompletion` **之前**：中断动作必须**先于生成入口
+                    //     装好再动**。反过来写（先起生成、再清标志）就有一步窗口里
+                    //     旧标志仍然为 true，而那段窗口恰好是"prefill 一整段"。
+                    stopRequested = false
                     // 思考开关与 HTTP 入口同一套实现（ThinkingControl），此处不再自己拼字符串。
-                    // 判定必须带上渲染结果：LFM2.5 这类模型的"思考开"是模板后缀硬编码的
-                    // （模板里没有 enable_thinking 变量），只看模板原文判不出来。
+                    // 两条判据都不能省：
+                    //   · thinkingOn 要传给渲染 —— MiniCPM5 模板按它决定生成后缀吐不吐
+                    //     `<think>\n`，不传就等于"思考永远开着"，本页的开关在这类模型上形同虚设；
+                    //   · 生效判定要带上渲染结果 —— LFM2.5 这类模型的"思考开"是模板后缀硬编码的
+                    //     （模板里没有 enable_thinking 变量），只看模板原文判不出来。
                     val chatTemplate = LlmEngine.chatTemplate()
                     val thinkingOn = !ModelStore.disableThinking(this@EngineActivity)
-                    val rendered = LlmEngine.applyChatTemplate(messages, addAss = true)
-                    val soft = ThinkingControl.softSwitchApplies(thinkingOn, chatTemplate, rendered)
-                    var prompt = if (soft) ThinkingControl.applyToPrompt(rendered, thinkingOn, chatTemplate)
-                                 else rendered
-                    LlmEngine.uiLog("[聊天] 思考=" + (if (thinkingOn) "开" else "关") +
-                            "软开关=" + (if (soft) "已注入空 think 块" else "不适用"))
+                    val rendered = LlmEngine.applyChatTemplate(messages, addAss = true, thinkingOn = thinkingOn)
+                    val soft = ThinkingControl.softSwitchApplies(thinkingOn, chatTemplate, rendered.text)
+                    val prompt = if (soft) ThinkingControl.applyToPrompt(rendered.text, thinkingOn, chatTemplate)
+                                 else rendered.text
+                    // 日志写清走的是哪条路：只写"软开关=不适用"会让「模板自己关的」与
+                    // 「模板根本没有思考段」看起来一样，而这两者的失败模式完全不同。
+                    LlmEngine.uiLog("[聊天] 思考=" + (if (thinkingOn) "开" else "关") + " " + when {
+                        thinkingOn -> "按思考开渲染"
+                        soft -> "软开关=已注入空 think 块（模板关不掉）"
+                        ThinkingControl.templateSupportsEnableThinking(chatTemplate) -> "模板自带 enable_thinking，由库/模板自己关"
+                        else -> "软开关=不适用（模板没有思考段）"
+                    })
                     LlmEngine.newSampler(sp.temp, sp.topP, sp.minP, seed = sp.seed,
                         topK = sp.topK, repPenalty = sp.repeatPenalty, penaltyN = sp.repeatLastN,
                         freqPenalty = sp.freqPenalty, presencePenalty = sp.presencePenalty)
@@ -1786,7 +2257,10 @@ class EngineActivity : Activity() {
                         ui.post { Toast.makeText(this@EngineActivity, err, Toast.LENGTH_SHORT).show(); statusTv.text = err }
                         return@Thread
                     }
-                    while (n < maxTok && !stopRequested) {
+                    // 登记取消归属：与 HTTP 路径共用一份状态，于是「HTTP /v1/abort」
+                    // 与「停止按钮」打的是同一轮，两边的收尾也走同一条路径。
+                    cancel = LlmEngine.beginCancelable()
+                    while (n < maxTok && !stopRequested && !cancel.requested) {
                         val piece = LlmEngine.step() ?: break
                         n++
                         if (piece.isNotEmpty()) {
@@ -1811,6 +2285,7 @@ class EngineActivity : Activity() {
                 errd = true
                 ui.post { statusTv.text = "出错: ${e.message}" }
             } finally {
+                cancel?.let { LlmEngine.endCancelable(it) }
                 generating = false
                 ui.removeCallbacks(hangWatch)   // 
                 ui.post {

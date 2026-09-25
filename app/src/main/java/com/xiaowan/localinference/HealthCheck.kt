@@ -30,7 +30,13 @@ object HealthCheck {
     data class Result(
         /** HTTP 状态码，未收到响应行为 null。 */
         val httpCode: Int?,
-        /** 原始响应体；非 200 时也保留，便于把服务器的错误信息带出来。 */
+        /**
+         * 原始响应体**原文**（未截断）；非 200 时也保留，便于把服务器的错误信息带出来。
+         *
+         * 这里是完整的，截断只发生在 [format] 的回显上 —— 两者不能混为一谈：
+         * 判定用的是完整原文（[jsonParsed] 就是对它解析的结果），
+         * 报告里给用户复制的才是预览，且预览必然标注"已截断"。
+         */
         val body: String,
         /** /health 的 status 字段；缺失即为 null。 */
         val status: String?,
@@ -53,6 +59,22 @@ object HealthCheck {
 
     /** 探测默认超时：本机回环上的 /health 是毫秒级，给到 3s 已经非常宽松。 */
     const val DEFAULT_TIMEOUT_MS = 3000
+
+    /**
+     * 报告里回显正文的上限（字符）。
+     *
+     * 做成常量而不是写死的字面量：**截断必须被报告自己说明**（见 [format]），
+     * 而"是否截断"的判据与 [format] 用的是同一个数 —— 两处各写一个数，
+     * 改了一处就会出现"实际截了却不说"或"没截却说截了"。
+     *
+     * 值取 4096：/health 的正文约 **221 字符**，典型上限（512/1024）都在它之上；
+     * 而"灌爆结论区"的真实来源是一整页 HTML（连到了别的进程），那是几十 KB 量级，
+     * 4 KB 一样拦得住。上限存在的理由是拦 HTML，不是省几行字，
+     * 所以它必须**明显大于本服务自己的响应**——否则常态响应一进来就被切，
+     * 而切出来的残片正好落在一堆合法 JSON 上（本函数的警告语就挂在里面的
+     * "响应体不是合法 JSON"），读者会把它当成解析器的结论去反推服务端。
+     */
+    const val BODY_PREVIEW_CHARS = 4096
 
     /**
      * 组装探测用的 HTTP 请求报文。
@@ -200,15 +222,44 @@ object HealthCheck {
                 sb.append("\n模型未加载：/v1/models 为空，生成类请求会返回 503")
             }
         }
-        r.busy?.let { if (it) sb.append("\n生成进行中（busy=true）") }
+        r.busy?.let { b -> if (b) sb.append("\n生成进行中（busy=true）") }
         // 只有 status=ok 却没带 model_loaded 才算异常；status 本来就非 ok 时上面已说明过了
         if (r.httpCode == 200 && r.status?.lowercase() == "ok" && r.modelLoaded == null) {
             sb.append("\n⚠ 响应里没有 model_loaded 字段，无法确认模型状态")
         }
-        if (r.body.isNotBlank() && verdict(r) != Verdict.ALIVE) {
-            sb.append("\n响应原文：${r.body.replace("\n", " ").take(200)}")
-        }
+        if (r.body.isNotBlank()) renderBody(sb, r)
         return sb.toString()
+    }
+
+    /**
+     * 回显「响应原文」。
+     *
+     * 两条硬约束，都是被现场反馈逼出来的：
+     *
+     * 1. **截断必须自证**（[BODY_PREVIEW_CHARS]）。默默 `take(N)` 的后果不是"少显示
+     *    一段"，而是**证据本身变成伪证**：残片天然非法 JSON，而这份报告的结论区里
+     *    就挂着"响应体不是合法 JSON"，读者只能把报告自己造的截断读成服务端的错。
+     *
+     * 2. **免责声明只在真出错时给**。此前回显的正文本就完整，后面却一律跟着一句
+     *    "截断处不是响应的问题" —— 那句话在**非 JSON** 的结论下就是噪音：
+     *    红色结论已经把账算在了服务头上，读者要的是"到底哪里不对"，
+     *    而不是一句在解释另一段不存在的东西。所以正文与结论一致时，
+     *    这里只说明"与判定一致"；真截断了才解释截断。
+     */
+    private fun renderBody(sb: StringBuilder, r: Result) {
+        val flat = r.body.replace("\n", " ").replace("\r", " ")
+        sb.append("\n响应原文：${flat.take(BODY_PREVIEW_CHARS)}")
+        if (flat.length > BODY_PREVIEW_CHARS) {
+            sb.append("…（已截断，完整 ${flat.length} 字符；截断处不是响应的问题）")
+            return
+        }
+        // 在整段正文里再点一次它与结论的关系：结论在最上面，正文在下面，
+        // 两段嵌在一起，报告又会被整段复制出去，不点明就会各读各的。
+        if (r.jsonParsed) {
+            sb.append("\n（以上正文与判定一致：合法 JSON / 状态码，结论不来自这段预览）")
+        } else {
+            sb.append("\n（以上正文即服务器所回原文，未被截断；它不是合法 JSON，故判定为不可达）")
+        }
     }
 
     /**

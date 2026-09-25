@@ -8,6 +8,7 @@ package com.xiaowan.localinference
 //   - 单独设 presence_penalty 时参数被整个丢掉
 //   - top_p=0 / repeat_penalty<1 / max_tokens 越界被静默降级
 //   - 同一毫秒内的请求拿到同一个 seed
+import org.json.JSONArray
 import org.json.JSONObject
 
 private var fail = 0
@@ -118,6 +119,21 @@ fun main() {
     ck("seed='abc' 报错（不再默默随机）", bad(JSONObject().put("seed", "abc")))
     ck("seed='' 走随机不报错", !bad(JSONObject().put("seed", "")))
     ck("seed=null 走随机不报错", !bad(JSONObject().put("seed", JSONObject.NULL)))
+    // seed 的类型校验此前是**自己另写**的一套判据（只拦「字符串且非空」），于是
+    // bool/array/object 一路走到 randomSeed()：显式给了值却被静默当成没给。
+    // 现在与其它 9 个字段共用同一条读取路径，非数值类型一律 400。
+    ck("seed=true 报错（此前静默随机）", bad(JSONObject().put("seed", true)))
+    ck("seed=false 报错（此前静默随机）", bad(JSONObject().put("seed", false)))
+    ck("seed=[] 报错（此前静默随机）", bad(JSONObject().put("seed", JSONArray())))
+    ck("seed={} 报错（此前静默随机）", bad(JSONObject().put("seed", JSONObject())))
+    ck("seed=1.5 报错（非整数）", bad(JSONObject().put("seed", 1.5)))
+    ck("见 400 时**不能**给出参数（否则调用方仍会用「随机」跑）",
+        SamplingParams.fromRequest(JSONObject().put("seed", true)).first == null)
+    // 合法类型仍要认，且与其它字段走同一条路径（数字串 / 整数字面量）
+    ck("seed='42'（字符串数值）可解析", !bad(JSONObject().put("seed", "42")))
+    ck("seed=42 与 seed='42' 解析结果一致（同一条路径，不因类型分叉）",
+        SamplingParams.fromRequest(JSONObject().put("seed", 42)).first!!.seed ==
+            SamplingParams.fromRequest(JSONObject().put("seed", "42")).first!!.seed)
 
     // 字符串形式的合法数字仍要认（UI 全走字符串）
     val strs = SamplingParams.fromRequest(JSONObject().apply {
@@ -142,6 +158,45 @@ fun main() {
         if (sp == null || sp.check() != null) drift++
     }
     ck("fromRequest 接受的样例都能过 check（两条规则一致）", drift == 0)
+
+    // ---- 8. 界面取值界（boundsOf）与服务端判据**逐条对应** ----
+    // 这一节防的是"页面上那个界"与"服务端实际收的界"分叉。历史上已经漂过两处
+    // （top_p 下界写成 0、min_p 上界写成 1），而漂移的表现是
+    // "用户按页面上的界填到端点值，拿到 400"。判据是**两侧各抽一遍再比对**，
+    // 而不是写死"等于 5.0"（写死的话改一边不会红）。
+    data class BoundCase(val key: String, val ok: (Double) -> Boolean, val good: Double, val evil: Double)
+    val cases = listOf(
+        BoundCase("temperature", { v -> SamplingParams.tempOk(v.toFloat()) }, 2.0, 5.5),
+        BoundCase("top_p", { v -> SamplingParams.topPOk(v.toFloat()) }, 0.5, 0.0),
+        BoundCase("min_p", { v -> SamplingParams.minPOk(v.toFloat()) }, 0.5, 1.0),
+        BoundCase("top_k", { v -> SamplingParams.topKOk(v.toInt()) }, 10.0, 2_000_000.0),
+        BoundCase("max_tokens", { v -> SamplingParams.maxTokensOk(v.toInt()) }, 100.0, 0.0),
+        BoundCase("repeat_penalty", { v -> SamplingParams.repeatPenaltyOk(v.toFloat()) }, 1.2, 0.5),
+        BoundCase("repeat_last_n", { v -> SamplingParams.repeatLastNOk(v.toInt()) }, 64.0, -1.0),
+        BoundCase("frequency_penalty", { v -> SamplingParams.penaltyOk(v.toFloat()) }, 1.0, 3.0),
+        BoundCase("presence_penalty", { v -> SamplingParams.penaltyOk(v.toFloat()) }, -1.0, -3.0),
+    )
+    var bDrift = 0
+    for (cse in cases) {
+        val b = SamplingParams.boundsOf(cse.key)
+        val agree = b != null && b.contains(cse.good) && cse.ok(cse.good) &&
+            !b.contains(cse.evil) && !cse.ok(cse.evil)
+        if (!agree) { bDrift++; println("  界漂移：${cse.key} good=${cse.good} evil=${cse.evil}") }
+    }
+    ck("9 个字段的界与服务端判据逐条一致（含端点排他）", bDrift == 0)
+    // 两处历史漂移必须已修正。
+    ck("top_p 的界是 (0,1) 开区间下界（0 不收）", !SamplingParams.boundsOf("top_p")!!.contains(0.0) &&
+        SamplingParams.boundsOf("top_p")!!.contains(1.0))
+    ck("min_p 的界是 [0,1) 开区间上界（1 不收）", !SamplingParams.boundsOf("min_p")!!.contains(1.0) &&
+        SamplingParams.boundsOf("min_p")!!.contains(0.0))
+    // 整数字段：小数必须被界拒（服务端 readInt 会 400）。
+    ck("整数项的界拒绝小数（512.5 / 1.5）",
+        !SamplingParams.boundsOf("max_tokens")!!.contains(512.5) &&
+            !SamplingParams.boundsOf("seed")!!.contains(1.5))
+    ck("整数项的界接受对应整数",
+        SamplingParams.boundsOf("max_tokens")!!.contains(512.0) &&
+            SamplingParams.boundsOf("seed")!!.contains(1.0))
+    ck("未登记的字段没有界（fail 而不是随便给一个）", SamplingParams.boundsOf("nope") == null)
 
     println()
 

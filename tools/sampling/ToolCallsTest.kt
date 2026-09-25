@@ -138,11 +138,11 @@ fun main() {
     }
     val src = java.io.File("app/src/main/java/com/xiaowan/localinference/LlmEngine.kt").readText()
     c3("nativeParseToolCalls 带 tmpl 形参（模板一致性）",
-        src.contains("text: String, toolsJson: String?, tmpl: String, addAss: Boolean"))
+        src.contains("text: String, toolsJson: String?, tmpl: String, addAss: Boolean, thinkingOn: Boolean"))
     // 形参名会随探针埋点调整，但"必须传模板变量、不能就地再取一次"这条语义不能松：
     // 渲染与解析之间若重新取一次模板，两边可能取到不同结果。
     c3("parseToolCalls 调用时把模板变量传进去",
-        src.contains("nativeParseToolCalls(text, toolsJson, tmpl, addAss)"))
+        src.contains("nativeParseToolCalls(text, toolsJson, tmpl, addAss, thinkingOn)"))
 
     // ---- add_generation_prompt 一致性：这是 tool_calls 恒为 0 的第二条真因 ----
     // cp.generation_prompt（会被 common_chat_parse 前拼到输入上、决定 PEG 根节点能否匹配）
@@ -152,13 +152,23 @@ fun main() {
     // —— 与真机日志 content_len - text_len = 8 精确吻合，根节点一上来就匹配不上。
     // 下面四条钉死"两边必须同源、且不得再写死"。
     c3("parseToolCalls 把 addAss 透传进 native",
-        src.contains("nativeParseToolCalls(text, toolsJson, tmpl, addAss)"))
+        src.contains("nativeParseToolCalls(text, toolsJson, tmpl, addAss, thinkingOn)"))
     c3("parseToolCalls 对 addAss 有默认值且与渲染侧同取 true",
-        src.contains("fun parseToolCalls(text: String, toolsJson: String, addAss: Boolean = true)"))
+        src.contains("addAss: Boolean = true"))
     c3("native parse 侧不再写死 add_generation_prompt = false",
         !cppParse().contains("in.add_generation_prompt = false;"))
     c3("native parse 侧 add_generation_prompt 取自 addAss",
         cpp.contains("in.add_generation_prompt = (addAss == JNI_TRUE);"))
+    // enable_thinking 同理：它同样改变 cp.generation_prompt 的形状
+    // （MiniCPM5 在 true 下后缀多一段 "<think>\n"），解析侧与渲染侧取值不同 =
+    // PEG 根节点前缀对不上 = tool_calls 静默变 0。而且 C++ 默认 true，
+    // **不传就等于恒"思考开"**，编译期与运行期都不报错 —— 只能断言到源码层面。
+    c3("parseToolCalls 把 thinkingOn 透传进 native（与渲染侧同源）",
+        src.contains("nativeParseToolCalls(text, toolsJson, tmpl, addAss, thinkingOn)"))
+    c3("native parse 侧 enable_thinking 取自 thinkingOn",
+        cpp.contains("in.enable_thinking = (enableThinking == JNI_TRUE);"))
+    c3("三条路径都显式设 enable_thinking（计数 = 3）",
+        cpp.split("in.enable_thinking = (enableThinking == JNI_TRUE);").size - 1 == 3)
     c3("nativeApplyChatTemplateTools 也接收模板参数",
         src.contains("nativeApplyChatTemplateTools(") && src.contains("tmpl: String"))
 

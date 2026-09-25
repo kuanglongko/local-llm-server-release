@@ -87,7 +87,19 @@ Kotlin 本次与上次会话全文、设备/后端/变体/Boot ID。
 | 一条 `[boot]` 都没有 | native 库根本没跑起来（`loadLibrary` 失败或拿的是旧包） |
 | `UnsatisfiedLinkError: nativeProbeInit` | `.so` 与 `.kt` 不是同一次构建（覆盖安装 / native 未重编） |
 
-**探针自身的兜底**：探针不问「Kotlin 有没有成功调到 nativeProbeInit」。
+**探针自身的兜底**（`0.9.113`，模块 K 修复后）：
+
+- handler 安装**幂等**：`nativeProbeInit(on=true)` 在本进程里可以被调到不止一次
+  （init 失败后用户再点「加载」/ 服务再起一轮），第二次安装不再覆盖 `g_old_*`。
+  之前每次覆盖会把转发链指向探针自己 —— 症状正是「`!!! ===== SIGNAL` 一行都没有」，
+  与「根本没崩 signal」**同形**；
+- 装了**备用信号栈**（64KB），`SA_ONSTACK` 才真的生效 ——
+  爆栈型 SIGSEGV（渲染 / PEG 解析的深递归）现在也能留下现场。日志里可直接读
+  `signal handlers installed (..., altstack=yes|no)`；
+- 驱动段**不再改写信号语义**：原 disposition 是 `SIG_IGN` 时，"忽略"就是忽略
+  （之前会被升级成 `exit(128+sig)`）。
+
+探针不问「Kotlin 有没有成功调到 nativeProbeInit」。
 native 在库加载时就自行自举（只读系统属性与包名推导目录），因此即使上面那一跳失败，
 `probe-native.log` 里也会有 `[boot]` 内容；要指定落盘目录（受控，仅调试用）：
 `setprop debug.localinference.probe.dir /data/local/tmp`。

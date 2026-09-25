@@ -116,6 +116,24 @@ int main() {
         else printf("ok   null  -> NewStringUTF(\"\")\n");
     }
 
+    // 13b nativeModelDesc 的"没模型"返回值必须与"有模型"同在**非空档**。
+    // 为什么单列：HttpApi 拼自带测试页时只看 LlmEngine.hasModel 就把
+    // modelDesc() 的返回当模型名（不再判 null），而没模型时这条路返回的是
+    // 空串。空串走的是 NewStringUTF("") —— 与"有模型但名字为空"分属两档，
+    // 这里把两档各自的返回值形状钉住：NewStringUTF("") 是合法 jstring（非 null），
+    // 走 NewString 的全在非空档。谁把空串塞进 NewString 档、或反过来，
+    // Kotlin 侧同一段代码就会重新变回"可能拿到 null"的形状。
+    {
+        std::vector<jchar> got = decode("x");   // decode 自带两档断言：非空档必须 NewString
+        g_env.lit.clear(); g_env.new_string_utf_calls = 0; g_env.new_string_calls = 0;
+        jstring empty_ret = new_string_utf8_safe(&g_env, guard_place(""));
+        // 空档：NewStringUTF("")，且返回值非 null（Kotlin 侧才敢不判空）
+        if (empty_ret == nullptr || g_env.new_string_utf_calls != 1 || g_env.new_string_calls != 0 ||
+            got.size() != 1) {
+            ++g_fail; printf("FAIL 空/非空两档的返回值形状被改了（空档 NewStringUTF / 非空档 NewString）\n");
+        } else printf("ok   空档 -> NewStringUTF(\"\")、非空档 -> NewString（都是非 null jstring）\n");
+    }
+
     // 14 模拟整条 LFM tokenizer 日志行：长串 + 中段截断 + 尾部省略号
     {
         std::string pre  = "llama_model_loader: - kv 24: tokenizer.ggml.tokens arr[str,128000] = [";

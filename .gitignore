@@ -30,3 +30,7 @@ __pycache__/
 
 # Gradle/CMake 本地构建中间产物
 .cxx/
+dist/
+
+# 本地工具链（ci/kt_check 一次性下载，不属于源码）
+.omnibot/

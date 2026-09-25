@@ -38,10 +38,35 @@ c "自举在 JNI 入口之前完成"                  "sed -n '/JNI_OnLoad(JavaV
 c "自举只跑一次（有明确一次性开关）"          "grep -q 'static bool g_bootstrapped = false;' \$CPP && grep -q 'if (g_bootstrapped) return false;' \$CPP"
 c "自举目录可经系统属性指定"                 "grep -q 'debug.localinference.probe.dir' \$CPP"
 c "getprop 读取走受控字符集（不接受任意值）"  "grep -q 'probe_getprop' \$CPP"
-c "写不出去时退到 /data/local/tmp"           "grep -q '/data/local/tmp/localinference-probe-native.log' \$CPP"
-c "彻底写不出去时 logcat 留痕（不静默）"      "grep -q 'probe bootstrap: 无法打开探针文件' \$CPP"
-c "自举期事件回灌到正式文件"                 "grep -q 'probe_bootstrap_flush' \$CPP"
-c "入参 on=false 仍能关掉探针（不被自举带偏）" "grep -q 'if (off) { g_bootstrapped = true; return JNI_FALSE; }' \$CPP"
+# 「自举阶段退到 /data/local/tmp」这条**已按 D-1 撤销**：自举不再打开任何文件，
+# 所以在自举里做降级落盘的能力一并消失 —— 这正是要的（用户没开探针就不该有文件）。
+# 落盘失败的可观测性改由 nativeProbeInit 承担：errno 进自举缓冲 → 交回 logcat。
+c "自举不自己降级落盘（目录/权限问题留给唯一权威处理）" \
+  "! awk '/static bool probe_bootstrap\(\)/,/^}/' \$CPP | sed 's|//.*||' | grep -q '/data/local/tmp'"
+c "落盘失败不静默：errno 进自举缓冲并交回 logcat" \
+  "grep -q 'probe boot: %s' \$CPP && grep -q 'Kotlin 目录打不开' \$CPP"
+c "探针始终没启用时也有交代（自举事件交回 logcat，不建文件）" \
+  "grep -q 'static void probe_bootstrap_recall()' \$CPP && grep -q '探针未启用（设置页未开），自举只记不写' \$CPP"
+# 下面四条钉的是**结构关系**，不是"某个标识符出现过"。
+# 上一版这里是 `grep -q 'probe_bootstrap_flush'` 与
+# `grep -q 'if (off) { g_bootstrapped = true; return JNI_FALSE; }'` —— 两条都恒真于
+# 失效状态：函数名叫什么都在、off 分支这一行也在，而 D-1/D-4 正是活在
+# "存在但无效"里的（self-bootstrap 无条件落盘 / 回灌恒写 0 字节）。
+# 现在把判据落到函数体里，删掉调用或改回旧写法都会红。
+c "自举期事件交付走唯一口径，且只在拿到的字节数 >0 时才写" \
+  "awk '/static void probe_bootstrap_flush\(\)/,/^}/' \$CPP | sed 's|//.*||' | grep -q 'probe_bootstrap_write(' && \
+   awk '/static void probe_bootstrap_flush\(\)/,/^}/' \$CPP | sed 's|//.*||' | grep -q 'if (n > 0) probe_raw('"
+c "自举只记不写：函数体里不得 open / 不得落盘 / 不得动 g_probe_on" \
+  "! awk '/static bool probe_bootstrap\(\)/,/^}/' \$CPP | sed 's|//.*||' | grep -qE 'open\(|probe_(raw|fmt)\(|g_probe_on'"
+c "受控自举开关（kProbeFlagProps）真的参与判定：取值被读、被判定" \
+  "grep -q 'kProbeFlagProps\[i\]' \$CPP && grep -q 'probe_flag_off(' \$CPP"
+c "入参 on=false 仍能关掉探针（不被自举带偏）：先无条件收口再 return" \
+  "awk '/nativeProbeInit\(JNIEnv/,/^}/' \$CPP | sed 's|//.*||' | grep -q 'g_probe_fd = -1;' && \
+   awk '/nativeProbeInit\(JNIEnv/,/^}/' \$CPP | sed 's|//.*||' | grep -q 'g_probe_on = false;'"
+c "Kotlin 的『关』也显式告知 native（探针开关唯一事实来源）" \
+  "grep -q 'nativeProbeInit(dir.absolutePath, probeEnabled)' \$KT"
+c "探针开关判据与自举缓冲判据由宿主单测真跑（不是复刻品）" \
+  "grep -q 'probe_flag.h' tools/probe_util_test.cpp && [ -f tools/run_probe_flag_tests.sh ]"
 c "每个 JNI 入口都会在 logcat 留一行"        "grep -q 'mark_jni_entry(fn)' \$CPP"
 # 自举必须在「没有 JNIEnv」的前提下也能跑：函数体里不许出现 env->
 c "自举不依赖 JVM（函数体无 env->）"          "! sed -n '/static bool probe_bootstrap()/,/^}/p' \$CPP | sed 's|//.*||' | grep -q 'env->'"

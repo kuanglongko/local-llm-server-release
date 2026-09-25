@@ -31,6 +31,8 @@ object LogFileStore {
     const val TAG_HTP = "[HTP参与]"
     const val TAG_HTP_MEASURED = "[HTP实测]"
     const val TAG_TIME = "[计时]"
+    /** 内存读数（推理期 RSS 峰值等）：与 `[mmap释放]` 的加载态读数成对读。 */
+    const val TAG_MEM = "[内存]"
 
     private var root: File? = null
     private var writer: OutputStreamWriter? = null
@@ -59,41 +61,48 @@ object LogFileStore {
     @Volatile var previousSessionId: String? = null
         private set
 
-    /** 幂等：任何入口在写日志前都可安全调用 */
-    @Synchronized
+    /**
+     * 幂等：任何入口在写日志前都可安全调用。
+     *
+     * 锁用 [lock]（与 [append] / [noteNoise] / [flushNoise] 同一把，不是 this）：
+     * 折叠状态 [fileBase] / [fileRep] 在这里重置，若与写入路径用不同监视器，
+     * 重置就会与并发 `append` 交错 —— 那就等于没加锁。
+     */
     fun init(context: android.content.Context) {
-        if (writer != null) return
-        val r = File(context.applicationContext.filesDir, "logs")
-        root = r
-        runCatching { if (!r.exists()) r.mkdirs() }
+        synchronized(lock) {
+            if (writer != null) return
+            val r = File(context.applicationContext.filesDir, "logs")
+            root = r
+            runCatching { if (!r.exists()) r.mkdirs() }
 
-        val stamp = java.text.SimpleDateFormat("yyyyMMdd-HHmmss", java.util.Locale.US)
-            .format(java.util.Date())
-        val cur = File(r, "$PREFIX$stamp.log")
-        currentFile = cur
-        currentSessionId = cur.name.removeSuffix(".log")
-        fileBase = null; fileRep = 0   // 新会话：折叠计数从 0 起
+            val stamp = java.text.SimpleDateFormat("yyyyMMdd-HHmmss", java.util.Locale.US)
+                .format(java.util.Date())
+            val cur = File(r, "$PREFIX$stamp.log")
+            currentFile = cur
+            currentSessionId = cur.name.removeSuffix(".log")
+            fileBase = null; fileRep = 0   // 新会话：折叠计数从 0 起
 
-        // 先认上一次会话（排除本次新建的空文件）
-        val prev = runCatching {
-            r.listFiles { f -> f.name.startsWith(PREFIX) && f.name.endsWith(".log") && f != cur }
-                ?.maxByOrNull { it.lastModified() }
-        }.getOrNull()
-        previousFile = prev
-        previousSessionId = prev?.name?.removeSuffix(".log")
-        if (prev != null && prev.length() > 0) {
-            val (clean, cnt) = cleanMarkStat(prev)
-            previousUnclean = !clean
-            previousMarkCount = cnt
-        }
+            // 先认上一次会话（排除本次新建的空文件）
+            val prev = runCatching {
+                r.listFiles { f -> f.name.startsWith(PREFIX) && f.name.endsWith(".log") && f != cur }
+                    ?.maxByOrNull { it.lastModified() }
+            }.getOrNull()
+            previousFile = prev
+            previousSessionId = prev?.name?.removeSuffix(".log")
+            if (prev != null && prev.length() > 0) {
+                val (clean, cnt) = cleanMarkStat(prev)
+                previousUnclean = !clean
+                previousMarkCount = cnt
+            }
 
-        runCatching {
-            // 只留最近 KEEP 个（含本次）
-            val all = r.listFiles { f -> f.name.startsWith(PREFIX) && f.name.endsWith(".log") }
-                ?.sortedByDescending { it.lastModified() } ?: emptyList()
-            all.drop(KEEP - 1).forEach { runCatching { it.delete() } }
+            runCatching {
+                // 只留最近 KEEP 个（含本次）
+                val all = r.listFiles { f -> f.name.startsWith(PREFIX) && f.name.endsWith(".log") }
+                    ?.sortedByDescending { it.lastModified() } ?: emptyList()
+                all.drop(KEEP - 1).forEach { runCatching { it.delete() } }
 
-            writer = OutputStreamWriter(java.io.FileOutputStream(cur, true), Charsets.UTF_8)
+                writer = OutputStreamWriter(java.io.FileOutputStream(cur, true), Charsets.UTF_8)
+            }
         }
     }
 
@@ -119,10 +128,21 @@ object LogFileStore {
         }
     }.getOrDefault(true to 0)
 
+    /**
+     * 文件侧的折叠状态。**这四个字段的每一次读写都必须在 [lock] 之内**。
+     *
+     * 为什么：`append` 会被四个线程并发调用（native 日志回调线程、stderr-pump 线程、
+     * UncaughtExceptionHandler 线程、主线程），而折叠逻辑是"读-改-写"三步 ——
+     * 锁外做的话，两个线程会各自以为自己是"第一个"，`fileRep` 的增长被打断，
+     * 写出的 `×N` 少报（`noiseRun` 同理，且方向是多报）。
+     * 这些数字的**全部用途就是给人对账**（"日志少了的那九成行数去哪了"），
+     * 失真时它给出的恰恰是错误方向的确定性。内存 ring 侧（[LlmEngine.logRing]）
+     * 一直是加锁的，这里原来漏了。
+     */
     private var fileBase: String? = null
     private var fileRep = 0
 
-    /** 噪音行的累计计数与样例（用于恢复输出时补一条"省略 N 条"说明） */
+    /** 噪音行的累计计数与样例（用于恢复输出时补一条"省略 N 条"说明）——同样受 [lock] 保护 */
     private var noiseRun = 0
     private var noiseSample = ""
 
@@ -141,17 +161,29 @@ object LogFileStore {
         line.contains("device-supports-buft") ||
                 (line.contains("supports-op") && line.trimEnd().endsWith("(0)"))
 
-    /** 记一条噪音（在真正写出前由 [flushNoise] 补一条计数说明） */
+    /** 记一条噪音（在真正写出前由 [flushNoise] 补一条计数说明）。计数与样例在同一临界区内配对更新。 */
     fun noteNoise(line: String) {
-        if (noiseRun == 0) noiseSample = line
-        noiseRun++
+        synchronized(lock) {
+            if (noiseRun == 0) noiseSample = line
+            noiseRun++
+        }
     }
 
+    /**
+     * 补一条「省略 N 条」说明。取数**与清零在同一个临界区内**：
+     * 旧写法 `val n = noiseRun; … ; noiseRun = 0` 中间没有独占，
+     * 另一线程在此期间 `noteNoise()` 的增量会被计数进 n 又被清零抹掉 —— 实测多报 0.34%~2.08%。
+     */
     fun flushNoise() {
-        val n = noiseRun
-        if (n <= 0) return
-        noiseRun = 0
-        append("$noiseSample ｜同类噪音共 $n 条已省略（LM_GGML_HEXAGON_VERBOSE=0 可整块关掉）")
+        val n: Int
+        val sample: String
+        synchronized(lock) {
+            n = noiseRun
+            if (n <= 0) return
+            sample = noiseSample
+            noiseRun = 0
+        }
+        append("$sample ｜同类噪音共 $n 条已省略（LM_GGML_HEXAGON_VERBOSE=0 可整块关掉）")
     }
 
     /**
@@ -166,19 +198,21 @@ object LogFileStore {
      * - 以 "##" 开头的控制行（结束标记等）永不折叠，否则末行判据会被 "##xxx ×2" 破坏。
      */
     fun append(line: String) {
-        val w = writer ?: return
-        val out = if (line.startsWith("##")) {
-            fileBase = null; fileRep = 0
-            line
-        } else if (line == fileBase) {
-            fileRep++
-            if (fileRep % 100 != 0) return
-            "$line ×$fileRep"
-        } else {
-            fileBase = line; fileRep = 1
-            line
-        }
         synchronized(lock) {
+            val w = writer ?: return
+            // 折叠判据与写出必须在同一个临界区内：读-改-写三步分开做时，
+            // 两个线程会各自认为自己是"第一个"，`fileRep` 的增长被打断 → 少报。
+            val out = if (line.startsWith("##")) {
+                fileBase = null; fileRep = 0
+                line
+            } else if (line == fileBase) {
+                fileRep++
+                if (fileRep % 100 != 0) return
+                "$line ×$fileRep"
+            } else {
+                fileBase = line; fileRep = 1
+                line
+            }
             runCatching {
                 w.write(out)
                 w.write("\n")

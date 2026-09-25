@@ -16,16 +16,28 @@
 set -e
 cd "$(dirname "$0")/.."
 
+# REQUIRED=0 时缺工具链退化为 SKIP（exit 0 并打印原因）：CI 是 AFK 编包场景，
+# 缺工具链属环境问题；与之相对，**测试断言失败**必须拦住。缺省 REQUIRED=1。
+missing() {
+    if [ "${REQUIRED:-1}" = "0" ]; then
+        echo "SKIP  缺少 $1（REQUIRED=0，CI 允许退化）"
+        exit 0
+    fi
+    echo "缺少 $1"
+    exit 2
+}
+
+
 TC=/workspace/.omnibot/toolchain
 KOTLINC="$TC/kotlinc/bin/kotlinc"
 JAVA=$(ls -d "$TC"/jdk-*/bin/java 2>/dev/null | head -1)
 JAR="$TC/android-35/android.jar"
 JSON=/tmp/json.jar
 
-[ -x "$KOTLINC" ] || { echo "缺少 kotlinc：解压 kotlin-compiler-2.0.21.zip 到 $TC"; exit 2; }
-[ -x "$JAVA" ]    || { echo "缺少 JDK：解压 OpenJDK*-jre_*_linux_hotspot_*.tar.gz 到 $TC"; exit 2; }
-[ -f "$JAR" ]     || { echo "缺少 android.jar：解压 platform-35_r02.zip，取 android-35/android.jar 放到 $TC/android-35/"; exit 2; }
-[ -f "$JSON" ]    || { echo "缺少 /tmp/json.jar：curl -o /tmp/json.jar https://repo1.maven.org/maven2/org/json/json/20240303/json-20240303.jar"; exit 2; }
+[ -x "$KOTLINC" ] || missing "kotlinc：解压 kotlin-compiler-2.0.21.zip 到 $TC"
+[ -x "$JAVA" ]    || missing "JDK：解压 OpenJDK*-jre_*_linux_hotspot_*.tar.gz 到 $TC"
+[ -f "$JAR" ]     || missing "android.jar：解压 platform-35_r02.zip，取 android-35/android.jar 放到 $TC/android-35/"
+[ -f "$JSON" ]    || missing "/tmp/json.jar：curl -o /tmp/json.jar https://repo1.maven.org/maven2/org/json/json/20240303/json-20240303.jar"
 
 # kotlinc 是 shell 脚本，内部靠 PATH 找 java。TC 不在默认 PATH 里，
 # 不显式导出会得到 "java: command not found" —— 而 kotlinc 此时仍返回 0，

@@ -62,17 +62,23 @@ c "parse 侧 add_generation_prompt 不再写死 false" \
 c "parse 侧 add_generation_prompt 取自 addAss（与渲染侧同源）" \
   "grep -q 'in.add_generation_prompt = (addAss == JNI_TRUE);' \$TMP"
 c "parseToolCallsImpl 接收 addAss 形参" \
-  "grep -q 'jstring jtmpl, jboolean addAss) {' \$TMP"
+  "grep -q 'jstring jtmpl, jboolean addAss,\$' \$TMP"
+c "parseToolCallsImpl 接收 enableThinking 形参（与渲染侧同源，否则前缀形状对不上）" \
+  "grep -q 'jboolean enableThinking) {' \$TMP"
 c "JNI 入口 nativeParseToolCalls 接收 addAss" \
-  "grep -q 'jstring jtmpl, jboolean addAss) {' \$CPP"
-c "Kotlin native 声明同步带 addAss" \
-  "grep -q 'text: String, toolsJson: String?, tmpl: String, addAss: Boolean' \$KT"
+  "grep -q 'jstring jtmpl, jboolean addAss,\$' \$CPP"
+c "JNI 入口 nativeParseToolCalls 接收 enableThinking" \
+  "grep -q 'jboolean enableThinking) {' \$CPP"
+c "Kotlin native 声明同步带 addAss 与 thinkingOn" \
+  "grep -q 'text: String, toolsJson: String?, tmpl: String, addAss: Boolean, thinkingOn: Boolean' \$KT"
 c "Kotlin parseToolCalls 把 addAss 透传进 native" \
-  "grep -q 'nativeParseToolCalls(text, toolsJson, tmpl, addAss)' \$KT"
+  "grep -q 'nativeParseToolCalls(text, toolsJson, tmpl, addAss, thinkingOn)' \$KT"
+c "Kotlin parseToolCalls 把 thinkingOn 透传进 native（与渲染同源）" \
+  "grep -q 'thinkingOn: Boolean = true' \$KT"
 # 调用点必须显式写 addAss=true，与 applyChatTemplateWithTools(..., addAss = true) 同取一值。
 # 不写而靠默认值也能对，但显式写能让"两处必须一致"这件事在 diff 里可见。
 c "HttpApi 解析调用点显式传 addAss = true" \
-  "grep -q 'parseToolCalls(sb.toString(), toolsJson, addAss = true)' \$HTTP"
+  "grep -q 'parseToolCalls(' \$HTTP && grep -q 'addAss = true, thinkingOn = thinkingOn)' \$HTTP"
 
 # ── 探针：这对数是这次查了两轮才推出来的，必须留在日志里 ──
 c "探针打出 generation_prompt 原文与长度" \
@@ -147,10 +153,52 @@ c "llama_token_to_piece 的 special 实参取自 renderSpecial" \
   "grep -q 'llama_token_to_piece(S.vocab, t, buf, sizeof(buf), 0, renderSpecial)' \$CPP"
 c "不再有写死 special=false 的 token_to_piece 调用" \
   "! grep -q 'llama_token_to_piece(S.vocab, t, .*, 0, false)' \$CPP"
+# 这里原来 grep 的是 `S.pending += token_to_piece(tok);`。补齐 stop 之后该行被
+# 换成「按状态机放行的增量下发」（`S.pending += piece;` / `+= stop_sampler_take_released`），
+# 于是 grep 落空、`[ -lt ]` 直接报 "argument expected" —— 断言失效为**报错**而不是 FAIL。
+# 改为匹配仍然存在、且语义等价的「本步把 token 文本化」那一行：EOG 判定必须早于它。
 c "EOG 判定在 token_to_piece 之前（防 <|im_end|> 漏进正文）" \
-  "[ \$(grep -n 'llama_vocab_is_eog(S.vocab, tok)' \$CPP | head -1 | cut -d: -f1) -lt \$(grep -n 'S.pending += token_to_piece(tok);' \$CPP | head -1 | cut -d: -f1) ]"
+  "[ \$(grep -n 'llama_vocab_is_eog(S.vocab, tok)' \$CPP | head -1 | cut -d: -f1) -lt \$(grep -n 'const std::string piece = token_to_piece(tok);' \$CPP | head -1 | cut -d: -f1) ]"
 c "解码侧可疑形状有留痕（不再在解析器上绕圈）" \
   "grep -q '解码侧可疑' \$TMP"
+# ── 第三条：enable_thinking 必须显式传（C++ 默认 true，不传 = 恒"思考开"）──
+# 这一条编译期拦不住：字段存在、默认值合理、不赋值也不报错，真机只表现为
+# "设置页勾了默认关闭思考也没用"。三条路径（无 tools 渲染 / 带 tools 渲染 / 解析）
+# 都必须赋值，缺一条就有一种请求形态关不掉思考。
+c "无 tools 渲染路径显式设 enable_thinking" \
+  "grep -q 'in.enable_thinking = (enableThinking == JNI_TRUE);' \$CPP"
+c "三条路径都设了 enable_thinking（计数 = 3）" \
+  "[ \$(grep -c 'in.enable_thinking = (enableThinking == JNI_TRUE);' \$CPP) -eq 3 ]"
+c "无 tools 渲染不再走 llama_chat_apply_template（旧接口不认 enable_thinking）" \
+  "! grep -q 'llama_chat_apply_template(' \$CPP"
+c "无 tools 渲染也走 common_chat_templates_apply（与带 tools 路径同一套引擎）" \
+  "grep -q 'Java_com_xiaowan_localinference_LlmEngine_nativeApplyChatTemplate(' \$CPP && \
+   awk '/nativeApplyChatTemplate\\(/,/^}/' \$CPP | grep -q 'common_chat_templates_apply'"
+c "带 tools 渲染的 enable_thinking 由形参透传" \
+  "grep -q 'jboolean enableThinking) {' \$CPP"
+c "解析路径的 enable_thinking 由形参透传" \
+  "grep -q 'in.enable_thinking = (enableThinking == JNI_TRUE);' \$TMP"
+
+# ── 第四条：JNI 形参个数不能两边漂移 ──
+# 形参个数不一致 = 运行时 UnsatisfiedLinkError，而它**只在真机调用到那一刻**才报，
+# 编译期（两边各自都合法）与离线单测都发现不了。这里按"Kotlin 声明的形参个数"
+# 与"C++ 函数形参个数"逐个数一遍。
+c "Kotlin nativeApplyChatTemplate 声明 5 个形参（含 thinkingOn）" \
+  "awk '/fun nativeApplyChatTemplate\\(/,/\\): String\\?/' \$KT | grep -q 'thinkingOn: Boolean): String?'"
+c "Kotlin nativeApplyChatTemplateTools 声明 8 个形参（含 thinkingOn）" \
+  "awk '/fun nativeApplyChatTemplateTools\\(/,/\\): String\\?/' \$KT | grep -q 'thinkingOn: Boolean): String?'"
+c "Kotlin nativeParseToolCalls 声明 5 个形参（含 thinkingOn）" \
+  "awk '/fun nativeParseToolCalls\\(/,/\\): String/' \$KT | grep -q 'addAss: Boolean, thinkingOn: Boolean): String'"
+c "C++ 对应入口的尾参也是 enableThinking" \
+  "grep -q 'jboolean addAss, jboolean enableThinking) {' \$CPP && \
+   grep -q 'jboolean parallelToolCalls, jboolean addAss,\$' \$CPP"
+c "C++ 无 tools 渲染入口形参序列与 Kotlin 一一对应（addAss, enableThinking）" \
+  "grep -q 'jboolean addAss, jboolean enableThinking) {' \$CPP"
+# 5 处 = 3 个 JNI 入口 + 2 个 Impl（无 tools 的渲染直接写在入口里，没有单独 Impl）
+c "C++ 的 3 个 JNI 入口与 2 个 Impl 都接收 enableThinking 尾参（共 5 处）" \
+  "[ \$(grep -c 'jboolean enableThinking) {' \$CPP) -eq 5 ]"
+
+
 c "留痕判定同时看开头形状与是否含标记" \
   "grep -q 'looksStripped' \$TMP && grep -q 'kToolMarkers' \$TMP"
 

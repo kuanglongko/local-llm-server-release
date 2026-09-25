@@ -26,6 +26,37 @@ data class SamplingParams(
     val seed: Long,
     val maxTokens: Int,
 ) {
+    /**
+     * 一个数值参数的界面取值界。
+     *
+     * [min]/[max] 是**闭**区间的端点；[minExclusive]/[maxExclusive] 表示该端
+     * 不可取（`top_p` 的下界、`min_p` 的上界都是这样）。分成两个标志而不是
+     * "把端点挪一个 step"，是因为端点是否可取由**服务端判据**决定，不是界面的
+     * 显示偏好 —— 挪一个 step 会让"界"与 [`topPOk`] 再次分叉，又回到老路上。
+     *
+     * [integral] 表示服务端走 `readInt`：非整数值会被 400（`512.5`、`seed=1.5`）。
+     * 界面对这类字段必须给整数判据，否则用户会白跑一趟 400。
+     */
+    data class Bounds(
+        val min: Double,
+        val max: Double,
+        val step: Double,
+        val minExclusive: Boolean = false,
+        val maxExclusive: Boolean = false,
+        val integral: Boolean = false,
+    ) {
+        /** 该值是否落在界内（含排他端与整数性）。与各 `*Ok` 的语义**逐条对应**。 */
+        fun contains(v: Double): Boolean {
+            if (!v.isFinite()) return false
+            if (minExclusive && v <= min) return false
+            if (!minExclusive && v < min) return false
+            if (maxExclusive && v >= max) return false
+            if (!maxExclusive && v > max) return false
+            if (integral && v != Math.floor(v)) return false
+            return true
+        }
+    }
+
     /** 生成用默认值，与 UI 参数区默认档保持一致。 */
     companion object {
         const val DEF_TEMP = 0.8f
@@ -39,14 +70,31 @@ data class SamplingParams(
         const val DEF_MAX_TOKENS = 512
         const val MAX_TOKENS_CAP = 8192
 
-        /** top_k 上限。超过词表规模没有意义，同时防止巨大 k 拖慢 top-k 采样。 */
-        private const val TOP_K_CAP = 1_000_000
+        /**
+         * top_k 上限。超过词表规模没有意义，同时防止巨大 k 拖慢 top-k 采样。
+         *
+         * **可见**（非 `private`）：自带测试页要把「取值界」画进 `<input min/max>`，
+         * 而界必须与这里**引同一份**而不是手抄。手抄的下场在本项目已经出现过一次
+         * （HTTP `min_p=0.05` vs UI `min_p=0` 的分裂）：两边各自漂移，症状是
+         * "页面上填的数和服务端实际用的/接受的不是一回事"，且不报错。
+         */
+        const val TOP_K_CAP = 1_000_000
 
         /** 采样温度上限。LLaMA 系在 2.0 附近已接近均匀分布，再高只会输出乱码。 */
-        private const val TEMP_CAP = 5f
+        const val TEMP_CAP = 5f
 
         /** 惩罚系数上限（OpenAI 的 presence/frequency 合法区间是 [-2, 2]）。 */
-        private const val PENALTY_ABS_CAP = 2f
+        const val PENALTY_ABS_CAP = 2f
+
+        /**
+         * top_p 的**排他**下界与 min_p 的**排他**上界。
+         *
+         * 这两个数不是"顺手取个整"：`topPOk` 要求 `p > 0`、`minPOk` 要求 `p < 1`
+         * （0 与 1 分别会让 native 侧静默失效 / 砍光候选）。它们**不等于**区间端点，
+         * 所以单独给两个显式常量，好让 UI 侧与断言侧引同一份。
+         */
+        const val TOP_P_MIN_EXCLUSIVE = 0f
+        const val MIN_P_MAX_EXCLUSIVE = 1f
 
         /**
          * 把调用方给的 seed 规整成非零的 uint32。
@@ -120,11 +168,22 @@ data class SamplingParams(
             val maxTok = readInt(j, "max_tokens", DEF_MAX_TOKENS) ?: return null to errMaxTokens
             if (!maxTokensOk(maxTok)) return null to errMaxTokens
 
-            // seed 缺席（含空串）-> 随机；给了但解析不了 -> 报 400，不再默默随机。
-            val seed = readLong(j, "seed")?.let { normalizeSeed(it) } ?: run {
-                if (j.has("seed") && !j.isNull("seed") &&
-                    (j.opt("seed") as? String)?.trim()?.isNotEmpty() == true) return null to errSeed
-                randomSeed()
+            // seed 走与其它 9 个字段**同一条**读取路径（read()）。
+            // 旧实现自己另写了一套判据，把 errSeed 的条件写成「字符串且非空」，于是
+            // {"seed":true} / {"seed":[]} / {"seed":{}} 全都落到 randomSeed() —— 显式给了值
+            // 却被静默当成没给，与本文件头「非法的显式取值报 400，而不是静默降级」相反。
+            // 交由 read() 后，只有 Absent（缺字段 / null / 空串，空串=UI 清空参数框）才随机。
+            val seed = when (val r = read(j, "seed")) {
+                is Read.Absent -> randomSeed()
+                is Read.Bad -> return null to errSeed
+                is Read.Ok -> {
+                    val d = r.v
+                    if (!d.isFinite() || d != Math.floor(d) ||
+                        d < Long.MIN_VALUE.toDouble() || d > Long.MAX_VALUE.toDouble()) {
+                        return null to errSeed
+                    }
+                    normalizeSeed(d.toLong())
+                }
             }
 
             return SamplingParams(
@@ -200,17 +259,6 @@ data class SamplingParams(
             }
         }
 
-        private fun readLong(j: JSONObject, key: String): Long? = when (val r = read(j, key)) {
-            is Read.Absent -> 0L
-            is Read.Bad -> null
-            is Read.Ok -> {
-                val d = r.v
-                if (!d.isFinite() || d != Math.floor(d) ||
-                    d < Long.MIN_VALUE.toDouble() || d > Long.MAX_VALUE.toDouble()) null
-                else d.toLong()
-            }
-        }
-
         // ---- 范围校验（UI 侧与 HTTP 侧共用，避免两处规则漂移）----
 
         /** temp<=0 = 贪心，合法；上界防均匀乱码。 */
@@ -243,6 +291,36 @@ data class SamplingParams(
         fun penaltyOk(p: Float) = p.isFinite() && p >= -PENALTY_ABS_CAP && p <= PENALTY_ABS_CAP
 
         fun maxTokensOk(n: Int) = n in 1..MAX_TOKENS_CAP
+
+        // ══════════════════════════════════════════════════════════════════
+        // 取值界（给 UI 用，**唯一一份**）
+        // ══════════════════════════════════════════════════════════════════
+
+        /**
+         * 按参数名取界面取值界。**这是页面唯一该用的来源** —— 页面自己发明一套
+         * 更宽松的界，用户会拿到服务端 400 而不知道是自己填的数越界；更宽松的界
+         * 还会让"页面上那个数"与"实际生效的数"悄悄不一致。
+         *
+         * 每一条都与上面的 `*Ok` 一一对应（`boundsAndCheckAgree` 有断言钉住）。
+         */
+        fun boundsOf(key: String): Bounds? = when (key) {
+            // temp<=0 = 贪心，合法；上界 TEMP_CAP。
+            "temperature" -> Bounds(0.0, TEMP_CAP.toDouble(), 0.05)
+            // (0,1]：下界排他（0 = 静默失效）。
+            "top_p" -> Bounds(TOP_P_MIN_EXCLUSIVE.toDouble(), 1.0, 0.01, minExclusive = true)
+            // [0,1)：上界排他（1 = 砍光候选）。
+            "min_p" -> Bounds(0.0, MIN_P_MAX_EXCLUSIVE.toDouble(), 0.01, maxExclusive = true)
+            "top_k" -> Bounds(0.0, TOP_K_CAP.toDouble(), 1.0, integral = true)
+            "max_tokens" -> Bounds(1.0, MAX_TOKENS_CAP.toDouble(), 1.0, integral = true)
+            "repeat_penalty" -> Bounds(1.0, Double.MAX_VALUE, 0.01)
+            "repeat_last_n" -> Bounds(0.0, Double.MAX_VALUE, 1.0, integral = true)
+            "frequency_penalty" -> Bounds(-PENALTY_ABS_CAP.toDouble(), PENALTY_ABS_CAP.toDouble(), 0.01)
+            "presence_penalty" -> Bounds(-PENALTY_ABS_CAP.toDouble(), PENALTY_ABS_CAP.toDouble(), 0.01)
+            // seed 服务端接受任意整数并规整成非零 uint32（normalizeSeed）；UI 留空 = 随机。
+            // Long 全域在 JS 的 Number 里表达不全，界只做"是否整数"，不做上下界。
+            "seed" -> Bounds(-9.007199254740991E15, 9.007199254740991E15, 1.0, integral = true)
+            else -> null
+        }
     }
 
     /**
