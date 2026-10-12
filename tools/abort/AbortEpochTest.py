@@ -18,10 +18,12 @@
 #
 # 运行：python3 tools/abort/AbortEpochTest.py
 fail = 0
+ok = 0
 def ck(name, cond):
-    global fail
+    global fail, ok
     if cond:
         print(f"PASS  {name}")
+        ok += 1
     else:
         print(f"FAIL  {name}")
         fail += 1
@@ -340,8 +342,12 @@ ck("差额恰好等于被缓冲未下发的那 4 个（可对账的量化口径�
 
 print()
 print("=" * 70)
+# 收尾必须报**条数**（`PASS n / FAIL 0`），不只是"全部通过"：
+# `tools/count_suite_totals.py` 拿这份读数去对账 `suite-counts.json`，
+# 而它只认带数字的汇总行 —— 只印"全部通过"会让清单记成 None，
+# 对账时按"清单有值、实测=None"报成一条**假漂移**（看起来像套件跑不动）。
 if fail == 0:
-    print("=== abort 归属/账本语义 全部通过 ===")
+    print(f"=== abort 归属/账本语义：PASS {ok} / FAIL 0 ===")
 else:
-    print(f"=== abort 归属/账本语义 {fail} 条失败 ===")
+    print(f"=== abort 归属/账本语义：PASS {ok} / FAIL {fail} ===")
 raise SystemExit(1 if fail else 0)

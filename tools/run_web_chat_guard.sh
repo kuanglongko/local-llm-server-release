@@ -25,6 +25,7 @@ SRC=app/src/main/java/com/xiaowan/localinference
 HTTP=$SRC/HttpApi.kt
 CORS=$SRC/CorsPolicy.kt
 WEB=$SRC/WebChatPage.kt
+ENGINE=$SRC/EngineActivity.kt
 SAMP=$SRC/SamplingParams.kt
 README=README.md
 STATUS=HTP-STATUS.md
@@ -81,6 +82,41 @@ c "页面默认值引 SamplingParams.DEF_TEMP" "grep -q 'fmt(SamplingParams.DEF_
 c "页面默认值引 SamplingParams.DEF_MAX_TOKENS" "grep -q 'fmt(SamplingParams.DEF_MAX_TOKENS)' \$WEB"
 c "页面默认值引 SamplingParams.DEF_REPEAT_PENALTY" "grep -q 'fmt(SamplingParams.DEF_REPEAT_PENALTY)' \$WEB"
 c "思考链走请求侧认的 enable_thinking 字段" "grep -q 'enable_thinking' \$WEB"
+
+# ── 3b) 单条删除 + 三页切换的**接线**（本轮新增）────────────────────────────
+# 单测（run_web_chat_tests.sh）钉的是"纯函数产物长什么样"，而接线侧要确认
+# 这几条**真的在 GET / 发出去的那一份里**。判据锚结构关系，不锚"出现过某词"：
+#   · 只删气泡不删 history（或反过来）-> 视觉与上下文不一致，两种方向都看不出来；
+#   · 删除下标若假定"气泡下标 == history 下标"，只有**填过 system** 的会话才会
+#     删错一条（system 只进 history、不建气泡）—— 恰好是最少被随手测到的组合；
+#   · 滑动的落点若写成 document，会把两个输入框内部的光标左右移动一起抢走。
+c "长按删除的入口在发出去的页面里" "grep -q 'line.oncontextmenu' \$WEB"
+c "删除同时动气泡与 history（不会只删一边）" \
+  "grep -q 'history.splice(hi, 1)' \$WEB && grep -q 'bubbles.splice(idx, 1)' \$WEB"
+c "下标换算扣掉 system（不假定两者相等）" "grep -q 'const hi = idx + sysCount' \$WEB"
+# ── 3c) 生成中删除的**静默失效**（D-2）──────────────────────────────────────
+# 这一族最坏的地方是它**没有症状**：气泡确实从页面消失了，用户以为删成功了，
+# 而被删的回答仍在 history 里、之后每轮都喂给模型（还与文件头自己写的
+# 「同时删气泡与 history」正好相反）。所以判据不能只查"两处都写了 splice" ——
+# 那只证明存在，证明不了"删的时候 history 里真的有那一条"。
+# 三条合起来才等价于"删了算数"：
+#   · 生成中有闸门（本轮还没进 history，那一段窗口必须被挡住）；
+#   · 换算越界不再是静默跳过（旧写法 `if (hi >= 0 && hi < history.length)` 就是它）；
+#   · 成功与失败是**两条不同的出口**（不能删没删都回一句"已删除"）。
+c "生成中禁止删除（与 App 内同一道闸门）" "grep -q \"if (abort) { show(\\\$('out'), '生成中，请先停止再删除\" \$WEB"
+c "换算越界不再静默跳过（旧写法必须绝迹）" \
+  "grep -q 'const inRange = hi >= 0 && hi < history.length' \$WEB && ! grep -q 'if (hi >= 0 && hi < history.length) history.splice(hi, 1);' \$WEB"
+c "删除的成功/越界是两条出口（越界不许说"已删除"）" \
+  "grep -q 'if (inRange) {' \$WEB && grep -q '但这一条不在历史里' \$WEB"
+c "App 侧同一道闸门仍在（两边不许分叉）" \
+  "grep -q '生成中，请先停止' \$ENGINE"
+c "气泡注册顺序与 history 一致" \
+  "[ \$(grep -n 'bubbles.push(meBub.el)' \$WEB | cut -d: -f1) -lt \$(grep -n 'bubbles.push(aiBub.el)' \$WEB | cut -d: -f1) ]"
+c "三页切换在（页签点击 + 滑动两个入口）" \
+  "grep -q 'function showPage(i)' \$WEB && grep -q \"t.onclick = () => showPage\" \$WEB && grep -q \"pg.addEventListener('touchend'\" \$WEB"
+c "滑动落点是内容节点而不是 document" \
+  "grep -q \"const pg = \\\$('pager')\" \$WEB"
+c "页面里说明了长按可删（不然没人知道这个功能）" "grep -q '长按任一条可单独删除' \$WEB"
 
 # ── 4) 多轮会话：三条硬判据 ────────────────────────────────────────────────
 c "页面维护历史数组" "grep -q 'let history = \\[\\]' \$WEB"

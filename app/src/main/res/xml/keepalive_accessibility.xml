@@ -1,0 +1,27 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  「后台保活」无障碍服务的系统侧声明。
+
+  ⚠ 这里声明的**不是辅助功能**：本服务不订阅事件、不读窗口内容，只为了让部分
+     OEM 的存活判定把本进程当作"用户显式在意的应用"（见 KeepAliveAccessibilityService
+    的文件头，以及 [KeepAlive] 里"冻结判据与权限无关"的说明）。
+
+  两个字段是刻意的"最小声明"，改它们之前先读 KeepAliveAccessibilityService 的注释：
+    · android:accessibilityEventTypes —— 声明最小集（窗口状态变化，系统要求非空）。
+      运行时 onServiceConnected 会再置成 0：声明是"能收什么"，置 0 是"不收"，
+      两者同时存在时才不会因为将来改 xml 而静默开始接收用户界面数据。
+    · android:canRetrieveWindowContent="false" —— 明确不读窗口内容。
+      这是这个权限最敏感的部分，本功能一个字段都不需要。
+
+  android:accessibilityFlags 只留 flagDefault；禁止加
+  flagRetrieveInteractiveWindows / flagRequestEnhancedWebAccessibility
+  （那两项都会把用户界面内容带进本进程）。
+-->
+<accessibility-service xmlns:android="http://schemas.android.com/apk/res/android"
+    android:description="@string/keepalive_accessibility_desc"
+    android:summary="@string/keepalive_accessibility_summary"
+    android:accessibilityEventTypes="typeWindowStateChanged"
+    android:accessibilityFeedbackType="feedbackGeneric"
+    android:accessibilityFlags="flagDefault"
+    android:canRetrieveWindowContent="false"
+    android:notificationTimeout="0" />

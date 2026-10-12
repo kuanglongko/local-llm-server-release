@@ -18,6 +18,7 @@
 # 纯 sh + python3 标准库，不依赖工具链。运行：sh tools/run_ui_io_guard_tests.sh
 set -e
 cd "$(dirname "$0")/.."
+. "$(dirname "$0")/with_worktree_lock.sh"   # 工作区独占锁：见该文件顶部说明
 
 PY=${PYTHON:-python3}
 GUARD=tools/run_ui_io_guard.sh
@@ -40,7 +41,14 @@ restore() {
     for f in "$ACT" "$MS" "$LFS" "$EXT"; do cp "$TMP/$(basename "$f").bak" "$f"; done
     rm -rf "$TMP"
 }
-trap restore EXIT
+# 退出即还原：EXIT / INT / TERM / HUP 都走同一个还原 ——
+# 只 trap EXIT 时，CI 的 kill（默认 TERM）不会触发 EXIT trap，
+# 打桩源码就会留在工作区（正是 #126 那轮脏工作区的机制）。
+# 就地打桩前先抢工作区独占锁：本脚本会改真源码再 trap 还原，
+# 与其他同套路自测并行时会互相盖桩（假红/漏桩）。见 tools/with_worktree_lock.sh。
+worktree_lock_acquire "$0"
+trap restore EXIT INT TERM HUP
+
 reset_src() { for f in "$ACT" "$MS" "$LFS" "$EXT"; do cp "$TMP/$(basename "$f").bak" "$f"; done; }
 
 # must_red "<桩名>" "<期望被点名的那条断言>"
@@ -71,32 +79,32 @@ else echo "FAIL  基线（未打桩）就红了："; cat "$TMP/base.out"; bad=$(
 "$PY" - $ACT <<'PYEOF'
 import sys
 p = sys.argv[1]; s = open(p, encoding="utf-8").read()
-old = """        for (r in rows) {
-            val f = r.file
-            val isSel = f.name == sel
-            val row = LinearLayout(this).apply {
-                orientation = LinearLayout.HORIZONTAL
-                gravity = Gravity.CENTER_VERTICAL
-            }
-            val tv = TextView(this).apply {
-                text = (if (isSel) "● " else "○ ") + (if (r.external) "🔗 " else "") + r.alias +
-                    (if (r.alias != f.name.removeSuffix(".gguf")) " · ${f.name}" else "") +
-                    if (r.missing) "  ⚠ 原文件已丢失" else "  (${r.bytes / 1048576} MB)\""""
-new = """        for (r in rows) {
-            val f = r.file
-            val isSel = f.name == sel
-            val row = LinearLayout(this).apply {
-                orientation = LinearLayout.HORIZONTAL
-                gravity = Gravity.CENTER_VERTICAL
-            }
-            val ext = ModelStore.isExternal(this, f.name)
-            val al = ModelStore.aliasOf(this, f.name)
-            val tv = TextView(this).apply {
-                text = (if (isSel) "● " else "○ ") + (if (ext) "🔗 " else "") + al +
-                    (if (al != f.name.removeSuffix(".gguf")) " · ${f.name}" else "") +
-                    if (r.missing) "  ⚠ 原文件已丢失" else "  (${f.length() / 1048576} MB)\""""
-assert s.count(old) == 1, "stub1: anchor not found"
+old = '''            val tailTxt = when {
+                r.missing -> "  ⚠ 原文件已丢失"
+                isSel && isLoaded -> "  (${r.bytes / 1048576} MB) · 已加载，正在用"
+                isLoaded -> "  (${r.bytes / 1048576} MB) · 在内存里，但当前选中的是别的（未切换）"
+                isSel -> "  (${r.bytes / 1048576} MB) · 已选中，尚未加载"
+                else -> "  (${r.bytes / 1048576} MB)"
+            }'''
+new = '''            val tailTxt = when {
+                r.missing -> "  ⚠ 原文件已丢失"
+                isSel && isLoaded -> "  (${f.length() / 1048576} MB) · 已加载，正在用"
+                isLoaded -> "  (${f.length() / 1048576} MB) · 在内存里，但当前选中的是别的（未切换）"
+                isSel -> "  (${f.length() / 1048576} MB) · 已选中，尚未加载"
+                else -> "  (${f.length() / 1048576} MB)"
+            }'''
+assert s.count(old) == 1, "stub1a: anchor not found"
 s = s.replace(old, new, 1)
+old2 = '''                    (if (r.alias != f.name.removeSuffix(".gguf")) " · ${f.name}" else "") + tailTxt'''
+new2 = '''                    (if (al != f.name.removeSuffix(".gguf")) " · ${f.name}" else "") + tailTxt'''
+assert s.count(old2) == 1, "stub1b: anchor not found"
+s = s.replace(old2, new2, 1)
+old3 = '''                text = mark + (if (r.external) "🔗 " else "") + r.alias +'''
+new3 = '''                val ext = ModelStore.isExternal(this@EngineActivity, f.name)
+                val al = ModelStore.aliasOf(this@EngineActivity, f.name)
+                text = mark + (if (ext) "🔗 " else "") + al +'''
+assert s.count(old3) == 1, "stub1c: anchor not found"
+s = s.replace(old3, new3, 1)
 open(p, "w", encoding="utf-8").write(s)
 PYEOF
 must_red "桩①（渲染循环里逐行问 prefs）" "I-2: renderModelList 函数体里不含任何 prefs"
@@ -106,14 +114,14 @@ reset_src
 "$PY" - $ACT <<'PYEOF'
 import sys
 p = sys.argv[1]; s = open(p, encoding="utf-8").read()
-old = """        ioExecutor.execute {
+old = '''        ioExecutor.execute {
             val rows = runCatching { ModelStore.rows(this) }.getOrNull()
-            ui.post { if (myGen == modelListGen) renderModelList(rows.orEmpty(), sel) }
+            ui.post { if (myGen == modelListGen) renderModelList(rows.orEmpty(), sel, loaded) }
         }
-    }"""
-new = """        val rows = runCatching { ModelStore.list(this) }.getOrNull()
-        renderModelList(rows.orEmpty().map { ModelStore.Row(it, it.name, false, false, it.length()) }, sel)
-    }"""
+    }'''
+new = '''        val rows = runCatching { ModelStore.list(this) }.getOrNull()
+        renderModelList(rows.orEmpty().map { ModelStore.Row(it, it.name, false, false, it.length()) }, sel, loaded)
+    }'''
 assert s.count(old) == 1, "stub2: anchor not found"
 s = s.replace(old, new, 1)
 open(p, "w", encoding="utf-8").write(s)

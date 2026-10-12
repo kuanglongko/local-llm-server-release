@@ -16,10 +16,14 @@ command -v "$CXX" >/dev/null 2>&1 || { echo "缺少 $CXX（本测试需要宿主
 command -v "$PY" >/dev/null 2>&1 || { echo "缺少 python3"; exit 2; }
 
 UNIT=/tmp/probe_syntax_unit.cpp
-"$PY" probe_syntax/extract.py ../app/src/main/cpp/llama_jni.cpp "$UNIT.body"
+UNITDIR=$(dirname "$UNIT")
+# 日志宏也一起抽出来（`log_macros.h`），由 head.h include —— 桩头不再自己抄
+# LOGI/LOGE。否则"源码里用了没定义的日志宏"这一族在本单元里永远编得过：
+# ccf0557 的 `LOGW` 让真机 GCC 直接报未声明，而这里一路全绿。
+"$PY" probe_syntax/extract.py ../app/src/main/cpp/llama_jni.cpp "$UNIT.body" "$UNITDIR/log_macros.h"
 cat probe_syntax/head.h "$UNIT.body" > "$UNIT"
 
-# -Werror：这里只编 7 个函数，警告就是信号（真机上被埋在几千行里的时候不是）。
+# -Werror：这里只编 8 个函数，警告就是信号（真机上被埋在几千行里的时候不是）。
 "$CXX" -std=c++17 -fsyntax-only -Wall -Wextra -Werror -Wno-unused-function \
-    -I ../app/src/main/cpp "$UNIT"
+    -I ../app/src/main/cpp -I "$UNITDIR" "$UNIT"
 echo "=== 探针开关/自举语法检查：PASS（抽取单元 $(basename "$UNIT")）==="

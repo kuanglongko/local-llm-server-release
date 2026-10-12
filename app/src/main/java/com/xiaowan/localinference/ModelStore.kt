@@ -99,6 +99,23 @@ object ModelStore {
             .edit().putString(KEY_SELECTED, name).apply()
     }
 
+    // ---- 嵌入模型（RAG 双常驻的那一份）----
+    //
+    // 与对话模型**共用同一个模型库目录**（同一个 `ModelStore.list`），但选中项
+    // 分开存：两个角色各要一个"当前用哪个"。合并成一个键会让"选嵌入模型"顺手
+    // 把对话模型的选择也改掉 —— 那正是双常驻要避免的串味。
+    private const val KEY_EMBED_MODEL = "embed_model"
+
+    /** 当前选定的嵌入模型文件名；""= 没选过（不能靠它判断是否已加载，见 [LlmEngine.hasEmbedModel]）。 */
+    fun embedModelName(ctx: Context): String =
+        ctx.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+            .getString(KEY_EMBED_MODEL, "").orEmpty()
+
+    fun setEmbedModelName(ctx: Context, name: String) {
+        ctx.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+            .edit().putString(KEY_EMBED_MODEL, name).apply()
+    }
+
     /** 模型显示别名（/v1/models 返回它；默认= 文件名去 .gguf） */
     fun aliasOf(ctx: Context, fileName: String): String =
         ctx.getSharedPreferences(PREFS, Context.MODE_PRIVATE)

@@ -147,8 +147,15 @@ c "prefill 成功后记一轮（否则计数恒 0，字段失去意义）" \
   "grep -q 'S.kv_rounds++;' \$JNI"
 c "kv_invalidate 不得清零 kv_rounds（作废账本 ≠ 没跑过）" \
   "! sed -n '/^static void kv_invalidate/,/^}/p' \$JNI | nocomment | grep -q 'S\.kv_rounds'"
-c "stats 出口带上第三个读数（数组长度 3）" \
-  "grep -q 'NewIntArray(3)' \$JNI && grep -q 'S.kv_rounds };' \$JNI"
+# ⚠ 长度不写死：这个数组是**追加式**的（引入 last_lcp 时 3 → 4，E-5 加 kv_rounds 时
+# 2 → 3）。判据要钉的是"kv_rounds 真的进了这个数组"，而不是"数组恰好这么长" ——
+# 钉长度会让每一次**合法的追加**都红在自己的措辞上（本仓库称之为判据漂移：
+# 守卫讨厌某种写法，而不是代码坏了）。
+# 取整个 nativeKvCacheStats **函数体**来判：kv_rounds 必须真的在那份初始化列表里
+# （`S.kv_rounds` 出现在文件别处不算），且容量与写入长度一致 —— 长度写死会在
+# 合法追加时误红（见上一条注释），但"容量 != 写入长度"是越界写，必须红。
+c "stats 出口带上 kv_rounds 读数（且数组容量与写入长度一致）" \
+  "python3 tools/abort/kv_stats_cap_check.py"
 c "LlmEngine 暴露 kvRounds（取引擎实况）" \
   "grep -q 'val kvRounds: Int get() = runCatching { nativeKvCacheStats()\\[2\\] }' \$ENG"
 c "HttpApi /health 报 kv_rounds（且取的是引擎实况）" \

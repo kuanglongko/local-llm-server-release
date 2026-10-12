@@ -21,6 +21,7 @@
 # 运行：sh tools/run_mmap_release_guard_tests.sh
 set -e
 cd "$(dirname "$0")/.."
+. "$(dirname "$0")/with_worktree_lock.sh"   # 工作区独占锁：见该文件顶部说明
 JNI=app/src/main/cpp/llama_jni.cpp
 
 ok=0; bad=0
@@ -31,11 +32,20 @@ chk() {
     else echo "FAIL  $name：期望 $want，实得 $got"; bad=$((bad+1)); fi
 }
 
-STASH=/tmp/mmap_release_stash
-rm -rf "$STASH"; mkdir -p "$STASH"
+STASH=$(mktemp -d "${TMPDIR:-/tmp}/mmap_release_XXXXXX")
 cp "$JNI" "$STASH/llama_jni.cpp"
 restore() { cp "$STASH/llama_jni.cpp" "$JNI"; }
-trap restore EXIT
+# 退出即还原：EXIT / INT / TERM / HUP 都走同一个还原 ——
+# 只 trap EXIT 时，CI 的 kill（默认 TERM）不会触发 EXIT trap，
+# 打桩源码就会留在工作区（正是 #126 那轮脏工作区的机制）。
+# restore 供运行时复位反复调用（不清理，否则后续桩失去基线）；
+# 退出清理只做一次，避免重复 rm。
+_exit_cleaned=0
+_on_exit() { [ "$_exit_cleaned" = 1 ] && return 0; _exit_cleaned=1; restore; rm -rf "$STASH"; }
+# 就地打桩前先抢工作区独占锁：本脚本会改真源码再 trap 还原，
+# 与其他同套路自测并行时会互相盖桩（假红/漏桩）。见 tools/with_worktree_lock.sh。
+worktree_lock_acquire "$0"
+trap _on_exit EXIT INT TERM HUP
 
 stub() {
     name="$1"; want="$2"; prog="$3"
@@ -46,6 +56,36 @@ stub() {
 
 # ① **本轮最重要的桩**：把旧错法原样放回去（自己另建映射 + DONTNEED）。
 #    它曾经是全绿 —— 现在必须红。这是"判据比实现更宽"的直接反证。
+# ①-2 **本轮真机现场**：正确的「读 maps + 对库映射 DONTNEED」整段还在源码里，
+#    但在它**前面**插了一段早退（典型来源是 merge/rebase 把旧错法又贴回来了，
+#    而新实现没删）。这种形态下：源文件里"maps / madvise / 自证日志"**一个不少**，
+#    只锚"字符串出现过"的判据**全会绿** —— 而运行期走的是早退那一支，
+#    用户那边 RSS 一页不降（Issue #238 用户日志里 [mmap释放] 三次回收 0/0/1 MB
+#    正是这个读数）。
+#    所以这根桩钉的是**可达性**，不是存在性：判据必须能红。
+stub "正确实现被提前 return 变死代码（maps 那段还在，但走不到）" red '
+import sys, io
+p = sys.argv[1]; s = io.open(p, encoding="utf-8").read()
+old = """    FILE * f = fopen("/proc/self/maps", "r");"""
+assert old in s, "源码形状变了，本自测要一起更新"
+# 把**旧错法原样贴回**到正确实现之前，并以 return 收尾 —— 正确那段从此不可达。
+early = """    int fd = open(path, O_RDONLY | O_CLOEXEC);
+    if (fd < 0) return -1;
+    off_t sz = lseek(fd, 0, SEEK_END);
+    if (sz <= 0) { close(fd); return -1; }
+    void * addr = mmap(nullptr, (size_t) sz, PROT_READ, MAP_SHARED, fd, 0);
+    if (addr == MAP_FAILED) { close(fd); return -1; }
+    int rc = madvise(addr, (size_t) sz, MADV_DONTNEED);
+    munmap(addr, (size_t) sz);
+    close(fd);
+    if (n_ranges) *n_ranges = 1;
+    if (bytes)    *bytes    = (long) sz;
+    return rc == 0 ? 0 : -1;
+""" + old
+s = s.replace(old, early, 1)
+io.open(p, "w", encoding="utf-8").write(s)
+'
+
 stub "旧错法：自己另建映射 + DONTNEED（碰不到库那份，RSS 不降）" red '
 import sys, io
 p = sys.argv[1]; s = io.open(p, encoding="utf-8").read()

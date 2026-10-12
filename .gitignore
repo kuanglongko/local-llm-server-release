@@ -34,3 +34,6 @@ dist/
 
 # 本地工具链（ci/kt_check 一次性下载，不属于源码）
 .omnibot/
+
+# Python 字节码（守卫里的辅助脚本会被 import，别把 __pycache__ 带进来）
+__pycache__/

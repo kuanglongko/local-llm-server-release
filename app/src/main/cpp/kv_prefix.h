@@ -39,6 +39,23 @@ struct Plan {
     int to_decode = 0;
     /** 本轮整段 prompt 的 token 数。 */
     int total = 0;
+    /**
+     * 本轮与上一轮的**逐 token 最长公共前缀**长度（**不设门槛**，也不需要命中）。
+     *
+     * 为什么要单独留这个数（第 5 步，用户拍板要的可观测性）：
+     * 「没命中」是个**笼统结论**，它至少有两种成因，而处置完全相反：
+     *
+     *   · `lcp` 很大（比如 300）却仍没命中 -> 只可能是**门槛或容量**拦下的
+     *     （`total >= n_ctx`，或 `total - 1 < kMinReuseTokens`）——
+     *     属于"差一点就命中了"，值得查为什么会这样；
+     *   · `lcp` 很小（比如 2）-> 两轮 prompt **真的不一样**（例如开了知识库、
+     *     检索结果每轮都变，分叉点就在最前面的 system 段里）——
+     *     这是设计使然，调参也没用，要改的是注入位置。
+     *
+     * 只报 `reuse=0` 时这两种在日志上**逐字相同**，用户只能猜。
+     * 它是 `plan_reuse` 的**副产品**（本来就要算公共前缀），零额外代价。
+     */
+    int lcp = 0;
     /** 是否命中缓存（reuse > 0）。日志与 /health 用。 */
     bool hit() const { return reuse > 0; }
 };
@@ -112,6 +129,7 @@ inline Plan plan_reuse(const std::vector<long long> & prev,
     if (total_ctx > 0 && p.total >= total_ctx) return p;        // ③
 
     const int lcp = common_prefix_len(prev, cur);
+    p.lcp = lcp;                                                // 可观测面：无论是否命中都记下
     if (lcp < kMinReuseTokens) return p;
 
     // ④ 复用长度绝不允许达到本轮的整段 prompt：
@@ -130,8 +148,13 @@ inline Plan plan_reuse(const std::vector<long long> & prev,
 
 /** 供日志用的一行摘要（判据本身不依赖字符串，只为"一眼可分"）。 */
 inline std::string describe(const Plan & p) {
-    if (!p.hit()) return "KV 前缀复用：未命中（全量 prefill " + std::to_string(p.total) + " tok）";
-    return "KV 前缀复用：命中，复用 " + std::to_string(p.reuse) + " tok，只需 prefill " +
+    // 未命中时把**公共前缀**打出来：它是"差一点"与"真的不一样"的唯一分界。
+    // 门槛（[kMinReuseTokens]）与容量两道闸都在 lcp 之后判，所以 lcp 大却没命中
+    // 只可能是它们拦的 —— 这行日志让用户不必猜。
+    if (!p.hit()) return "KV 前缀复用：未命中（公共前缀 " + std::to_string(p.lcp) +
+                         " tok < 门槛 16，全量 prefill " + std::to_string(p.total) + " tok）";
+    return "KV 前缀复用：命中，复用 " + std::to_string(p.reuse) + " tok（公共前缀 " +
+           std::to_string(p.lcp) + " tok），只需 prefill " +
            std::to_string(p.to_decode) + " tok（共 " + std::to_string(p.total) + " tok）";
 }
 

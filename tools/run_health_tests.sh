@@ -49,7 +49,8 @@ trap 'rm -rf "$OUT"; rm -f "$LOG"' EXIT
 CP="$OUT:$JSON:$JAR:$TC/kotlinc/lib/kotlin-stdlib.jar"
 
 "$KOTLINC" -nowarn -classpath "$JAR:$JSON" -d "$OUT" \
-    "$SRC/HealthCheck.kt" "tools/health/HealthCheckTest.kt" > "$LOG" 2>&1 || true
+    "$SRC/HealthCheck.kt" "$SRC/EmbedLimits.kt" \
+    "tools/health/HealthCheckTest.kt" > "$LOG" 2>&1 || true
 if grep -qE ": error:" "$LOG"; then
     grep -E ": error:" "$LOG"
     exit 1

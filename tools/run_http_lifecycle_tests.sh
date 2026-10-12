@@ -50,7 +50,7 @@ fi
 # 加一道"源码级对应"检查：复刻里必须真的存在这三条判据，否则"测试全绿"
 # 只说明这份复刻自己能跑，不说明仓库里的实现有这三条（判据在守卫里，但这里
 # 也顺手把"复刻与实现脱钩"这件事挡一下：实现里没有代际号就找不到锚点）。
-for pat in 'listenerGen' 'desired' 'activeConns'; do
+for pat in 'listenerGen' 'desired' 'activeConns' 'restartPending' 'consumeRestartPendingIfIdle'; do
     if ! grep -q "$pat" "$SRC/HttpApi.kt"; then
         echo "FAIL  实现里找不到 $pat —— 复刻测试与实现已脱钩"
         exit 1

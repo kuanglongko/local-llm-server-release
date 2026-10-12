@@ -123,6 +123,44 @@ object HttpApi {
     private val busy = AtomicBoolean(false)
 
     /**
+     * **上一轮**远端请求实际注入了几条知识库内容（0 = 没注入）。
+     *
+     * 它是 `/health` 的 `rag_remote_injected` 的值，也是"远端知识库到底有没有
+     * 在工作"的唯一可编程读数。为什么不能只看 `/health` 的"开关开着"：
+     * 开关开着完全不代表检索命中了 —— 阈值、索引是否需重建、嵌入模型是否驻留，
+     * 任一环节没就绪，注入都是 0 条，而开关字段照旧报 `true`。
+     * 那种"开了却什么都没发生"在调用方看来与"功能坏了"是一回事，
+     * 只有这个"上一轮实际条数"能把两者分开。
+     *
+     * 语义与 `kv_reuse_tokens` 一致（都是"上一轮"）：它在**每轮请求开始时清零**，
+     * 注入成功则写上真实条数。不清零的实现会在本轮没注入时继续报上一轮的数 ——
+     * 那样"没注入"与"注入了"读数相同，字段就废了。
+     */
+    private val lastRagInjected = java.util.concurrent.atomic.AtomicInteger(0)
+
+    /**
+     * **注入当时的库名**（与 [lastRagInjected] 同一个时刻取）。
+     *
+     * ══════════════════════════════════════════════════════════════════════
+     * 为什么库名必须和条数**同源取一次**，不能到响应时现读
+     * ══════════════════════════════════════════════════════════════════════
+     * `local_rag` 字段是 `{kb, injected}` 一个**对象** —— 它描述的是"这一轮
+     * 用了哪个库、注入了几条"这一件事。到响应时再 `remoteKb(prefs)` 现读一次，
+     * 两者就可能来自**两个不同的时刻**：
+     *
+     *   · 用户在生成期间（长生成可以几十秒）在 App 里把「远端库名」从 A 改成 B；
+     *   · 本轮实际是拿 A 检索、注入了 3 条，而响应里写成 `kb:"B", injected:3`。
+     *
+     * 调用方读到的是一对**从未同时成立过**的事实，而它没有任何现象 ——
+     * 字段本身合法、JSON 合法、只是内容不真。这正是本仓库反复要消灭的
+     * "分成两次读，中间恰好变了一次"那一族（见 [RagIndexStore.readState] 的注释）。
+     *
+     * 所以与条数**同一个判据点**取出来（注入成功那一刻），响应时只读这两个共享值。
+     * 它在**每轮请求开始时清零**，语义与 [lastRagInjected] 一致。
+     */
+    @Volatile private var lastRagKb: String = ""
+
+    /**
      * listener 的**代际号**：每起一轮 accept 循环 +1，`finally` 只在
      * "我仍是当前那一轮"时才允许清 [running] / [server]。
      *
@@ -241,6 +279,39 @@ object HttpApi {
 
     /** 启动方（InferenceService）注入；为空时 /v1/models 优雅降级，绝不抛异常。 */
     @Volatile var appContext: android.content.Context? = null
+
+    /**
+     * 读 RAG 相关 prefs 用的 `Context` —— **本 object 里唯一的取口**。
+     *
+     * ⚠ 为什么要有这一层：`HttpApi` 是 `object`（单例），函数体里的 `this` 是
+     * **HttpApi 自己**，不是 `Context`。而 `RagInject.remoteEnabled/remoteKb`（以及
+     * `LlmEngine.ragContext` 的首参）要的是 `android.content.Context` —— 直接写
+     * `RagInject.remoteKb(this)` 是**编译不过**的（`object` 不是 `Context`），
+     * 这不是"能不能拿到值"的问题，是类型不匹配。
+     *
+     * 取不到 `Context` 时**抛异常**而不是回退成"当作没开"：本函数在 `handleChat`
+     * 的 `try` 之内被调用，异常由既有兜底转成 500；这与"静默按未配置处理"相比，
+     * 差别是**出错时能查**。而唯一的正常调用方（`start()` 之前由 InferenceService
+     * 注入）事实上保证它不为空 —— `injected` 无埋点、`static` 会在首次访问就初始化
+     * 并丢掉后来注入的那一个，两者都是"看着能跑、跑起来是错的"，所以不采用。
+     */
+    private fun ragPrefs(): android.content.Context =
+        appContext ?: throw IllegalStateException(
+            "HttpApi.appContext 未注入：RAG 相关读数必须在 Service 启动后使用")
+
+    /**
+     * 远端知识库**当前是否真的在注入**（`remote_enabled && remoteKb 非空`）。
+     *
+     * 与其他判断"远端那条路当下开着没有"（[RagInject.remoteEnabled]）分开，
+     * 语义是**两者都满足**。叫 `ragActive` 而不是 `remoteEnabled` 是刻意的：
+     * 与 [RagInject.remoteEnabled] 同名会成为"到底是哪一个"的长期误读源。
+     *
+     * ⚠ **不提供"传 null 就当作没开"的重载**：那正是本文件此前六处错误的温床 ——
+     * 少写一个 `?`（或漏掉判空）就变成"静默按未配置处理"，接口照 200、内容不注入，
+     * 与"用户没开"完全同形。宁可让它在类型层面就编译不过。
+     */
+    private fun ragActive(): Boolean =
+        RagInject.remoteEnabled(ragPrefs()) && RagInject.remoteKb(ragPrefs()).isNotEmpty()
 
     val isRunning: Boolean get() = running.get()
 
@@ -466,8 +537,97 @@ object HttpApi {
     // ---- 看门狗自愈 ----
     // 背景：部分 OEM 的后台冻结策略（切后台即冻、亮屏后也冻）与
     // accept 线程异常死亡都会造成「端口 LISTEN 但没人 accept」的假活态。
-    // 每 30s 自连探活，连续 2 次失败自动重启监听 —— 断联自愈窗口 30~60s。
+    // 自检周期见 [WATCHDOG_IDLE_MS] / [WATCHDOG_BUSY_MS]；
+    // 探活失败**不立刻重启**（那会掐断正在跑的流），只登记 [restartPending]，空闲后才重启。
+    //
+    // ⚠ 2026-09-26（Issue #159）重写这一段的**判据**，三处都是"原来那样看着对、
+    //    实际会掐断正在跑的流"：
+    //   1. **生成期必须完全不碰 socket、不重启**。冻结/长 prefill 期间本进程整套都慢，
+    //      2s 探活必然 timeout；周期压到 5s 之后，连续两次失败的概率直接乘 6 ——
+    //      而 [restartListenerIfDesired] 里的 `stop()` 会 close() 掉**所有在途连接**，
+    //      包括那条正在续传的 SSE。所以生成期为真时只做内存态检查、连 socket 都不建。
+    //   2. **探活失败不立刻重启，只登记 [restartPending]，等空闲再重启**。
+    //      "监听假活"与"有一条流正在跑"在探活结果上完全同形，任何立刻重启都是拿
+    //      正在跑的流去赌；延后到空闲再重启，赌注就不存在了。
+    //   3. 探活超时 2s → [PROBE_TIMEOUT_MS]：后台冻住时本进程连自己都慢，
+    //      2s 会把"服务好好地在跑"自造成"失败"。
     private val watchdogRunning = java.util.concurrent.atomic.AtomicBoolean(false)
+
+    /**
+     * 后台冻结的**痕迹**（A3）：看门狗上一轮从"准备睡"到"醒来"之间，实际过了多久。
+     *
+     * 为什么必须有：冻结期间**没有任何症状** —— 探活不会失败（那会儿它根本没在跑）、
+     * 连接不会断、写不抛异常、日志不写。没有这行痕迹，"A2 到底有没有生效"
+     * 就永远验不了：解冻后探活一次成功，与"从来就没被冻过"读数完全一样。
+     * 判据只能是**墙钟**：`Thread.sleep(5s)` 却过了一小时，那就是被冻了一小时
+     *（或机器进了深睡），二者对调用方是同一件事：这段时间没人 accept。
+     *
+     * 另一个用途在 App 内：设置页/存活探测把"上次被冻 N 秒"显示出来，
+     * 用户不用再靠猜"是不是被限制了"。
+     */
+    @Volatile private var lastSleepMs: Long = 0
+    /** 最近一次"睡眠远超预期"的超出量（毫秒）；0 = 从没被冻过。 */
+    @Volatile private var lastFreezeMs: Long = 0
+    /** 累计被冻的超出量（毫秒）。 */
+    @Volatile private var freezeTotalMs: Long = 0
+    /** 累计被冻次数（每次超出阈值算一次）。 */
+    @Volatile private var freezeCount: Int = 0
+    /**
+     * "睡眠超时多少算被冻"的阈值：一个 3 倍余量。
+     * 取相对值而不是绝对秒数，是因为周期本身有两档（5s / 30s），
+     * 用一个固定阈值时要么在小周期上误报、要么在大周期上漏报。
+     */
+    private const val FREEZE_FACTOR = 3
+
+    /** 「上次被冻了 N 秒」的对外读法（App 内 UI 与 /health 共用一份）。 */
+    val lastFreezeSeconds: Long get() = lastFreezeMs / 1000
+    /** 「累计被冻 N 次 / 共 M 秒」的对外读法。 */
+    val freezeCountTotal: Int get() = freezeCount
+    val freezeTotalSeconds: Long get() = freezeTotalMs / 1000
+    /** 上一轮看门狗实际睡了多少毫秒（诊断用；正常 ≈ 周期）。 */
+    val lastWatchdogSleepMs: Long get() = lastSleepMs
+    /** 当前是否欠着一次"空闲后重启"（诊断用）。 */
+    val isRestartPending: Boolean get() = restartPending.get()
+
+    /**
+     * 记一次看门狗睡眠的实测时长，判断这一轮是不是**被冻过**。
+     *
+     * 记账放在独立函数里，理由与 [consumeRestartPendingIfIdle] 同族：判据只能有一处。
+     * 内联在循环里的话，第二个睡眠点（将来若加）必然忘记记账，
+     * 而"忘了记账"的症状是"冻结痕迹永远为 0" —— 与"从没被冻过"完全同形。
+     */
+    private fun recordWatchdogSleep(plannedMs: Long, actualMs: Long) {
+        lastSleepMs = actualMs
+        val extra = actualMs - plannedMs
+        if (extra <= plannedMs * FREEZE_FACTOR) return  // 没超阈值：那一轮算正常
+        lastFreezeMs = extra
+        freezeTotalMs += extra
+        freezeCount++
+        emitLog("[watchdog] 检出后台冻结：本轮计划 ${plannedMs}ms、实际 ${actualMs}ms" +
+            "（超出 ${extra}ms，累计 ${freezeCount} 次 / ${freezeTotalMs / 1000}s）")
+    }
+
+    /**
+     * 「探活失败、但当时不适合重启」——等生成结束（空闲）后再重启。
+     *
+     * 为什么不能"失败即重启"：重启路径的第一步是 `stop()`，而 `stop()` 会收敛
+     * **所有在途连接**（见那里第 ④ 步）。探活失败只说明"这一秒没连上"，
+     * 它同时覆盖两种完全不同的处境：listener 真死了、或引擎被一条长生成占满
+     * （accept 轮不上）。后者下重启＝当场掐掉那条流。
+     *
+     * 它不是"取消重启"，是**延后**：空闲后由 [consumeRestartPendingIfIdle] 消费掉。
+     * 每次失败都重新置 true（不"只置一次"）：只要还有人探活失败，就还欠一次重启。
+     */
+    private val restartPending = java.util.concurrent.atomic.AtomicBoolean(false)
+
+    /** 探活周期（空闲）：解冻后 1~5s 内恢复，不再是最坏 30~60s。 */
+    private const val WATCHDOG_IDLE_MS = 5_000L
+    /** 探活周期（有生成在跑）：只是弱检查，拉到 30s，连唤醒次数都省下来。 */
+    private const val WATCHDOG_BUSY_MS = 30_000L
+    /** 连续探活失败多少次才算"服务真没了"（单次失败可能只是抖动）。 */
+    private const val FAIL_STREAK_LIMIT = 1
+    /** 自连探活超时。后台被冻时本进程整套都慢，2s 会把健康服务自造成失败。 */
+    private const val PROBE_TIMEOUT_MS = 3_000
 
     private fun startWatchdog() {
         if (!watchdogRunning.compareAndSet(false, true)) return
@@ -475,31 +635,55 @@ object HttpApi {
             var failStreak = 0
             try {
                 while (true) {
-                    Thread.sleep(30_000)
+                    // ---- 两档周期 + 冻结痕迹 ----
+                    // 周期：空闲 5s（解冻后 1~5s 恢复），生成期 30s（那时只是弱检查）；
+                    // 两档都由这一处决定，别在循环里另写一份判据。
+                    val plannedMs = if (isGenerating) WATCHDOG_BUSY_MS else WATCHDOG_IDLE_MS
+                    val t0 = System.nanoTime()  // 只作差：墙钟跳变会把"被冻了多久"算错甚至算负
+                    Thread.sleep(plannedMs)
+                    // 睡够了吗？**只记实测**，不靠"我睡过 5s"这个假设：
+                    // 被冻/被深睡时 sleep 会远超计划值，而那一刻正是 t0 之后才发现 ——
+                    // 这也是本进程**唯一**能证明"刚才没人 accept"的证据（见 [lastSleepMs]）。
+                    recordWatchdogSleep(plannedMs, (System.nanoTime() - t0) / 1_000_000L)
                     // ⚠ 判据是 desired（用户意图），**不是** running（当前状态）。
                     // 只看 running 时，A-1 一踩就把这里变成死分支 —— 设计目标
-                    // "断联 30~60s 自愈"退化成"一旦踩中永久躺平"：
+                    // "断联自愈"退化成"一旦踩中永久躺平"：
                     // 那次 stop() 会把 desired 置 false，而错误路径上的 stop() 与
                     // 用户主动停服在 running 上完全同形（都是 false），
                     // 只有 desired 能区分"我不该重启"与"我该重启"。
                     if (!desired.get()) { failStreak = 0; continue }  // 用户没要求跑，仅休眠待命
+                    // ---- 闸门①：生成期只做内存态检查 ----
+                    // 这一条是"绝不掐断正在跑的流"的全部保证：`isGenerating` 为真时
+                    // **不发请求、不碰 socket、不重启**，只把探测推迟到空闲。
+                    // 判据用 [isGenerating]（HTTP 侧 busy **或** 引擎侧），
+                    // 不用 `busy` —— App 内聊天在跑时只有引擎标志为真，那种情况下
+                    // 一条 socket 探活会挂在 `LlmEngine.genLock` 上白占线程、
+                    // 还给每次生成添几次调度抖动。
+                    if (isGenerating) { failStreak = 0; continue }
+                    // ---- 闸门②：欠着一次重启时，先补上（此时已确认空闲）----
+                    // 放在探活**之前**：上一次失败登记的 restartPending 说明
+                    // "那时没连上"，而此刻空闲 + 端口可能还活着 —— 先重启再探活
+                    // 会让每次重启都多耗一轮；先消费登记、再探活，
+                    // 恢复动作与观察动作各自只有一次。
+                    if (restartPending.get() && consumeRestartPendingIfIdle()) {
+                        failStreak = 0
+                        continue
+                    }
                     if (probeHealthy()) {
-                        if (failStreak >= 2) emitLog("[watchdog] 自检恢复正常")
+                        if (failStreak >= FAIL_STREAK_LIMIT) emitLog("[watchdog] 自检恢复正常")
                         failStreak = 0
                         continue
                     }
                     failStreak++
-                    emitLog("[watchdog] 自连探活失败 $failStreak/2 (port=$PORT, running=${running.get()})")
-                    if (failStreak >= 2) {
-                        // 重启判据只有一处（见 restartListenerIfDesired 的注释）：
+                    emitLog("[watchdog] 自连探活失败 $failStreak/${FAIL_STREAK_LIMIT} " +
+                        "(port=$PORT, running=${running.get()})")
+                    if (failStreak >= FAIL_STREAK_LIMIT) {
+                        // ⚠ 这里**不**直接重启，只登记"欠一次重启"。
+                        // 判据只有一处（见 [consumeRestartPendingIfIdle] 的注释）：
                         // 内联在这里时，新增的探活调用点都得自己记得补 desired 判据，
                         // 漏一个就是"用户已停服却被自动拉起"这种后台偶发故障。
-                        if (restartListenerIfDesired("连续 $failStreak 次自连探活失败")) {
-                            failStreak = 0
-                            Thread.sleep(2_000)  // 新 listener 稳定窗口
-                        } else {
-                            failStreak = 0  // 用户已停服：不重启，静默待命
-                        }
+                        restartPending.set(true)
+                        failStreak = 0
                     }
                 }
             } catch (_: InterruptedException) {
@@ -510,11 +694,39 @@ object HttpApi {
     }
 
     /**
+     * 消费 [restartPending]：**确实空闲**时才重启，否则原样留着。
+     *
+     * 返回值 = 是否真的重启了一轮。它在"不空闲"时也返回 false，但**不清标记** ——
+     * 清了就等于把用户这次断联丢了（流跑完也没人补这次重启）。
+     *
+     * 之所以把"空闲判据"独立于调用方的 `if (isGenerating)` 再查一遍：
+     * 那个闸门与这里之间隔着一次 `sleep`（最长 30s），这期间用户完全可能新起一轮生成。
+     * 两个判据不是重复，是"进入前"与"动手前"各查一次 —— 后者才是真正拦住误杀的那道。
+     */
+    private fun consumeRestartPendingIfIdle(): Boolean {
+        if (isGenerating) return false          // 这会儿又忙起来了：继续欠着，绝不掐流
+        if (!desired.get()) { restartPending.set(false); return false }  // 用户已停服：这次欠账作废
+        // ⚠ 用 `getAndSet(false)` 而不是"先读后清"：两行之间若有并发失败把标记又置上，
+        //   "先读后清"会把那次新欠账**一起清掉**（丢一次重启，而症状与"从没失败过"
+        //   完全同形）。getAndSet 是原子的，返回值只代表"我这一轮看到的是 true"。
+        if (!restartPending.getAndSet(false)) return false
+        // 唯一的重启调用点：到这里三条都已确认（欠着重启、此刻空闲、用户仍要跑）。
+        // 判据由 tools/run_http_lifecycle_guard.sh 钉住 —— 它要求文件里存在
+        // `if (restartListenerIfDesired(`，也要求 startWatchdog 里**没有**这个调用。
+        if (restartListenerIfDesired("之前探活失败，此刻已空闲")) return true
+        return false
+    }
+
+    /**
      * 探活失败时的自愈入口：**仅当用户仍想要服务在跑**（[desired]）时才重启。
      *
-     * 抽成函数是为了让"想不想重启"这条判据只有一处 —— 内联在 watchdog 循环里时，
-     * 任何新增的探活调用点都得自己记得补 desired 判据，漏一个就是一处
-     * "用户已停服却被自动拉起"（而它只在后台偶发，真机上几乎抓不到）。
+     * 抽成函数是为了让"想不想重启"这条判据只有一处 —— 命名与调用点由
+     * `tools/run_http_lifecycle_guard.sh` 钉住（"重启判据收敛到唯一一处"），
+     * 任何新增的探活调用点都得走它，漏一个就是一处"用户已停服却被自动拉起"
+     *（而它只在后台偶发，真机上几乎抓不到）。
+     *
+     * 调用者只能有两个：[consumeRestartPendingIfIdle]（正常路径，先确认空闲）
+     * 与测试。**绝不允许**在生成期为真的路径上直接调它：`stop()` 会关掉在途连接。
      * 返回值 = 是否真的重启了一轮。
      */
     private fun restartListenerIfDesired(reason: String): Boolean {
@@ -527,11 +739,11 @@ object HttpApi {
         return true
     }
 
-    /** 自连探活：TCP 连上并发 GET /health，2s 内收到任意响应字节即健康。 */
+    /** 自连探活：TCP 连上并发 GET /health，[PROBE_TIMEOUT_MS] 内收到任意响应字节即健康。 */
     private fun probeHealthy(): Boolean = try {
         java.net.Socket().use { s ->
-            s.connect(java.net.InetSocketAddress("127.0.0.1", PORT), 2_000)
-            s.soTimeout = 2_000
+            s.connect(java.net.InetSocketAddress("127.0.0.1", PORT), PROBE_TIMEOUT_MS)
+            s.soTimeout = PROBE_TIMEOUT_MS
             s.getOutputStream().apply {
                 write("GET /health HTTP/1.0\r\n\r\n".toByteArray())
                 flush()
@@ -562,7 +774,68 @@ object HttpApi {
         val tooLarge: Boolean = false,
         /** 请求行或某个头行超过 [MAX_LINE_LEN]（→ 400，见 [readLine]）。 */
         val overlongLine: Boolean = false,
+        /**
+         * 请求头没在本端给的窗口内读完（客户端连上了，但**一个完整请求都没发过来**）。
+         *
+         * 与 [overlongLine] 同一个道理：它必须能被**单独判掉**，否则症状是
+         * "连接被静默断开" —— 客户端只看到 `Empty reply from server`，
+         * 与"服务崩了"完全同形。见 [handleConn] 的 A1 说明。
+         */
+        val headTimedOut: Boolean = false,
+        /**
+         * `Content-Length` 的值既不是合法整数、也不在合法范围内（→ 400）。
+         *
+         * **与 [tooLarge] 分开、且必须分开**：`99999999999999` 这种溢出值一旦被
+         * 折成 0，`> MAX_BODY_BYTES` 就永远不成立，于是连 413 都触发不了 ——
+         * "超限"这个语义轮不到它，它连一个合法长度都不是。同理 `abc` / `5abc`
+         * （`toIntOrNull` 只认整串）与 `-1`（能解析、但不是长度）。
+         */
+        val badLength: Boolean = false,
+        /**
+         * body **没读满**声明的 [contentLength] 就遇到了 EOF（→ 400）。
+         *
+         * 与 [headTimedOut] 是两个阶段、两个码：头没读完是本端等超时（客户端还在，
+         * 只是没说完 → 可重试的 503）；body 没读完是**对端关了连接**，请求已经不完整，
+         * 再重试也只是重发同一个残包 → 400。折在一起的话，"传输截断"
+         * 会退化成两种错方向：截在 JSON 合法处 = 静默按错误语义跑，
+         * 截在非法处 = 500「服务内部错误」。见 [Req.shortBody]。
+         */
+        val shortBody: Boolean = false,
+        /** 上面那种情形**实际**收到了多少字节（只用于错误文案，不回显内容）。 */
+        val gotBodyBytes: Int = 0,
     )
+
+    /**
+     * 解析阶段的 `Content-Length` 读取器（纯函数，可离线单测）。
+     *
+     * 返回值是**三态**，为的是让"头缺失""头非法""头合法"在上层能各自处置：
+     * 缺失 → 按无 body 处理（合法）；非法 → 400；合法 → 记长度。压成两态
+     * （比如 `toIntOrNull() ?: 0`）就是静默丢 body 的根因，别退回那种写法。
+     *
+     * 判据本体（[Parsed]）与接线（[parseReq]）分开的原因与其余判据同源：
+     * 纯函数能离线喂 `abc` / `5abc` / `-1` / `2147483648` / `99999999999999`，
+     * 接线只能靠读代码。
+     */
+    internal object ContentLengthHeader {
+        /** 三态：头缺失（合法）、头非法（→ 400）、头合法（记长度）。 */
+        sealed class Parsed {
+            /** 头缺失：语义等价于 `Content-Length: 0`。 */
+            object Absent : Parsed()
+            /** 头在，但值不是合法长度（非整数 / 负数 / 溢出 Int）。 */
+            object Invalid : Parsed()
+            /** 头在且合法。 */
+            data class Length(val bytes: Int) : Parsed()
+        }
+
+        /** `toIntOrNull` 只认**整串**：`5abc` 与 `abc` 都是 `Invalid`，不会被截成 5。 */
+        fun parse(raw: String): Parsed {
+            val n = raw.trim().toIntOrNull() ?: return Parsed.Invalid
+            // 负数单独拦：`"-1".toIntOrNull()` 返回 -1 而非 null，光靠 `?: 0`
+            // 挡不住它，它会一路活到 `if (contentLength > 0)` 才变假 —— 同样是丢 body。
+            if (n < 0) return Parsed.Invalid
+            return Parsed.Length(n)
+        }
+    }
 
     /**
      * 「这一行超长」的哨兵。用**对象**而不是某个字符串字面量的原因：
@@ -572,11 +845,51 @@ object HttpApi {
      */
     private val LINE_TOO_LONG = String()
 
+    /**
+     * 「这一行的读超时了」的哨兵（A1，Issue #159）。
+     *
+     * 与 [LINE_TOO_LONG] 同构、也必须分开：`readLine` 原来把
+     * `SocketTimeoutException` 直接抛出去，于是"客户端还在、只是没说完"
+     * 与"客户端崩了"在调用方那条 `?: break` 上**完全同形**，最终都落到
+     * `parseReq` 返回 null → `handleConn` 静默 return —— 客户端只看到
+     * `Empty reply from server`，会去查模型/进程，而真因只是"这个客户端
+     * 自己没把请求发完"。有了这个哨兵，那条路径才能回**可读的 503**。
+     *
+     * 用对象而不是字符串：任何客户端都无法让一个正常读出的行恰与它 `===` 相等。
+     */
+    private val HEAD_TIMED_OUT = String()
+
     /** 头/请求行的长度上限（字节 ≈ 字符，头里全是 ASCII）。 */
     private const val MAX_LINE_LEN = 8192
 
     /** 请求体上限。超限**拒绝**（413），不截断。 */
     private const val MAX_BODY_BYTES = 4 * 1024 * 1024
+
+    /**
+     * 「首字节之前」的等待上限（A1，Issue #159）。
+     *
+     * 语义**只有一条**：从连接被受理，到请求头读完，最多等这么久，且**只在没人在生成时**
+     * 才计时。超时回一个**可读的 503 JSON**，而不是静默断连。
+     *
+     * 为什么必须"只在没人在生成时才计时"：15s 这个数原本是拍出来防"连上就不发数据"
+     * 占满线程槽的。但一旦有生成在跑，服务端本来就忙、客户端拿 503 也是应得的；
+     * 而空闲期给它 15s 完全没有意义 —— 空闲意味着服务端毫秒级就能接手，
+     * 15s 收不到任何字节只可能是客户端根本没打算说话。缩短窗口让"假活"
+     * 更早变成"明确失败"（客户端可以据此重试），代价是零（正常客户端不发请求就不该连）。
+     *
+     * ⚠ 取 5s 而不是更短：解冻后的第一拍会慢，客户端可能正好在这时连上并开始发头，
+     *   窗口太短会把一次**正常但慢**的请求判死。
+     */
+    private const val HEAD_TIMEOUT_MS = 5_000
+
+    /**
+     * 请求头读取的上限（在**生成期**使用）。
+     *
+     * 生成期不缩短窗口：那时服务端本来就忙，任何"服务端说你别等了"的判断
+     * 都不该由读超时来做（真忙的结论由 [handleChat] 的 503 背压给出，那条路径
+     * 带着明确的 `server busy` 文案）。这里保持原来的 15s，行为与改动前一致。
+     */
+    private const val HEAD_TIMEOUT_BUSY_MS = 15_000
 
     /**
      * 路由用的"落在某前缀之下"判定（与 [ApiAuth.under] 同一条判据）。
@@ -592,11 +905,19 @@ object HttpApi {
     }
 
     private fun handleConn(s: Socket) {
-        s.soTimeout = 15_000  // 15s 内未收到完整请求即断开；生成期只写不读，不受影响
+        // ---- A1：首字节之前的等待上限，且**只在空闲时**收紧（Issue #159）----
+        //
+        // 读超时只作用于 **read** 方向（生成路径只写不读，不受影响），
+        // 且超时之后这里不再静默 return，而是回一个可读的 503 ——
+        // 这是本改动的全部：把"卡死/静默断连"降级成"明确失败 + 可重试"。
+        // 判据只取一次（`isGenerating` 在受理那一刻的快照）：连接一旦开始读头，
+        // 中途"忙起来了"不该改变已经定下的窗口，否则同一条连接的超时值会随
+        // 别人起生成而漂移，成了不可复现的偶发。
+        val headTimeoutMs = if (isGenerating) HEAD_TIMEOUT_BUSY_MS else HEAD_TIMEOUT_MS
+        s.soTimeout = headTimeoutMs
         s.use { sock ->
             val ins = sock.getInputStream()
             val out = sock.getOutputStream()
-            val req = parseReq(ins) ?: return
             // ---- CORS 白名单判定（**每个响应**都要带，不只是预检）----
             //
             // 判据在 CorsPolicy（纯函数、可离线单测）。这里只做三件事：
@@ -605,23 +926,57 @@ object HttpApi {
             //      这种最难查的形态就会出现）；
             //   ③ 预检单独走一个 204 分支。
             //
-            // ⚠ 位置必须在**所有** `writeJson` 之前 —— 下面的 400/413 拒绝也带 CORS 头，
-            //   所以它们是 corsOrigin 的**首批读者**。写在它们之后 = 先用后声明，
-            //   局部变量在 Kotlin 里没有提升，直接编译不过
+            // ⚠ 位置必须在**所有** `writeJson` 之前 —— 首字节超时的 503、下面的
+            //   400/413 拒绝也都带 CORS 头，所以它们是 corsOrigin 的**首批读者**。
+            //   写在它们之后 = 先用后声明，局部变量在 Kotlin 里没有提升，直接编译不过
             //   （2026-09-22 CI 红：`unresolved reference 'corsOrigin'` ×2）。
             //   那一轮 22 个脚本都在 grep 这个文件，但**没有一个编译它** ——
             //   判据见 tools/run_http_hardening_guard.sh 判据⑨（结构顺序断言）。
+            //
+            // ⚠ 首字节超时那条路径上根本没读到请求头，能被判的只有"来源未知"，
+            //   而"来源未知"在 CorsPolicy 里就是不放行 —— 与正常请求漏带 Origin
+            //   是同一条判据，不是特例。所以这里先把请求读出来（`parseReq` 自己
+            //   把超时折成 [Req.headTimedOut]，不再抛异常），再统一判 CORS：
+            //   `corsOrigin` **只有这一处声明**，也就没有"第二条路径漏透传"的空间。
+            val req = parseReq(ins) ?: return
             val corsOrigin = CorsPolicy.allow(req.origin)
             // 来源被拒时留一行日志：浏览器侧看到的只是"请求失败"，
             // 没有这行日志就无法区分"来源被拦"与"服务坏了"。
             if (req.origin != null && corsOrigin == null) {
                 emitLog("CORS 拒绝来源: ${req.origin}（不在白名单内，未回 CORS 头）")
             }
+            // ---- A1：首字节超时 → 可读 503（必须在 corsOrigin 之后）----
+            // 位置由 `tools/cors_writejson_guard.sh` 钉住：**每一条**写出 JSON 的调用
+            // 都必须能透传 corsOrigin。这条 503 也是响应，不能例外 ——
+            // 漏了它在浏览器里就退化成"预检过了、正式请求被拦"那种最难查的形态。
+            // 解析阶段自己判出的"头没读完"（[Req.headTimedOut]）走同一条路径。
+            if (req.headTimedOut) {
+                emitLog("首字节超时（${headTimeoutMs}ms 内未收到完整请求头，解析阶段判定）：回 503")
+                writeJson(out, 503, errJson(
+                    "request head not received within ${headTimeoutMs}ms; " +
+                        "service is up, retry with a complete request"), corsOrigin)
+                return
+            }
             // 畸形请求**必须**挡在路由与鉴权之前，且**各自回自己的码**：
             // 两者都曾退化成"静默丢内容"，症状分别是"token 明明没错却说不匹配"
             //（头被丢）与"服务内部错误"（body 被截断后 JSON 解析炸）。
             // 这两个码（400/413）都不在 CORS 白名单外豁免的讨论范围内：
             // 它们不是业务拒绝，而是"这个请求本身没读全"，回什么都救不了。
+            if (req.badLength) {
+                emitLog("拒绝畸形请求: Content-Length 不是合法长度（非整数 / 负数 / 溢出）")
+                writeJson(out, 400, errJson("invalid Content-Length header " +
+                    "(must be a non-negative integer)"), corsOrigin)
+                return
+            }
+            if (req.shortBody) {
+                // 文案里给出「差多少字节」：只回一句"请求不完整"的话，
+                // 排查方分不清是客户端少发了、还是服务端少读了（两边都说得通）。
+                emitLog("拒绝截断请求体: 声明 ${req.body.length + req.gotBodyBytes}" +
+                    " 字节，实际收到 ${req.gotBodyBytes} 字节后连接结束")
+                writeJson(out, 400, errJson("incomplete request body: " +
+                    "received ${req.gotBodyBytes} bytes, connection closed early"), corsOrigin)
+                return
+            }
             if (req.overlongLine) {
                 emitLog("拒绝畸形请求: 请求行或头行超长（> ${MAX_LINE_LEN} 字节）")
                 writeJson(out, 400, errJson("request line or header line too long " +
@@ -682,6 +1037,14 @@ object HttpApi {
             when {
                 req.method == "GET" && pathUnder(req.path, "/health") ->
                     writeJson(out, 200, healthJson(), corsOrigin)
+                // ⚠ **顺序是判据**：`/v1/models/{id}` 必须排在 `/v1/models` 之前。
+                // 反过来会被前缀命中吞掉，客户端拿到的是一份**列表**而不是它要的那个
+                // 模型对象 —— 而列表本身是合法 JSON，SDK 侧只会解成"字段缺失"，
+                // 报出来的错与"模型不存在"长得一模一样，排障方向全错。
+                // 判据落在 tools/run_models_profile_guard.sh 的**行号关系**上（与
+                // `parseReq` 的哨兵那两条同一个做法），不靠 review 肉眼保证。
+                req.method == "GET" && pathUnder(req.path, "/v1/models/") ->
+                    writeJson(out, 200, modelEntryJson(idFromModelsPath(req.path)), corsOrigin)
                 req.method == "GET" && pathUnder(req.path, "/v1/models") ->
                     writeJson(out, 200, modelsJson(), corsOrigin)
                 // 自带测试页（**同源**，内嵌 HTML，零外部依赖）：
@@ -696,6 +1059,13 @@ object HttpApi {
                     // 走 `if (!S.model) return NewStringUTF("")`，返回空串而非 null。
                     writeHtml(out, 200, CorsPolicy.pageHtml(
                         PORT, bindAll, LlmEngine.hasModel, LlmEngine.modelDesc()), corsOrigin)
+                // `/v1/embeddings`（阶段 3）：**无状态逐条算向量**。
+                // 位置在 chat 之前、models 之后，路径前缀互不包含，顺序不影响行为；
+                // 读起来"先清单、再嵌入、后对话"贴合使用顺序。
+                // ⚠ 它与知识库（RAG）开关**完全解耦**：这个端点不读任何 rag_* 开关，
+                //   也不因为"App 内/远端没开知识库"而被拒绝 —— 它只判嵌入模型在不在。
+                req.method == "POST" && pathUnder(req.path, "/v1/embeddings") ->
+                    handleEmbeddings(req, out, corsOrigin)
                 req.method == "POST" && pathUnder(req.path, "/v1/chat/completions") ->
                     handleChat(req, out, corsOrigin)
                 req.method == "POST" && pathUnder(req.path, "/v1/completions") ->
@@ -710,29 +1080,66 @@ object HttpApi {
         }
     }
 
+    /**
+     * 读并解析请求（请求行 + 头 + body）。
+     *
+     * 读取阶段的**超时**与"读到 EOF"必须分开：EOF 是客户端真走了（静默 return 合理），
+     * 超时是"客户端还在，只是没说完"（要回可读的 503，见 [headTimedOut]）。
+     * 请求行与请求头的读超时都在这里折成 [Req.headTimedOut]；**body** 阶段的读超时
+     * 保持原语义（当"连接坏掉"处理，由调用方的 `s.use{}` 收尾）—— 那时请求已成立、
+     * 响应还没开始写，回什么都救不了那次请求。
+     */
     private fun parseReq(ins: InputStream): Req? {
         val first = readLine(ins) ?: return null
+        // 读取阶段的两个哨兵分开判：读超时（HEAD_TIMED_OUT）与超长（LINE_TOO_LONG）
+        // 语义完全不同（前者=客户端还在只是没说完、后者=这一行根本读不完），
+        // 都不能与 EOF（`?: return null`）混为一谈。
+        if (first === HEAD_TIMED_OUT) return Req(method = "", path = "", body = "", headTimedOut = true)
         if (first === LINE_TOO_LONG) return Req(method = "", path = "", body = "", overlongLine = true)
         val sp = first.split(' ')
         if (sp.size < 2) return null
         val method = sp[0]
         val path = sp[1]
         var contentLength = 0
+        // 「头缺失」「头非法」「头合法」必须是**三种**状态，不能压成两种
+        //（三态判据在 [ContentLengthHeader]，这里只记结果）。压缩的坏法就是
+        // 原来那行 `value.toIntOrNull() ?: 0`：
+        //   · `abc` / `5abc` —— toIntOrNull 只认整串，返回 null；
+        //   · `99999999999999` / `2147483648` —— 溢出，同样返回 null；
+        //   · `-1` —— **能解析**，返回 -1，`?: 0` 拦不住它。
+        // 三者都落进「没有 body」那一支：body 一个字节都不读、真实字节留在 socket 里，
+        // 客户端却收到一个"正常"响应，全程零错误信号。
+        var badLength = false
         var origin: String? = null
         var reqHeaders: String? = null
         var auth: String? = null
         while (true) {
-            // `?: break` 这里只表示 EOF（连接在半路断了）—— 超长**不**返回 null，
-            // 而是在下一行被单独判掉。两者分开是 B-3 的修复本体，别把顺序调过来。
+            // `?: break` 这里只表示 EOF（连接在半路断了）—— 超长与读超时都**不**返回 null，
+            // 而是在下一行被单独判掉（两个哨兵，见 [LINE_TOO_LONG] / [HEAD_TIMED_OUT]）。
+            // 三者分开是 B-3 的修复本体，别把顺序调过来。
+            // ⚠ 下面这两条判定必须**按这个顺序、且紧跟** readLine 的 `?: break`：
+            //    ① 超长（LINE_TOO_LONG）必须在 readLine 的**下一行**（判据②锚的是
+            //       这个相邻行号关系，插一行注释进去都会红）；② 读超时（HEAD_TIMED_OUT）
+            //       紧随其后。语义上三者完全不同：超时 = 客户端还在、只是没说完；
+            //       EOF = 客户端走了；超长 = 这一行根本读不完 —— 混起来只能静默断连。
             val line = readLine(ins) ?: break
             if (line === LINE_TOO_LONG) return Req(method = "", path = "", body = "", overlongLine = true)
+            if (line === HEAD_TIMED_OUT) return Req(method = "", path = "", body = "", headTimedOut = true)
             if (line.isEmpty()) break
             val i = line.indexOf(':')
             if (i <= 0) continue
             val name = line.substring(0, i).trim().lowercase()
             val value = line.substring(i + 1).trim()
             when (name) {
-                "content-length" -> contentLength = value.toIntOrNull() ?: 0
+                // 非法值**置标记**（→ 400），绝不折成 0 —— 折成 0 就是静默丢 body。
+                // 负数单独拦：`"-1".toIntOrNull()` 是 -1 不是 null，`?: 0` 挡不住，
+                // 它一路活到 `if (contentLength > 0)` 才变假，结局同样是丢 body，
+                // 但根因不在"解析失败"，所以只改 `?: 0` 修不掉这一支。
+                "content-length" -> when (val len = ContentLengthHeader.parse(value)) {
+                    is ContentLengthHeader.Parsed.Length -> contentLength = len.bytes
+                    ContentLengthHeader.Parsed.Invalid -> badLength = true
+                    ContentLengthHeader.Parsed.Absent -> Unit
+                }
                 // 鉴权凭据也必须**读出来**：不读的话 [ApiAuth.verdict] 永远拿到 null，
                 // 于是要么把所有人挡在门外、要么（若顺手 fail-open）等于鉴权没做。
                 "authorization" -> auth = value
@@ -746,6 +1153,12 @@ object HttpApi {
         // 超出上限**直接拒**（不是截断）：`coerceAtMost` 会把多余字节留在 socket 里
         // 没人读，截断后的 JSON 再交给解析器去炸 —— 客户端拿到的是「服务内部错误」，
         // 真因却是「请求体超限」。宁可回一个说明白了的 413。
+        // ⚠ **顺序是判据**：非法值先判，再判超限。反过来的话溢出值
+        //（`2147483648`、`99999999999999`）会被 413 抢走 —— 报的是"体太大"，
+        // 而它连一个合法长度都不是，客户端照着"体太大"去改会改不到点子上。
+        if (badLength) {
+            return Req(method, path, "", origin, reqHeaders, auth, badLength = true)
+        }
         if (contentLength > MAX_BODY_BYTES) {
             return Req(method, path, "", origin, reqHeaders, auth, tooLarge = true)
         }
@@ -754,7 +1167,16 @@ object HttpApi {
             var off = 0
             while (off < buf.size) {
                 val n = ins.read(buf, off, buf.size - off)
-                if (n < 0) break
+                // EOF 在这里**不代表请求读完了**：声明了 N 字节却只到了 off 字节，
+                // 请求是残的。原来这条 `break` 直接收工、把半包当完整 body 交上去，
+                // 于是两种症状、没有一种是"截断"：残片恰好是合法 JSON 时静默按错误
+                // 语义执行（典型：`"stream":true` 落在没读到的后半段里 → 按非流式跑完，
+                // 客户端等 SSE 等到超时）；残片非法时 500「服务内部错误」，
+                // 真因（传输截断）被掩盖。退回给调用方判 400，并说明差多少字节。
+                if (n < 0) {
+                    return Req(method, path, "", origin, reqHeaders, auth,
+                        shortBody = true, gotBodyBytes = off)
+                }
                 off += n
             }
             String(buf, 0, off, Charsets.UTF_8)
@@ -774,7 +1196,15 @@ object HttpApi {
     private fun readLine(ins: InputStream): String? {
         val sb = StringBuilder()
         while (true) {
-            val b = ins.read()
+            // 读超时**不往外抛**：折成 [HEAD_TIMED_OUT] 哨兵，让调用方能把
+            // "超时"与"EOF/超长"三者分开处理（三者症状完全不同，混起来
+            // 就只能静默断连 —— 见 [HEAD_TIMED_OUT] 的注释）。
+            // `soTimeout` 抛的是 `SocketTimeoutException`（IOException 子类）。
+            val b = try {
+                ins.read()
+            } catch (_: java.net.SocketTimeoutException) {
+                return HEAD_TIMED_OUT
+            }
             if (b < 0) return if (sb.isEmpty()) null else sb.toString()
             if (b == '\n'.code) break
             if (b != '\r'.code) sb.append(b.toChar())
@@ -808,6 +1238,23 @@ object HttpApi {
         //   · kv_reuse_tokens   —— 上一轮实际复用了多少 token；
         //   · kv_prefill_tokens —— 上一轮**新算**了多少 token；
         //   · kv_rounds         —— 已经跑完 prefill 的轮次数。
+        //   · kv_lcp_tokens     —— 上一轮与上一轮之前的**最长公共前缀** token 数
+        //     （不设门槛）。它把"没命中"这个笼统结论拆开：lcp 大却 reuse=0 ->
+        //     是门槛/容量拦的（差一点）；lcp 很小 -> 两轮 prompt 真的不一样
+        //     （开了知识库时检索结果每轮都变，分叉点在 system 段里），
+        //     那是**注入位置**的问题、要改代码，不是调参能解决的。
+        //     没有它，这两种情形在 /health 与日志上完全同形。
+        //   · frozen_ms         —— 最近一次"看门狗该醒却晚了"的超出量（毫秒，0 = 没检出过）；
+        //   · frozen_count      —— 累计检出次数；
+        //   · frozen_total_ms   —— 累计超出量（毫秒）；
+        //   · restart_pending   —— 欠着一次"空闲后重启"（探活失败但当时有生成在跑）。
+        //
+        // 前三个是**后台冻结**唯一的可观测面（见 [lastSleepMs] 的长注释）：被冻期间
+        // 探活不失败、连接不断、日志不写，解冻后"探活成功"与"从没被冻过"读数完全一样。
+        // 没有它们，"自愈到底有没有生效"就只能靠用户描述；有了它们，客户端与设置页
+        // 都能把"刚才那 N 秒是冻的，不是我网络坏了"说清楚 —— 从零症状变成可归因。
+        // restart_pending 同理：它是"服务此刻**本**该重启、但为了不掐断在跑的流
+        // 而故意欠着"的唯一读数，否则"没重启"与"重启判据没生效"长得一模一样。
         // kv_rounds 不是"锦上添花"：kv_cache_valid=false 同时覆盖两种**完全不同的**
         // 处境 —— 「从未跑过任何请求」（冷启动，正常）与「跑过、但账本已被作废」
         //（取消 / 换模型 / prompt 超长，是故障或取消）。没有它，这两者同形，
@@ -821,19 +1268,161 @@ object HttpApi {
         val kvReuse = if (loaded) LlmEngine.lastReuseTokens else 0
         val kvPrefill = if (loaded) LlmEngine.lastPrefillTokens else 0
         val kvRounds = if (loaded) LlmEngine.kvRounds else 0
+        val kvLcp = if (loaded) LlmEngine.lastLcpTokens else 0
+        // 冻结痕迹（A3）。注意它们与 `loaded` 无关：没加载模型时端口照样可能被冻。
+        val frozenMs = lastFreezeMs
+        val frozenCount = freezeCount
+        val frozenTotal = freezeTotalMs
+        val restarting = restartPending.get()
+        // 嵌入模型（双常驻）的两个可观测字段。**这是它唯一的读取面**：
+        // 双常驻把模型从一份变成两份，而 `/health` 此前只报得出对话那一份 ——
+        // 于是"嵌入模型到底装上没有"在探活里完全看不见，用户只能翻日志猜，
+        // 也就无法区分"嵌入没加载（检索必然全空）"与"检索没命中（正常）"。
+        //   · embed_loaded —— 嵌入那份是否驻留（**与 model_loaded 无关**，
+        //     两者的组合正是双常驻的定义：可以只有嵌入、可以只有对话、可以都有）；
+        //   · embed_model  —— 嵌入模型的短描述，空串 = 未加载。取的是**嵌入**
+        //     那一份的描述，不是对话那份的复制品；
+        //   · embed_dim    —— 向量维度，0 = 未加载。它是索引指纹的一部分：
+        //     维度变了说明换了嵌入模型，旧索引必须作废。
+        val embedLoaded = LlmEngine.hasEmbedModel
+        val embedDesc = if (embedLoaded) LlmEngine.embedModelDesc().toJsonStr() else "\"\""
+        val embedDim = if (embedLoaded) LlmEngine.embedDim else 0
+        // 嵌入**合批**的六个可观测字段（ISSUE #269 第 1 步：先量）。
+        // 合批是**纯加速**：生效与不生效在协议上完全看不出来（同样的 200、
+        // 同样的向量、同样的检索结果）。没有这几个数，"合批到底有没有在工作"
+        // 就只能靠翻日志推断 —— 而它与 `kv_cache` 那三个字段是同一个病：
+        // 纯加速的东西没有可观测面，回归里静默失效而无人发现。
+        //   · embed_batch_batches    —— 走了合批的**批次**数；
+        //   · embed_batch_entries    —— 合批**真正编掉的条数**（它们才是省下的前向）；
+        //   · embed_batch_fallback_batches —— 回落逐条的批次数；
+        //   · embed_batch_fallback_entries —— 回落逐条的条数；
+        //   · embed_batch_ms          —— 合批花掉的毫秒（只算合批那部分）；
+        //   · embed_batch_size        —— **当前生效的批大小**（设置值，默认 8）；
+        //   · embed_batch_size_set    —— 这一格**有没有被显式设过**（区分"没碰过"与"设了 8"）。
+        // 后两个是本轮第 2 步（可调）的对外面："我设了 8，它到底跑了几" 必须有一个
+        // 打探就能读到的答案。
+        //
+        // ── 嵌入 ctx 那一格（0.9.212）──
+        // "内存占用为啥高"的答案在这一格，不在批大小那格：批大小只决定"一次塞几条"，
+        // 而 ctx 预算决定 KV / output / compute buffer 三项分配（还有它推出来的
+        // 两道门 `n_batch`/`n_ubatch`）。只报批大小的话，用户把批从 8 调到 1
+        // 之后会以为内存该降了 —— 而它一点都不会降。
+        //   · embed_ctx_per_seq      —— **当前配置的**每条预算（设置值，默认 [LlmEngine.kEmbedCtxDefault]）；
+        //   · embed_ctx_per_seq_set  —— 这一格有没有被显式设过（同 embed_batch_size_set 的理由）。
+        // 报的是**配置值**而不是 native 的落值：native 那个只有加载之后才有，
+        // 而这一格要在加载**之前**就能对账（"我填了 1024，它到底有没有用上"）。
+        val bs = EmbedBatchStats.snapshot()
+        val wantBatch = EmbedBatchPref.get(ragPrefs())
+        val wantBatchSet = EmbedBatchPref.isSet(ragPrefs())
+        val wantCtx = EmbedCtxPref.get(ragPrefs())
+        val wantCtxSet = EmbedCtxPref.isSet(ragPrefs())
+        // ── 建索引时用的批大小（ISSUE #269 第 5 步：把"库认的那个"也报出来）────
+        // 这一格补的是**只有一半读数**留下的洞：`embed_batch_size` 是**当前配置**
+        // 的那个，而"建这份索引时用的是几"此前**哪里都读不到**。于是用户把批大小
+        // 8 改成 1 之后，库**静默不可检索**（`g` 是必比字段，8 ≠ 1 -> 指纹不符 ->
+        // `Load.none`），而他能拿到的只有一句"索引不可用：合批每批条数 变了"，
+        // **机制一个字都不说**（因为两个数里只有一个在外面）。
+        // 现在两个数摆在一起，那句话就有了答案：索引里是 8、当前是 1 -> 改回来。
+        //
+        // ⚠ 读的是**当前选中的那个库**（[RagInject.currentKb]）的索引 —— `g` 是
+        //   每份索引自己开头写的，没有"全局的那个"。所以还要把**库名**也报出来
+        //   （`embed_batch_size_index_kb`），否则用户看到 -1 无从知道是"这个库没索引"
+        //   还是"读的是别的库"。
+        //   -1 = 当前库没有索引 / 读不出来（旧格式 / 文件坏）—— 与 `get` 的语义
+        //   （0 = 没设过）不同，因为这里是"库里的那个数"，没有"没设过"这一说。
+        val currentKbName = RagInject.currentKb(ragPrefs())
+        val currentKbNameJson = RagProtocol.kbJson(currentKbName)
+        val indexBatch = if (currentKbName.isNotEmpty())
+            RagIndexStore.batchOfIndex(ragPrefs(), currentKbName) else -1
+        // ── 逐位比对（ISSUE #269 第 5 步：把"g 是不是纯加速旋钮"量出来）────
+        // 这三个数回答的是**唯一决定"改批大小要不要重建索引"**的那条断言。
+        // 不报的话，用户只能看日志（会滚），而结论是**跨版本**要对的一条
+        // （"0.9.218 那条待验断言到底成立没有"）—— 打探能读到的才叫读数。
+        //   · embed_parity_rows      —— 参与比对的条数（0 = 还没跑过，**不是**"相同"）；
+        //   · embed_parity_identical —— 其中逐位相同的条数；
+        //   · embed_parity_different —— 其中**真的不同**的条数（0 = 跑过且没有不同）；
+        //   · embed_parity_verdict   —— 三档结论（unknown/identical/close/different/missing）；
+        //   · embed_parity_repeat_measured          —— 这次做没做「逐条重复」对照；
+        //   · embed_parity_repeat_not_identical     —— 逐条重复里不是逐位相同的条数；
+        //   · embed_parity_repeat_batched_measured  —— 这次做没做「合批重复」对照；
+        //   · embed_parity_repeat_batched_not_identical —— 合批重复里不是逐位相同的条数；
+        //   · embed_parity_group     —— 这份读数取自**哪一组样本**（长短悬殊 / 等长）。
+        // ⚠ `embed_parity_group` 不是可省的标签：两组样本回答**两个不同的问题**，
+        //   而它们的方向相反 —— 等长组按构造就是稳的（唯一变量只剩批布局），
+        //   长短悬殊组才是"换批大小会不会改答案"要问的那组。只报数字不报来源时，
+        //   一行"逐位相同 4/4 —— 批大小是纯加速旋钮"在两组下**长得一模一样**，
+        //   而读者会把它读成"长短悬殊也稳"（真机现场正是如此）。落进 `/health`
+        //   的是**长短悬殊**那组（见 `probeEmbedBatchParity` 的落读数处）。
+        //
+        // ── 「检索对照」（`embed_retrieve_*`）：与上面那组**配对**的另一半 ──────
+        // ⚠ 上面那组量的是**向量**（"逐位相同吗"）。而"改批大小要不要重建索引"
+        // 要问的是**另一句**："换批大小重建后，**搜出来的东西**还是不是同几条"。
+        // 两者之间**没有蕴含关系** —— 向量差 4e-03 不代表答案会变，向量逐位相同
+        // 也不代表答案不变（索引里还有正文行序 / 切分 / 分数比较）。
+        // 不报这组时，用户会拿"向量有差异"直接推出"检索结果也会不一样"，
+        // 而那是**推出来的**，不是量出来的（本仓库的规矩是判据落在具体一格上）。
+        //   · embed_retrieve_measured        —— 这一格**测没测**（false 时下面三个都是 0）；
+        //   · embed_retrieve_queries         —— 参与对照、且**两侧都搜到了东西**的查询条数；
+        //   · embed_retrieve_answer_changed  —— 命中**集合**变了的查询条数（>0 = `g` 不能放行）；
+        //   · embed_retrieve_order_changed   —— 集合相同、只是名次变了的条数（打平处换序，另一件事）；
+        //   · embed_retrieve_batch_base / embed_retrieve_batch_other —— 比的是哪两种批大小；
+        //   · embed_retrieve_topk            —— 取前几名（口径：与用户实际用的同一档）。
+        // ⚠「测没测」必须单独一格：没测时 `answer_changed` 也是 0 —— 而"没测"
+        // 该去测、"集合全同"才能收窄结论，方向相反（与上面那两格同一条理由）。
+        // 这四格是"差异来自哪里"的那一格：只跑一次时「批布局改语义」与
+        // 「编码本身不确定」混在一个读数里，而它们的下一步相反（前者收窄批大小
+        // 结论，后者先别谈批大小）—— 见 `probeEmbedBatchParity`。
+        // ⚠ 「重复」是**两格**（逐条 / 合批），不是一个布尔：合批自己复现不了
+        // 自己，与"合批和逐条不同"是两件事（前者先查合批，后者才谈 `g` 收不收窄）。
+        // `different` 的条数必须单独报：真机首轮读数是「6 条里 1 条不同」，
+        // 而"1/6"（某几条踩到边界）与"6/6"（合批普遍改语义）的下一步相反 ——
+        // 只有"逐位相同 N 条"时这两个读数长得一模一样（见 HealthCheck.Result）。
+        // 用**字符串**而不是布尔：三档里"不是逐位相同"与"其实没测过"是两件事，
+        // 一个布尔会把"没测过"报成 false -> 被读成"验过了，结论是不相同"。
+        val pari = EmbedParity.Last.snapshot()
+        val retr = EmbedRetrieveParity.Last.snapshot()
+        val parityVerdictJson = RagProtocol.kbJson(
+            if (pari.verdict == EmbedParity.Last.Verdict.UNKNOWN) "" else pari.verdict.name.lowercase())
+        // 这份读数取自哪一组样本（`长短悬殊` / `等长`，空串 = 还没跑过）。
+        // ⚠ 它不是可省的标签，而是这行读数**能不能被解释**的前提：两组样本
+        //   回答两个不同的问题（等长组按构造必然稳、长短悬殊组才是"会不会变"），
+        //   而只报数字时"逐位相同 4/4"在两组下同形（见 `pari` 上方那段说明）。
+        val parityGroupJson = RagProtocol.kbJson(pari.group)
+        // 远端知识库（RAG 阶段 3）的三个可观测字段。
+        // 它们与 `embed_*` 是**两组独立**的读数（用户口径 4：`/v1/embeddings` 与
+        // RAG 开关完全解耦）：嵌入模型在不在，与"远端会不会注入"是两件事。
+        // 组合起来才够归因：
+        //   · rag_remote_enabled=true 且 embed_loaded=false -> 远端开了但注入必然为空（缺嵌入模型）；
+        //   · 两者都 true 而 rag_remote_injected=0 -> 检索跑了但没命中（调阈值/加内容），
+        //     与上一条的处置完全不同 —— 没有 `rag_remote_injected` 时两者同形。
+        //   · `rag_remote_enabled` —— 远端那条路当下开着没有（调用方发请求前就能读）；
+        //   · `rag_remote_kb`       —— 远端用的是哪个库（空串 = 没配）。两个库名分开存之后，
+        //     "我配的和远端用的到底是不是同一个"必然会被问到，这是它唯一的答案；
+        //   · `rag_remote_injected` —— **上一轮**远端实际注入了几条（语义同 kv_reuse_tokens）。
+        //     开关开着**完全不代表**检索命中了，这个数才是"有没有真的在工作"的读数。
+        val ragRemoteEnabled = RagInject.remoteEnabled(ragPrefs())
+        val ragRemoteKbJson = RagProtocol.kbJson(RagInject.remoteKb(ragPrefs()))
+        val ragRemoteInjected = lastRagInjected.get()
         // 注意 Kotlin 原始字符串（"""..."""）的行尾引号计数：
         // 拼接段必须以 `"""` 收尾（字面量内容 0 个引号）；若写成 `""""`，
         // 最后一个引号会被当成字面量内容，JSON 里就多出一个 `"`，整份响应立刻非法。
         // 段首同理：`""""` = 结束符 `"""` + 内容 `"`。
         //
-        // ⚠ 这里是**恰好 4 段**的拼接，不是随手折的行：`tools/run_health_json_guard.py`
-        // 会按 Kotlin 词法把每一段还原成字面量再拼成真 JSON 去解析，判据里第一条就是
-        // "有 4 段"。加字段时**不要新增一段**（多一段立刻红），把字段并进现有段里。
-        // 反过来，段数对不上时那条守卫会先红在"段数"上，比 JSON 解析报的错好查得多。
+        // ⚠ 这是多段拼接，不是随手折的行：`tools/run_health_json_guard.py`
+        // 会按 Kotlin 词法把每一段还原成字面量再拼成真 JSON 去解析，判据里第一条是
+        // "至少 4 段"（并成更少才是退化 —— 见该守卫 `0.9.143` 的改法：判据从
+        // "恰好 4 段"放宽，因为它原先挂在**排版**上，而不是 JSON 本身）。
+        // 加字段时**尽量并进现有段**，少一次折行就少一次引号计数的机会。
+        // 反过来，段数不对时守卫会先红在"段数"上，比 JSON 解析报的错好查得多。
         val json = """{"status":"ok","model_loaded":$loaded,"model":$desc,""" +
             """"ctx_used":$ctxUsed,"ctx_size":$ctxSize,"busy":${busy.get()},"port":$PORT,""" +
             """"generating":$generating,"cancelled":${LlmEngine.currentCancel?.cancelled ?: false},""" +
-            """"kv_cache_valid":$kvValid,"kv_reuse_tokens":$kvReuse,"kv_prefill_tokens":$kvPrefill,"kv_rounds":$kvRounds}"""
+            """"kv_cache_valid":$kvValid,"kv_reuse_tokens":$kvReuse,"kv_prefill_tokens":$kvPrefill,"kv_rounds":$kvRounds,"kv_lcp_tokens":$kvLcp,"frozen_ms":$frozenMs,"frozen_count":$frozenCount,"frozen_total_ms":$frozenTotal,"restart_pending":$restarting,""" +
+            // 三个 RAG 字段与合批六个字段都并进**最后这一段**（不另起一段）：
+            // 段数越少，行尾引号计数出错的窗口越小 —— 这份 JSON 非法时
+            // 探针会把健康的服务判成不可达。
+            // `$ragRemoteKbJson` 是**已带引号**的 JSON 串（转义收在 RagProtocol 一处）。
+            """"embed_loaded":$embedLoaded,"embed_model":$embedDesc,"embed_dim":$embedDim,"rag_remote_enabled":$ragRemoteEnabled,"rag_remote_kb":$ragRemoteKbJson,"rag_remote_injected":$ragRemoteInjected,"embed_batch_batches":${bs.batchedBatches},"embed_batch_entries":${bs.batchedEntries},"embed_batch_fallback_batches":${bs.fellBackBatches},"embed_batch_fallback_entries":${bs.fellBackEntries},"embed_batch_ms":${bs.batchedMs},"embed_batch_size":$wantBatch,"embed_batch_size_set":$wantBatchSet,"embed_batch_size_index":$indexBatch,"embed_batch_size_index_kb":$currentKbNameJson,"embed_ctx_per_seq":$wantCtx,"embed_ctx_per_seq_set":$wantCtxSet,"embed_parity_rows":${pari.rows},"embed_parity_identical":${pari.identical},"embed_parity_different":${pari.different},"embed_parity_verdict":$parityVerdictJson,"embed_parity_repeat_measured":${pari.repeatMeasured},"embed_parity_repeat_not_identical":${pari.repeatNotIdentical},"embed_parity_repeat_batched_measured":${pari.repeatBatchedMeasured},"embed_parity_repeat_batched_not_identical":${pari.repeatBatchedNotIdentical},"embed_parity_group":$parityGroupJson,"embed_retrieve_measured":${retr.measured},"embed_retrieve_queries":${retr.queries},"embed_retrieve_answer_changed":${retr.answerChanged},"embed_retrieve_order_changed":${retr.orderChanged},"embed_retrieve_batch_base":${retr.baseBatch},"embed_retrieve_batch_other":${retr.otherBatch},"embed_retrieve_topk":${retr.topK}}"""
         // 自检：手拼 JSON 一旦出引号错，探活/监控会把健康的服务判为不可达。
         // 这里用 JSONObject 解析兜底，宁可抛异常暴露问题，也不静默发出非法 JSON。
         return try {
@@ -841,6 +1430,86 @@ object HttpApi {
         } catch (e: Exception) {
             errJson("health json malformed: ${e.message}")
         }
+    }
+
+    /**
+     * `GET /v1/models/{id}` 的 id 取口 —— **解出来的 id 必须与 `modelsJson()` 里
+     * 放进 `data[].id` 的那一个逐字节相等**，否则 SDK 会照着列表里的 id 去查、
+     * 查到 404，而"列表里有、查不到"这种自相矛盾，排查时会先怀疑网络。
+     *
+     * 三条约束（每条都对应一种"看起来正常"的错法）：
+     *   · **百分号解码**：id 可能是中文别名或带空格的文件名，客户端一定会 URL 编码。
+     *     不解码时 `/v1/models/我的模型` 直接找不到，而报的是 404「模型不存在」——
+     *     与"这个模型真没有"同形。
+     *   · 解码失败（非法 `%xx`）**按原样**使用，不抛 —— 抛出去就是 500，
+     *     而这里最坏只是找不到，404 更准确。
+     *   · **查 query 只在 `/` 之后**（`pathUnder` 会把 `/v1/models/abc?x=1` 也判进
+     *     这个分支），少切这一刀会把 `?x=1` 拼进 id。
+     */
+    private fun idFromModelsPath(path: String): String {
+        val tail = path.removePrefix("/v1/models/")
+        val raw = tail.substringBefore('?').substringBefore('#')
+        return try {
+            java.net.URLDecoder.decode(raw, "UTF-8")
+        } catch (_: Exception) {
+            raw
+        }
+    }
+
+    /**
+     * 单个模型的 OpenAI 兼容对象（`GET /v1/models/{id}`）。
+     *
+     * 语义上就是**列表里那一条**，所以这里复用同一个档案拼装逻辑（[attachProfile]），
+     * 字段名不许另起一套：两处字段名一旦分叉，客户端会得到"列表里有 profile、
+     * 单查没有"的诡异结果，而两边都是合法 JSON、谁都不报错。
+     *
+     * 命中判据与 `modelsJson()` **同源**：拿别名逐个比（`id`/`aliases[0]` 都是别名）。
+     * 不再写第二套（比如"去文件系统 stat 一下这个名字"）—— 判据分叉的那天开始，
+     * 列表与单查就会给出互相矛盾的两个答案。
+     */
+    private fun modelEntryJson(id: String): String {
+        val dbg = appContext
+        if (dbg == null) return errJson("not found: $id")
+        val files = try { ModelStore.list(dbg) } catch (_: Throwable) { emptyList() }
+        val profile = LlmEngine.modelProfile()
+        // 两点纯粹是**源码级判据**要求的，改了会觉得"这有什么必要"，但不改就会红：
+        //   · 形参名**不能叫 `alias`** —— 它下面那个 `for` 循环里有个局部变量同名，
+        //     而 `run_http_scope_order.py` 会把局部函数的形参表当成"声明前的读"
+        //     （它只排除 `fun f(名: 类型)` 这一种形态，形参表 + 返回类型不认）。
+        //     判据是真词法、能捞到真问题，所以让路的是源码，不是判据。
+        //   · `cur` 必须**先取好**再声明 `entry`：`entry` 体内读它，而局部变量没有提升。
+        val cur = currentModel
+        fun entry(forId: String, bytes: Long?, ftype: String?): JSONObject {
+            val o = JSONObject()
+                .put("id", forId)
+                .put("object", "model")
+                .put("created", 0)
+                .put("owned_by", "local-llm-server")
+            if (bytes != null) o.put("meta", JSONObject().put("size", bytes).put("ftype", ftype ?: ""))
+            if (profile.available && forId == cur) {
+                o.put("profile", JSONObject().apply {
+                    profile.name?.let { put("name", it) }
+                    profile.architecture?.let { put("architecture", it) }
+                    profile.tensorBytes?.let { put("tensor_bytes", it) }
+                    profile.paramCount?.let { put("param_count", it) }
+                    profile.ctxTrain?.let { put("ctx_train", it) }
+                    profile.vocabSize?.let { put("vocab_size", it) }
+                    profile.fileType?.let { put("file_type", it) }
+                    profile.metaCount?.let { put("meta_count", it) }
+                })
+            }
+            return o
+        }
+        for (f in files) {
+            val alias = ModelStore.aliasOf(dbg, f.name)
+            if (alias != id) continue
+            val quant = Regex("(?i)(iq\\d+[a-z0-9_]*|q\\d+[a-z0-9_]*|f16|bf16|f32)").find(f.name)?.value?.uppercase() ?: ""
+            return entry(alias, f.length(), quant).toString()
+        }
+        // 库为空但模型已加载（异常情况）：与 `modelsJson()` 的兜底**同一口径**，
+        // 保证"列表里出现过的 id 一定查得到"。
+        if (currentModel == id) return entry(id, null, null).toString()
+        return errJson("not found: $id")
     }
 
     private fun modelsJson(): String {
@@ -864,10 +1533,36 @@ object HttpApi {
         root.put("object", "list")
         val modelsArr = JSONArray()
         val dataArr = JSONArray()
+        // 「当前加载的是哪一个」的判据是**别名**（与 `HttpApi.currentModel` 同源），
+        // 只有它指的那一条挂档案：库同一时刻只加载一份权重（`Session S` 只有一个），
+        // 给别的条目挂等于把"这一个模型"的读数说成"那个模型"的。
+        //
+        // 别名解析必须走 `ModelStore.aliasOf`：另一处**同名**的
+        // `ModelStore.Row.alias` 是 `rows()` 内置好的一批，两者在"用户改过别名、
+        // 而改名前已缓存"这类边界上取值不同 —— 拿 `rows()` 去比对等于换了一套判据，
+        // 结果就是"当前模型看起来不在库里"（列表里一条都不带档案）。
+        val profile = LlmEngine.modelProfile()
+        fun attachProfile(o: JSONObject) {
+            if (!profile.available) return
+            o.put("profile", JSONObject().apply {
+                profile.name?.let { put("name", it) }
+                profile.architecture?.let { put("architecture", it) }
+                // 权重字节与文件字节**两个都给、字段名不同**：它们差值就是元数据+对齐，
+                // 合并成一个数就再也说不清"文件为什么比权重大一截"。
+                profile.tensorBytes?.let { put("tensor_bytes", it) }
+                profile.paramCount?.let { put("param_count", it) }
+                profile.ctxTrain?.let { put("ctx_train", it) }
+                profile.vocabSize?.let { put("vocab_size", it) }
+                profile.fileType?.let { put("file_type", it) }
+                profile.metaCount?.let { put("meta_count", it) }
+            })
+        }
         if (files.isEmpty()) {
             // 降级：拿不到模型库时只报当前加载模型（别名），保证连接可用
             cur?.let { alias ->
-                dataArr.put(JSONObject().put("id", alias).put("object", "model").put("owned_by", "local-llm-server"))
+                val d = JSONObject().put("id", alias).put("object", "model").put("owned_by", "local-llm-server")
+                attachProfile(d)
+                dataArr.put(d)
                 modelsArr.put(JSONObject().put("name", alias).put("model", alias).put("type", "model"))
             }
         } else {
@@ -901,7 +1596,7 @@ object HttpApi {
                         .put("families", JSONArray().put(""))
                         .put("parameter_size", params)
                         .put("quantization_level", quant)))
-                dataArr.put(JSONObject()
+                val d = JSONObject()
                     .put("id", id)
                     .put("aliases", JSONArray().put(alias))
                     .put("tags", JSONArray())
@@ -910,17 +1605,130 @@ object HttpApi {
                     .put("owned_by", "llamacpp")
                     .put("meta", JSONObject()
                         .put("size", f.length())
-                        .put("ftype", quant)))
+                        .put("ftype", quant))
+                if (cur != null && alias == cur) attachProfile(d)
+                dataArr.put(d)
             }
             // 当前加载模型不在库里时（异常情况），补一个别名条目保证客户端可选
             val listedAliases = files.mapNotNull { f -> ctx?.let { c -> ModelStore.aliasOf(c, f.name) } }
             if (cur != null && cur !in listedAliases) {
-                dataArr.put(JSONObject().put("id", cur).put("object", "model").put("owned_by", "local-llm-server"))
+                val d = JSONObject().put("id", cur).put("object", "model").put("owned_by", "local-llm-server")
+                attachProfile(d)
+                dataArr.put(d)
             }
         }
         root.put("models", modelsArr)
         root.put("data", dataArr)
         return root.toString()
+    }
+
+    /**
+     * `POST /v1/embeddings`：把一批文本编码成**已归一化**的向量（RAG 阶段 3）。
+     *
+     * ══════════════════════════════════════════════════════════════════════
+     * 为什么这个端点**只**判「嵌入模型在不在」
+     * ══════════════════════════════════════════════════════════════════════
+     * 它不读 `rag_enabled` / `rag_remote_enabled` / `rag_remote_kb` 中的任何一个。
+     * 这是本端点唯一的架构约束，也是它最容易被"顺手"改坏的地方 —— 加一句
+     * `if (!RagInject.remoteEnabled(this)) 503` 看起来是"统一口径"，
+     * 实际是**让两件不相干的事互相绑架**：用户为了 App 内聊天不注入而关了知识库，
+     * 远端客户端的 embeddings 就跟着不可用，而报的错还是"知识库未启用"。
+     *
+     * 缺嵌入模型 -> **503 + 明文原因**，绝不静默返回空 data（那会被调用方当成
+     * "这批文本没有向量"而静默跳过，检索全空但一切 200）。
+     * 判据落在 `tools/rag_remote/check_embeddings_decoupled.py`：该函数体里
+     * **一个 `RagInject.` 引用都不许有**。
+     *
+     * ⚠ 它**不持 `busy`**：嵌入与生成走两条路（双常驻的另一半价值）。持了 busy
+     * 就等于"聊天的同时不能算向量"，而那正是双常驻要买的东西。
+     */
+    private fun handleEmbeddings(req: Req, out: OutputStream, corsOrigin: String? = null) {
+        if (!LlmEngine.hasEmbedModel) {
+            emitLog("拒绝 /v1/embeddings：嵌入模型未加载（与知识库开关无关）")
+            writeJson(out, 503, errJson(
+                "嵌入模型未加载：先在 App 内加载一个嵌入模型（如 bge-small-zh-v1.5）；" +
+                    "本端点与知识库开关无关，只看嵌入模型是否驻留"), corsOrigin)
+            return
+        }
+        val dim = LlmEngine.embedDim
+        if (dim <= 0) {
+            emitLog("拒绝 /v1/embeddings：嵌入模型维度取不到（加载可能不完整）")
+            writeJson(out, 503, errJson("嵌入模型维度取不到（加载可能不完整），请重新加载嵌入模型"), corsOrigin)
+            return
+        }
+        try {
+            val j = JSONObject(req.body)
+            val (rq, opt, err) = EmbeddingsApi.fromRequest(j)
+            if (rq == null || opt == null) {
+                emitLog("拒绝 /v1/embeddings：${err}")
+                writeJson(out, 400, errJson(err ?: "input 非法"), corsOrigin)
+                return
+            }
+            // 模型名回显：OpenAI 客户端会用响应里的 model 反查它请求的那个。
+            // 缺省取**嵌入模型自己的描述**而不是硬编码 "local" —— 双常驻下这句话
+            // 必须指向嵌入那一份（对话模型往往是另一个，回错等于告诉调用方
+            // "你算出来的向量来自 X"，而实际来自 Y；两个模型维度不同时，
+            // 调用方按 X 的维度去解析会直接错位）。
+            val modelName = j.optString("model", "").ifEmpty {
+                LlmEngine.embedModelDesc().ifEmpty { "local-embed" }
+            }
+            val items = ArrayList<String>(rq.inputs.size)
+            var failCount = 0
+            var idCount = 0
+            for ((i, item) in rq.inputs.withIndex()) {
+                // ⚠ index 必须是**请求里的下标**（`i`），不是"第几个成功的"：
+                // 用成功计数当 index 会让"中间有一条失败"之后的每一条都错位一格，
+                // 而调用方按 index 把向量配文本入库 —— 文本 A 拿到文本 B 的向量，
+                // 检索全错、接口 200、没有任何一处报错。
+                //
+                // token id 数组在这里**先还原成文本**再走同一条编码路径（见
+                // `nativeDetokenize` 的注释）。还原失败（id 越界 / 没加载模型）
+                // 是这一条的错误，不是整批的 —— 与"这条编码失败"同一处置。
+                val text: String? = when (item) {
+                    is EmbeddingsApi.Item.Text -> item.text
+                    is EmbeddingsApi.Item.TokenIds -> {
+                        idCount++
+                        LlmEngine.detokenize(item.ids)
+                    }
+                }
+                if (text == null) {
+                    failCount++
+                    items.add(EmbeddingsApi.errorItemJson(i,
+                        "这一条的 token id 还原失败：id 越界（不属于本模型 vocab）或数组为空；" +
+                            "id 必须来自同一个嵌入模型"))
+                    continue
+                }
+                val vec = LlmEngine.embed(text)
+                if (vec == null || vec.isEmpty()) {
+                    failCount++
+                    // 实值原因已由 LlmEngine.embed 内部打过一行；这里在**该项**上再带
+                    // 一句，让调用方不必翻服务端日志就知道是哪一条。
+                    items.add(EmbeddingsApi.errorItemJson(i,
+                        "这一条编码失败（服务端日志有实值原因：维度/池化/范数）"))
+                } else {
+                    items.add(EmbeddingsApi.itemJson(i, vec, opt.encoding))
+                }
+            }
+            // 一条失败不拖垮整批（见 EmbeddingsApi.errorItemJson），但必须留痕：
+            // 只回 200 而日志干净时，"有些条没有向量"会被当成"那些文本本来就没意义"。
+            if (failCount > 0)
+                emitLog("embeddings：${rq.inputs.size - failCount} 条成功 / $failCount 条失败" +
+                    "（失败项在 data[] 里带 error）")
+            // id 条数单独记一笔：id 数组与字符串两条输入共用同一条编码路径，
+            // 日志里若不区分，"这一批为什么慢/为什么有几条失败"就少了最关键的
+            // 那半句（越界 id 的失败原因与"文本有问题"完全不同）。
+            if (idCount > 0) emitLog("embeddings：其中 $idCount 条是 token id 输入（已还原文本）")
+            emitLog(EmbeddingsApi.describe(rq.batch, rq.inputs.size, dim, opt.encoding))
+            // 空 input（`"input": []`）是合法的：回一个空 data，**不是**错误。
+            // 回 400 会让"我确实没有要编码的东西"看起来像请求写错了。
+            writeJson(out, 200, EmbeddingsApi.responseJson(modelName, items), corsOrigin)
+        } catch (t: Throwable) {
+            // 与生成端点同一口径：异常兜住、不留半截响应。但嵌入的失败**不携带
+            // 用户文本**（日志里只报类型与 message），避免把知识库内容或提问
+            // 写进日志文件 —— 迁移日志时那是最容易泄漏的东西。
+            emitLog("embeddings 异常：${t.javaClass.simpleName}: ${t.message}")
+            try { writeJson(out, 500, errJson(t.message ?: "internal error"), corsOrigin) } catch (_: Exception) {}
+        }
     }
 
     private fun handleChat(req: Req, out: OutputStream, corsOrigin: String? = null) {
@@ -953,7 +1761,18 @@ object HttpApi {
             // top_p=0 被静默关掉、repeat_penalty<1 语义反转、min_p 默认值与 UI 不一致）。
             // max_tokens 也在此处按 1..8192 校验（此前用 coerceIn 静默钳制）。
             // fromRequest 已逐字段校验并给出原因；返回 null 即取值非法，直接 400。
-            val (sp, spErr) = SamplingParams.fromRequest(j)
+            // 协议字段（`max_completion_tokens` / `logit_bias` / `logprobs`）先解。
+            // **必须在 SamplingParams 之前**：那是这一批里唯一"要同时看到两个字段名"
+            // 的判据（`max_tokens` 与 `max_completion_tokens` 同时给出且取值不同 -> 400），
+            // 而 SamplingParams 是逐字段结构、一次只看自己那一格。
+            // 判据只有一处，就在 ProtocolFields（默认值/上限/文案都从那里引，不另抄）。
+            val (pf, pfErr) = ProtocolFields.fromRequest(j)
+            if (pf == null) { writeJson(out, 400, errJson(pfErr ?: "协议字段非法"), corsOrigin); return }
+            // 每条 notice 是一句"客户端以为生效了、其实没有/部分生效"的说明，必须留痕
+            // （`logit_bias` 超限被截断、`logprobs=true` 收下但不产出数据）。
+            for (msg in pf.notices) emitLog(msg)
+            ProtocolFields.describe(pf).takeIf { it.isNotEmpty() }?.let { emitLog("协议字段 $it") }
+            val (sp, spErr) = SamplingParams.fromRequest(j, aliasMaxTokens = pf.maxTokens)
             if (sp == null) { writeJson(out, 400, errJson(spErr ?: "采样参数非法"), corsOrigin); return }
             // stop / stop_sequences 与采样参数同一套原则：取值非法直接 400，不静默忽略。
             // 拦截本身在 native（local-stop 采样器，逐 token 判），这里只做请求侧解析与校验；
@@ -999,6 +1818,56 @@ object HttpApi {
                 msgs.add(role to content)
             }
             if (msgs.isEmpty()) { writeJson(out, 400, errJson("messages is empty"), corsOrigin); return }
+
+            // ---- 知识库注入（RAG 阶段 3：远端路径）----
+            //
+            // 位置在**渲染之前、工具解析之前**：注入只动最后一条 user 的正文，
+            // 越早做越好 —— 之后所有步骤（工具感知模板、思考开关判定、长度统计）
+            // 看到的都是**最终**那一份 messages。放在渲染之后就必须把渲染重做一遍，
+            // 而且工具路径与普通路径各要改一次（两处判据必然漂移）。
+            //
+            // 「要不要注入」的判据**只有一处**（[RagInject.shouldSearchRemote] ->
+            // [RagInject.shouldSearch]），与 App 内那条路径共用同一个函数 ——
+            // 客户端无意间多发一个字节、或服务端多注入一个字节，都没有任何现象。
+            //
+            // ⚠ 与 `/v1/embeddings` **完全解耦**（用户口径 4）：那个端点不读这里的
+            //   开关、也不受"有没有注入"影响。两条路唯一的共同点是都用嵌入模型，
+            //   而那由各自的入口独立判断（缺嵌入模型时各自的错误语义也不同）。
+            // ⚠ 这里必须走 [ragPrefs]（= `appContext`），**不能写 `this`**：
+            //    `this` 在本文件里是 `HttpApi` 这个 **object 单例**，不是 `Context`，
+            //    而 `RagInject.remoteKb/remoteEnabled` 的形参是 `android.content.Context` ——
+            //    写成 `this` 直接编译不过（`/health` 与 [ragFieldOf] 里同样如此）。
+            val remoteKb = RagInject.remoteKb(ragPrefs())
+            val lastUserText = msgs.lastOrNull { it.first == "user" }?.second.orEmpty()
+            // 先清零再算：`rag_remote_injected` 是"**上一轮**注入了几条"的读数
+            // （与 kv_reuse_tokens 同一语义）。不清零的话，本轮没注入时它会
+            // 继续报上一轮的数 —— 于是"这轮没注入"与"这轮注入了"读数相同，
+            // 而读数存在的全部意义就是分辨这两者。
+            lastRagInjected.set(0)
+            lastRagKb = ""
+            val rag = LlmEngine.ragContext(
+                ragPrefs(), remoteKb, lastUserText, RagInject.remoteEnabled(ragPrefs()))
+            if (rag != null) {
+                // 与 App 路径**同一个助手**（`attachBeforeLastUser`）：消息角色序列一个字节不变，
+                // 只在最后一条 user 的正文前拼上注入块。位置对了，KV 前缀复用的分叉点就落在
+                // "本轮提问处"（放 system 段会让分叉点回到 pos 0、reuse 恒为 0）。
+                val injected = RagInject.attachBeforeLastUser(msgs.toList(), rag.block)
+                msgs.clear()
+                msgs.addAll(injected)
+                lastRagInjected.set(rag.count)
+                // ⚠ 写的是 `rag.kb`（检索**当时**真正用的那个库名），**不是**
+                //    到响应时再 `remoteKb(prefs)` 现读 —— 两者可能差一次用户改设置
+                //    （长生成期间很容易发生），于是一对从未同时成立过的 `{kb, injected}`
+                //    就发出去了。见 [lastRagKb] 的说明。
+                lastRagKb = rag.kb
+                emitLog("知识库注入（远端）: kb=${rag.kb} 条数=${rag.count} —— 本轮响应带 local_rag 字段，" +
+                    "正文里带 ${RagInject.MARK} 锚点；关闭请在 App 内关「远端知识库」开关")
+            } else if (ragActive()) {
+                // 开关开着却一条没注入 —— 这是最需要留痕的一种：用户以为功能坏了。
+                // 具体原因（没命中/索引需重建/嵌入未加载）已经由 ragContext 内部逐条打过日志，
+                // 这里只补一句"远端这一轮没有注入"，让"开了但没注入"在日志上可判。
+                emitLog("知识库：远端开关开着（kb=$remoteKb）但本轮 0 条注入（原因见上一行 [知识库] 日志）")
+            }
 
             // ---- 工具调用（OpenAI tools / function calling）----
             // 请求带 tools 时必须走「工具感知」模板渲染：工具定义要进 prompt，
@@ -1090,7 +1959,10 @@ object HttpApi {
                     // 进而决定 GBNF 里思考块是"写死的"还是"可选的"。不透传时库按默认
                     // true 重算 PEG，与真 prompt 分叉 —— 而分叉的后果是 grammar
                     // **整个失效**（不是"少一点约束"），原因见 gbnf_from_json_schema 判据 ④。
-                    thinkingOn = thinkingOn)
+                    thinkingOn = thinkingOn,
+                    // logit_bias 的两个平行数组来自同一个 List，长度天然相等。
+                    // 没给时两者都是 null -> native 不挂偏置采样器，链路逐字节同旧行为。
+                    biasIds = ProtocolFields.biasIds(pf), biasVals = ProtocolFields.biasValues(pf))
                 if (respFormat !is ResponseFormat.None)
                     emitLog("sampling ${sp.describe()} ${StopSequences.describe(stops)} " +
                             JsonSchemaFormat.describeGenPrompt(genPrompt))
@@ -1127,7 +1999,7 @@ object HttpApi {
                     //     （2026-09-20 「思考开时输出一小段就断」的现场）；
                     //   · 改为「每次真发过事件后刷新」，就等于把首帧门槛内建进来：
                     //     至少有一条 data: 帧出去了，心跳才有意义，也才安全。
-                    var lastBeat = System.currentTimeMillis()
+                    var lastBeat = System.nanoTime()  // G2：与判据同口单调钟，墙钟后跳会让心跳永不触发
                     // 带 tools 时**不实时下发 content**：工具调用语法（<tool_call> / [TOOL_CALLS] 等）
                     // 与正文同处一条输出流，边生成边发会把语法标记当正文吐给客户端。改为整段生成结束后
                     // 先按模板解析出 tool_calls，再决定发 tool_calls 增量块还是纯 content。
@@ -1140,10 +2012,20 @@ object HttpApi {
                                 if (asReason) """{"reasoning_content":${text.toJsonStr()}}""" else """{"content":${text.toJsonStr()}}""", null))
                             // 真发过一帧 —— 从现在起 "客户端空闲" 才成立，心跳才允许探测。
                             emitted++
-                            lastBeat = System.currentTimeMillis()
+                            lastBeat = System.nanoTime()
                         }
                     }
-                    while (n < maxTok) {
+                    // [hitLimit] = "这一轮是被 `max_tokens` 掐断的"，供收尾处算 finish_reason。
+                    // 判据锚在**循环怎么退出的**（体内那支置位后 break），不在收尾处反推
+                    // `n >= maxTok` —— 后者会把"最后一步恰好吐出一个 token"与"最后一步是
+                    // EOS"混成一谈。推导与优先级见 [FinishReason]。
+                    var hitLimit = false
+                    while (true) {
+                        // 上限判定移到循环**体内最前面**：这样"为什么退出"只有一个来源 ——
+                        // 这一支置 [hitLimit] 后 break，其余三个 break 各自是对的取值。
+                        // 写成 `while (n < maxTok)` 的话，"跑满"这件事只剩一个**推导**
+                        // （收尾处反推 `n >= maxTok`），而那个推导会把 EOS 也覆盖进去。
+                        if (n >= maxTok) { hitLimit = true; break }
                         // 取消判定放在**取 token 之前**：已经生成的内容不回滚（SSE 已下发，
                         // 收不回来），但绝不再多算一步。取消后走与自然结束同一条收尾路径。
                         if (cancel.requested) break
@@ -1157,9 +2039,9 @@ object HttpApi {
                         // 首帧门槛内建在 `lastBeat` 的语义里（见它的注释）：思考段若从第一个
                         // token 就开始（openAtStart=true），在**第一条真实帧下发之前**绝不心跳 ——
                         // 那一刻流里只有响应头，探测写出的任何东西都会与 chunked 分帧竞争。
-                        if (stream && think.inThink && emitted > 0 && System.currentTimeMillis() - lastBeat > 800) {
+                        if (stream && think.inThink && emitted > 0 && System.nanoTime() - lastBeat > 800_000_000L) {
                             heartbeat(out, cancel)
-                            lastBeat = System.currentTimeMillis()
+                            lastBeat = System.nanoTime()
                         }
                         if (piece.isNotEmpty()) think.feed(piece) { t, asReason ->
                             if (stream) emit(t, asReason)
@@ -1255,27 +2137,45 @@ object HttpApi {
                             (if (ledger > n) "（有 ${ledger - n} tok 已进 KV 未下发，" +
                                 "客户端按收到的文本拼回的历史会比引擎手里的短）" else ""))
                     }
+                    // logprobs 字段片段：流式与非流式两条路径**共用这一个**（值恒为 null，
+                    // 客户端没要就是空串 -> 逐字节同旧行为）。放在分支外算一次，
+                    // 免得两条路径各算一次后漂移。
+                    val lpField = logprobsFieldOf(pf.logprobs)
+                    // 本轮的 `local_rag` 字段（没注入 -> 空串，一个字节都不多）。
+                    // 三条响应路径共用同一处取值：这条字段最怕的就是"某条路径上没有"——
+                    // 那正是它存在的意义的反面（调用方在该路径上永远看不到被注入了）。
+                    val ragField = ragFieldOf(lastRagKb, lastRagInjected.get())
                     if (stream) {
-                        val fin = if (cancelled) "cancelled" else if (toolCallsJson != null) "tool_calls" else "stop"
+                        val fin = FinishReason.of(cancelled, hitLimit, toolCallsJson != null)
                         // 缓冲模式下补发正文（带 tools 但模型没调工具）。
                         // 下发字节同样是上面剥过围栏的那份 sb —— 与 !stream 路径同一处判据，
                         // 不在这里再判一次（两处判据必然漂移）。
                         if (bufferContent && toolCallsJson == null && sb.isNotEmpty())
-                            sseEvent(out, chatChunkJson(id, modelName, created, """{"content":${sb.toString().toJsonStr()}}""", null))
+                            sseEvent(out, chatChunkJson(id, modelName, created, """{"content":${sb.toString().toJsonStr()}}""", null, lpField))
                         // 流式下按 OpenAI 约定发 tool_calls 增量块（index/id/type/function）。
                         // 已整段解析完成，故一次性下发而不是逐 token 拼装——客户端按 index 聚合，结果一致。
                         // id 兜底与 native 侧同一条规则：parse 结果缺 id 时用 call_<下标>，
                         // 不能在这里另写一份默认值，否则同一份数据在两条路径上会算出不同的 id。
                         if (toolCallsJson != null) {
                             for (delta in ToolCalls.streamDeltas(JSONArray(toolCallsJson)))
-                                sseEvent(out, chatChunkJson(id, modelName, created, delta, null))
+                                sseEvent(out, chatChunkJson(id, modelName, created, delta, null, lpField))
                         }
-                        sseEvent(out, chatChunkJson(id, modelName, created, "{}", fin))
+                        // `local_rag` 只挂在**收尾帧**上：流式下客户端按 delta 聚合正文，
+                        // 额外字段挂在中间帧没有意义（它描述的是整轮），而收尾帧是每一条流
+                        // 都必然会收到的那一帧（含被取消的轮次 —— 取消也要让调用方知道自己
+                        // 这一轮其实被注入了，否则"被注入了又被我自己中断"这条读不到）。
+                        // ⚠ `ragField` 必须**真的传进来**：它就是上面那句注释说的
+                        // "收尾帧是每一条流都会收到的那一帧"。此前这一行漏了第七个实参
+                        // （默认值 `""`），于是 `local_rag` 在流式路径上**一个字节都到不了**
+                        // —— 而非流式那条路带得好好的，症状是"同一个接口两种模式读数不同"，
+                        // 且不报错、不崩溃。接线守卫（`tools/rag_remote/check_wiring.py`
+                        // 的判据⑤）正面钉住这个实参。
+                        sseEvent(out, chatChunkJson(id, modelName, created, "{}", fin, lpField, ragField))
                         sseEvent(out, "[DONE]")
                         sseEnd(out)
                     } else {
                         val usage = usageJson(LlmEngine.contextUsed(), n)
-                        val fin = if (cancelled) "cancelled" else if (toolCallsJson != null) "tool_calls" else "stop"
+                        val fin = FinishReason.of(cancelled, hitLimit, toolCallsJson != null)
                         // 有 tool_calls 时 content 按 OpenAI 规范可为 null
                         val contentField = if (toolCallsJson != null && sb.isEmpty()) "null" else sb.toString().toJsonStr()
                         // 必须走 ToolCalls 重新包装：native 给的是解析器原生形状（只有 id/name/arguments），
@@ -1284,7 +2184,7 @@ object HttpApi {
                         val toolField = if (toolCallsJson != null) ToolCalls.messageToolCallsField(JSONArray(toolCallsJson)) else ""
                         writeJson(out, 200,
                             """{"id":"$id","object":"chat.completion","created":$created,"model":"$modelName",""" +
-                            """"choices":[{"index":0,"message":{"role":"assistant","content":$contentField$reasonField$toolField},"finish_reason":"$fin"}],"usage":$usage}""", corsOrigin)
+                            """"choices":[{"index":0,"message":{"role":"assistant","content":$contentField$reasonField$toolField}$lpField,"finish_reason":"$fin"}],"usage":$usage$ragField}""", corsOrigin)
                     }
                 } finally {
                     // 摘除取消归属。**必须在 emitLog 之前**：之后任何 /v1/abort 都应看到
@@ -1318,7 +2218,13 @@ object HttpApi {
             val stream = j.optBoolean("stream", false)
             // 与 /v1/chat/completions 同一套解析与校验，默认值不会两边漂移
             // fromRequest 已逐字段校验并给出原因；返回 null 即取值非法，直接 400。
-            val (sp, spErr) = SamplingParams.fromRequest(j)
+            // 与 /v1/chat/completions 同一套解析与顺序（理由见 handleChat 同处）：
+            // 协议字段先解 -> 再解采样参数（别名 max_completion_tokens 的结果传进去）。
+            val (pf, pfErr) = ProtocolFields.fromRequest(j)
+            if (pf == null) { writeJson(out, 400, errJson(pfErr ?: "协议字段非法"), corsOrigin); return }
+            for (msg in pf.notices) emitLog(msg)
+            ProtocolFields.describe(pf).takeIf { it.isNotEmpty() }?.let { emitLog("协议字段 $it") }
+            val (sp, spErr) = SamplingParams.fromRequest(j, aliasMaxTokens = pf.maxTokens)
             if (sp == null) { writeJson(out, 400, errJson(spErr ?: "采样参数非法"), corsOrigin); return }
             val (stopsRaw, stopErr) = StopSequences.fromRequest(j)
             if (stopsRaw == null) { writeJson(out, 400, errJson(stopErr ?: "stop 参数非法"), corsOrigin); return }
@@ -1378,7 +2284,9 @@ object HttpApi {
                     // 裸补全没有渲染侧，取全局默认（与 handleChat 同一条 `resolve`，不另立一份）。
                     // 仍要**显式**传：形参不给时用的是同一个值，但显式才让"这一支按什么算的"可查。
                     thinkingOn = ThinkingControl.templateEnableThinking(
-                        ThinkingControl.resolve(disableThinkingDefault, null)))
+                        ThinkingControl.resolve(disableThinkingDefault, null)),
+                    // 与 handleChat 同源（见那边的说明）；两个端点对同一字段给同一个答案。
+                    biasIds = ProtocolFields.biasIds(pf), biasVals = ProtocolFields.biasValues(pf))
                 if (respFormat !is ResponseFormat.None)
                     emitLog("sampling ${sp.describe()} ${StopSequences.describe(stops)} " +
                             JsonSchemaFormat.describeGenPrompt(genPrompt))
@@ -1390,27 +2298,31 @@ object HttpApi {
                     val sb = StringBuilder()
                     // 与 handleChat 同一套语义：lastBeat 记「上次真实下发时刻」，emitted 作首帧门槛。
                     var emitted = 0
-                    var lastBeat = System.currentTimeMillis()
+                    var lastBeat = System.nanoTime()  // G2：与 handleChat 同一口径
                     if (stream) {
                         sseHead(out, corsOrigin)
                     }
-                    while (n < maxTok) {
+                    // 与 handleChat 同一套：上限判定在体内最前，「跑满」这件事只有一个来源。
+                    // 裸补全没有 tool_calls，[hitLimit] 之外只剩 cancelled / stop 两档。
+                    var hitLimit = false
+                    while (true) {
+                        if (n >= maxTok) { hitLimit = true; break }
                         if (cancel.requested) break
                         val piece = LlmEngine.step() ?: break
                         n++
                         // /v1/completions 没有 think 状态机，心跳纯粹为了断连探测：
                         // 这个端点常见于"测速"长跑（max_tokens 拉满），客户端中途离开
                         // 却白跑完是最浪费的一类场景。同样带首帧门槛（见 handleChat 的注释）。
-                        if (stream && emitted > 0 && System.currentTimeMillis() - lastBeat > 800) {
+                        if (stream && emitted > 0 && System.nanoTime() - lastBeat > 800_000_000L) {
                             heartbeat(out, cancel)
-                            lastBeat = System.currentTimeMillis()
+                            lastBeat = System.nanoTime()
                         }
                         if (piece.isNotEmpty()) {
                             sb.append(piece)
                             if (stream) {
                                 sseEvent(out, compChunkJson(id, modelName, created, piece.toJsonStr(), null))
                                 emitted++
-                                lastBeat = System.currentTimeMillis()
+                                lastBeat = System.nanoTime()
                             }
                         }
                         // 同样带首帧门槛：前 256 步若一条真实帧都没发（思考段 / 带 tools 缓冲），
@@ -1432,7 +2344,8 @@ object HttpApi {
                                 "客户端按收到的文本拼回的历史会比引擎手里的短）" else ""))
                     }
                     if (stream) {
-                        sseEvent(out, compChunkJson(id, modelName, created, "\"\"", if (cancelled) "cancelled" else "stop"))
+                        sseEvent(out, compChunkJson(id, modelName, created, "\"\"",
+                            FinishReason.of(cancelled, hitLimit, hasToolCalls = false)))
                         sseEvent(out, "[DONE]")
                         sseEnd(out)
                     } else {
@@ -1450,10 +2363,11 @@ object HttpApi {
                         emitLog(JsonSchemaFormat.describeDeliveryStrip(respFormat, rawOut))
                         if (delivered !== rawOut) { sb.setLength(0); sb.append(delivered) }
                         val usage = usageJson(LlmEngine.contextUsed(), n)
-                        val fin = if (cancelled) "cancelled" else "stop"
+                        val fin = FinishReason.of(cancelled, hitLimit, hasToolCalls = false)
+                        val lpField = logprobsFieldOf(pf.logprobs)
                         writeJson(out, 200,
                             """{"id":"$id","object":"text_completion","created":$created,"model":"$modelName",""" +
-                            """"choices":[{"index":0,"text":${sb.toString().toJsonStr()},"finish_reason":"$fin"}],"usage":$usage}""", corsOrigin)
+                            """"choices":[{"index":0,"text":${sb.toString().toJsonStr()}$lpField,"finish_reason":"$fin"}],"usage":$usage}""", corsOrigin)
                     }
                 } finally {
                     LlmEngine.endCancelable(cancel)
@@ -1553,17 +2467,62 @@ object HttpApi {
 
     // ---- JSON / SSE 工具 ----
 
-    private fun chatChunkJson(id: String, model: String, created: Long, deltaJson: String, finish: String?): String {
+    /**
+     * 一条流式 chat 增量块。
+     *
+     * [logprobsField] 是**已拼好的** `,"logprobs":null` 或**空串**。为什么是字符串而不是
+     * 一个 Boolean 让这里判：调用方（handleChat）手里才有"客户端到底要没要 logprobs"这个
+     * 信息，而"要了才出现该字段、不要就一个字节都不多"是本仓库对新增可选字段的硬要求
+     * （见 [JsonSchemaFormat] 文件头：字段不存在 => 与引入本特性之前逐字节相同）。
+     * 在这里再判一次就等于把那个判据复制到第二个地方，两处必然漂移。
+     */
+    private fun chatChunkJson(id: String, model: String, created: Long, deltaJson: String,
+                               finish: String?, logprobsField: String = "",
+                               ragField: String = ""): String {
         val fin = if (finish == null) "null" else "\"$finish\""
         return """{"id":"$id","object":"chat.completion.chunk","created":$created,"model":"$model",""" +
-            """"choices":[{"index":0,"delta":$deltaJson,"finish_reason":$fin}]}"""
+            """"choices":[{"index":0,"delta":$deltaJson$logprobsField,"finish_reason":$fin}]$ragField}"""
     }
 
-    private fun compChunkJson(id: String, model: String, created: Long, textJson: String, finish: String?): String {
+    /**
+     * 本轮响应里的 `local_rag` 字段片段（含前导逗号）；**没有注入时是空串**。
+     *
+     * 为什么单独一个方法而不是把 `RagProtocol.Injection` 透传给三处调用点：
+     * 三处（流式收尾帧 / 非流式正文 / 补发正文帧）各拼一次必然漂移，
+     * 而漂移的方向是"某一条路径上字段没了"—— 那条路径上的调用方于是**永远
+     * 看不到"被注入了"**，正是这个字段要消除的那种盲区。
+     * 判据落在 `tools/rag_remote/check_response_field.py`（三条路径都必须取它）。
+     */
+    private fun ragFieldOf(kb: String, count: Int): String =
+        RagProtocol.responseField(
+            if (count > 0) RagProtocol.Injection(kb, count) else null)
+
+    /** 同 [chatChunkJson] 的 [logprobsField]：空串 = 客户端没要 logprobs，一个字节都不多。 */
+    private fun compChunkJson(id: String, model: String, created: Long, textJson: String, finish: String?,
+                               logprobsField: String = ""): String {
         val fin = if (finish == null) "null" else "\"$finish\""
         return """{"id":"$id","object":"text_completion","created":$created,"model":"$model",""" +
-            """"choices":[{"index":0,"text":$textJson,"finish_reason":$fin}]}"""
+            """"choices":[{"index":0,"text":$textJson$logprobsField,"finish_reason":$fin}]}"""
     }
+
+    /**
+     * 客户端要了 `logprobs` 时该出现在 choice 里的那段片段（**含前导逗号**）。
+     *
+     * 为什么值恒为 `null`：本实现收下并校验了这个字段，但**不产出**逐 token 置信度
+     * （理由与代价写在 [ProtocolFields] 文件末尾那段）。这里的取舍是：
+     *   · 字段要出现（否则 SDK 会把"我们要过 logprobs"这件事整个丢掉，而它对
+     *     响应形状的判断是按字段在不在做的）；
+     *   · 值必须是 `null` 而不是 `[]` 或 `{}` —— 后两者都是"结构对但内容为空"，
+     *     客户端会当成"模型一个 token 都没给置信度"，而真相是"这版不支持"。
+     *     `null` 才是 OpenAI 语义里"没有这一项"的表达，且日志里那行说明与它成对。
+     *
+     * 客户端**没要**时返回空串 —— 一个字节都不多，与引入本特性之前逐字节相同。
+     */
+    private fun logprobsFieldOf(wanted: Boolean): String =
+        // 引号用**转义形式**而不是三引号原样串：本值里恰好有 `":` 的序列，
+        // 写成三引号是对的但读起来像括号打架（而且守卫的判据要落到这行上，
+        // 正则解析三引号串会把它绕过去）。
+        if (wanted) ",\"logprobs\":null" else ""
 
     private fun usageJson(promptTok: Int, completionTok: Int): String =
         """{"prompt_tokens":$promptTok,"completion_tokens":$completionTok,"total_tokens":${promptTok + completionTok}}"""

@@ -200,6 +200,7 @@ object LlmEngine {
      * @return null=挂载成功；否则为失败原因（用于 UI 直接提示，不静默失败）
      */
     fun startProbe(ctx: android.content.Context): String? {
+        // ⚠ 这里**不得**因 !probeEnabled 提前 return —— 见下方那次「关」的调用。
         return try {
             val dir = java.io.File(ctx.applicationContext.filesDir, "logs")
             if (!dir.exists()) dir.mkdirs()
@@ -210,11 +211,18 @@ object LlmEngine {
             // 注意这一跳失败**不代表取证失败**：native 侧在 JNI_OnLoad 里会自行跑一次
             // 自举（**只记不写**），所以日志里「Kotlin 挂载失败」但 probe-native.log 有
             // `[boot]` 内容是正常组合 —— 那说明崩点就在 Kotlin → native 之间，而不是 native 内部。
-            if (nativeTag == null) return if (probeEnabled) "native 库尚未加载（loadNative 未成功），探针无处挂载" else null
-            // ⚠ 「关」也必须**显式**告知 native。
+            // ⚠ 「关」也必须**显式**告知 native，且这一跳要排在所有提前 return **之前**。
             // 此前 !probeEnabled 时直接 return，native 侧永远收不到那次 on=false 的调用，
             // 于是它只能靠自举（无条件打开）猜 —— 用户在设置页关掉探针，native 照样
             // 全量落盘并把日志 sink 换成空操作。现在开关在这里有**唯一**的事实来源。
+            //
+            // 参数就是 probeEnabled 本人（**不许写死 true**）：写死等于把上面那个故障
+            // 换个位置原样搬回来。native 侧无论 on 真假都会先把 fd 收口，所以这次调用
+            // 是「用户关掉探针」唯一能传达到 native 的时机。
+            //
+            // 代价说清楚：native 库没加载时（nativeTag == null）这次调用也发不出去了 ——
+            // 那种情况下 native 根本没跑起来，没有文件可关，用 logcat 那两行区分即可。
+            if (nativeTag == null) return if (probeEnabled) "native 库尚未加载（loadNative 未成功），探针无处挂载" else null
             probeAttached = nativeProbeInit(dir.absolutePath, probeEnabled)
             if (!probeEnabled) return null
             if (!probeAttached) {
@@ -233,11 +241,16 @@ object LlmEngine {
 
     val probeAttachedNow: Boolean get() = probeAttached
 
-    /** 探针打点：写 native fd，同时镜像进 Kotlin 日志文件（进程没崩时便于一次导出看完）。 */
+    /**
+     * 探针打点：写 native fd，同时镜像进 Kotlin 日志文件（进程没崩时便于一次导出看完）。
+     *
+     * 落盘用 [LogFileStore.appendRaw] 而不是 [LogFileStore.append]：探针模式一律不折叠，
+     * 与 [pushLog] 的探针分支保持同一条口径（否则同一份文件里两套折叠规则打架）。
+     */
     fun probeMark(msg: String) {
         if (!probeEnabled) return
         try { nativeProbeMark(msg) } catch (_: Throwable) {}
-        LogFileStore.append("[probe] $msg")
+        LogFileStore.appendRaw("[probe] $msg")
     }
 
     /** 探针原始文本（native 直写的那份，含信号现场）。 */
@@ -251,9 +264,87 @@ object LlmEngine {
     /** UI 侧日志钩子：EngineActivity 设置后，原生日志同时转发到界面与 ring buffer。 */
     @Volatile var logSink: ((String) -> Unit)? = null
     private val logRing = ArrayDeque<String>()
-    fun recentLogs(): List<String> = synchronized(logRing) { logRing.toList() }
+
+    /**
+     * 日志页的**取数口径**：标签多选的集合 + 任意关键字。两者都是空 = 不过滤。
+     *
+     * 过滤**必须在这一层做**，不能在 `EngineActivity.renderLog` 那 120 行渲染结果上做：
+     * ring 是 2000 行、界面只渲染尾部 120 行，某个标签的行完全可能全部落在窗口之外 ——
+     * 在渲染结果上过滤，用户看到的是**空白页**，而空白页在日志页的语义是"没记日志"。
+     * 在 ring 上过滤时，取的是"整条 ring 里最后 120 条满足条件的行"，判据与用户的理解一致。
+     *
+     * ⚠ **写这两个字段的只有主线程**（`EngineActivity` 的一个入口），所以不变量
+     * "至少有一维在筛"在同一次赋值里就能守住；`@Volatile` 而不是加锁，是因为
+     * 写入方只有主线程、读取方是四个并发 `pushLog` 线程 —— 读到上一轮的值最多让
+     * 某一帧多/少一行，而把它塞进 [logRing] 的临界区只会让日志风暴下的写入多等一次。
+     */
+    @Volatile private var logFilterKeys: Set<String> = emptySet()
+    @Volatile private var logFilterKeyword: String = ""
+
+    /**
+     * 设置日志页的取数口径，**两维一次写完**。
+     *
+     * 为什么坚持在这一个方法里写、不把两个字段直接开放给 UI：关键字与档位是**同一个视图**
+     * 的两维，分两次赋值的那一瞬间存在一个"只有一个维度旧值、另一个维度新值"的口径，
+     * 而且**两维都空**这件事必须被明确处理（= 不过滤）—— 让 UI 自己判断"是不是该两维都置空"
+     * 等于把这套语义复制到第二个地方，第一个改、第二个忘，就会退化成"点了没反应"。
+     */
+    fun setLogFilter(keys: Set<String>, keyword: String) {
+        logFilterKeys = HashSet(keys)
+        logFilterKeyword = keyword
+    }
+
+    /** 当前口径是不是"不过滤"（两维都空）。界面上的解释行要用它决定说不说自己。 */
+    fun logFilterActive(): Boolean = logFilterKeys.isNotEmpty() || logFilterKeyword.isNotEmpty()
+
+    /** 当前口径的档位集合（只读快照，给界面画选中态）。 */
+    fun logFilterKeysNow(): Set<String> = logFilterKeys
+
+    /** 当前口径的关键字（只读快照）。 */
+    fun logFilterKeywordNow(): String = logFilterKeyword
+
+    /**
+     * 日志页的取数：与不过滤时**同一把锁、同一份顺序**，只是先筛后取尾。
+     * 只有渲染日志页该用它 —— 其余用途见 [recentLogsUnfiltered]。
+     */
+    fun recentLogs(): List<String> = synchronized(logRing) {
+        val keys = logFilterKeys
+        val kw = logFilterKeyword
+        if (keys.isEmpty() && kw.isEmpty()) logRing.toList()
+        else logRing.filter {
+            LogFileStore.LogFilter.matches(keys, it) &&
+                LogFileStore.LogFilter.keywordMatches(kw, it)
+        }
+    }
+
+    /**
+     * **不受过滤档位影响**的全量取数，只给"导出"与"崩溃现场"用。
+     *
+     * 为什么必须与 [recentLogs] 分开：过滤是**界面上的一个视图开关**，不是数据的属性。
+     * 让它渗进导出，用户点「导出本次」拿到的就是"当前那一档的几行" ——
+     * 而他导出日志的场景恰恰是"页面看不全、要拿给别人看"，那时他需要的是**全部**；
+     * 渗进崩溃现场更坏：`crash_last.txt` 会在某个档位恰好没有命中时变成空文件，
+     * 而崩溃现场**只有这一次机会**。两个方向都不报错，只是第二次想导出时已经没有现场了。
+     */
+    fun recentLogsUnfiltered(): List<String> = synchronized(logRing) { logRing.toList() }
+
+    /**
+     * ring 里的**原始**行数（不受过滤影响）。
+     *
+     * 与 [recentLogs]`.size`（过滤后的命中数）必须分开：日志页的空白页提示要同时说
+     * "这一档没有命中"和"整段日志其实有多少行"。只给命中数的话，用户没法区分
+     * "这档真没有"与"ring 本来就空"—— 而这两种情况该做的事完全不同。
+     */
+    fun ringSize(): Int = synchronized(logRing) { logRing.size }
+
+    /**
+     * 清空**必须同时清过滤条件**（两维都清）：只清行不清条件时，用户下次进日志页看到的是
+     * "上次选的筛选还在、但一行都没有" —— 与"日志坏了"不可区分，
+     * 而这正是本仓库反复出现的「数据在、界面看不见」同族故障。
+     */
     fun clearLogs() = synchronized(logRing) {
         logRing.clear(); ringBase = null; ringRep = 0
+        logFilterKeys = emptySet(); logFilterKeyword = ""
     }
 
     private var ringBase: String? = null
@@ -271,16 +362,39 @@ object LlmEngine {
      * 卡死看门狗的计时基准：最近一次"确实有进展"的时刻（一条非噪音日志，
      * 或一步解码）。native 线程卡在 DSP 等回包时，Kotlin 侧的 stopRequested / abort 都
      * 够不着它，只能靠外部计时把「卡死」变成可判定的事实。
+     *
+     * **必须用 [System.nanoTime]（单调钟）**：这只被用作"两个时刻相减"的差，
+     * 而不是"某时某刻"的时间戳。`currentTimeMillis` 受 NTP 校准 / 用户改表影响会跳变：
+     * 前跳 → `now - lastProgressAt` 瞬间巨大 → 看门狗误报 native 卡死（状态栏引导用户
+     * 强杀，丢会话）；后跳 → 差值可能为负 → `idle >= HANG_SEC` 恒假 → 真实卡死永不上报。
+     * 差值的两个端点必须取自同一口单调钟，改一处就够不着另一处（读方在 EngineActivity）。
      */
     @Volatile var lastProgressAt: Long = 0L
 
     private fun pushLog(t: String) {
         // 探针开启时**不过滤噪音、不折叠重复**：崩溃前最后那几条恰恰经常是
-        // llama 逐 token 打的 "."，折叠会把它们挤掉。全量落 native 探针文件。
+        // llama 逐 token 打的 "."，折叠会把它们挤掉。
+        //
+        // 三条落点**同时**保留（此前只落 native 探针文件，会话文件整段缺失）：
+        //   ① native 探针文件 —— 经 nativeProbeMark 直写 fd，崩瞬间也不丢；
+        //   ② Kotlin 会话文件 —— 经 LogFileStore.appendRaw 落盘（**不折叠**），
+        //      这样"导出崩溃探针"里"Kotlin 侧本次会话全文"那段不再是空的；
+        //   ③ 内存 ring（放宽到 PROBE_RING），日志页能看到。
+        // stderr 那份也走这里（StderrPump → uiLog → pushLog），于是 ggml_abort
+        // 那类"只往 fd 2 打"的遗言同样会落进会话文件 —— 此前它在探针模式下丢失。
         if (probeEnabled) {
-            lastProgressAt = System.currentTimeMillis()
+            // ⚠ 探针模式**不得推新 lastProgressAt**（这里此前正是这么写的）。
+            //
+            // 探针开着时，llama 逐 token 往 stderr 打 "." 这类回调**每一行**都会
+            // 独立"确认有进展"，于是卡死看门狗（看着 lastProgressAt）在取证模式下
+            // 永久静默 —— "服务没死但僵着"这个已知故障，**只在你开探针准备排查它时
+            // 变得不可检测**，方向恰好是反的。
+            //
+            // 探针的职责是"把现场写下来"，不是"报告进展"。真正证明有进展的是
+            // 下面 `decode`/`onToken` 那两处显式打点（不在本函数里），
+            // 与探针开不开无关。
             try { nativeProbeMark(t) } catch (_: Throwable) {}
-            // 同时也进内存 ring，UI 日志页能看到（不再落 Kotlin 会话文件，避免双份）
+            LogFileStore.appendRaw(t)
             synchronized(logRing) {
                 logRing.addLast(t)
                 while (logRing.size > PROBE_RING) logRing.removeFirst()
@@ -294,7 +408,11 @@ object LlmEngine {
             LogFileStore.noteNoise(t)
             return
         }
-        lastProgressAt = System.currentTimeMillis()
+        // ⚠ 必须是**单调钟**，且与读方（`hangWatch` 的 `System.nanoTime() - lastProgressAt`）
+        // 同口。这里此前写的是 `System.currentTimeMillis()` —— 单位差 1e6 倍，
+        // 两者相减永远是个巨大负数，于是「连续 N 秒无进展」那条告警**永远触发不了**
+        // （真实卡死被静音）。见 run_monotonic_clock_guard.sh 的 G1。
+        lastProgressAt = System.nanoTime()
         LogFileStore.flushNoise()
         // 连续重复行折叠成 "xxx ×N"。生成期 llama 会逐 token 往 stderr 打 "."，
         // 一次回答就是上百行，既占满 300 行的 ring（把关键行挤出窗口），
@@ -337,6 +455,33 @@ object LlmEngine {
     fun uiLog(t: String) {
         Log.i(TAG, t)
         pushLog(t)
+        try { logSink?.invoke(t) } catch (_: Exception) {}
+    }
+
+    /**
+     * **进度回执**：一条日志，但**不落盘、不进日志 ring**，只在 UI 上活到下一句覆盖它。
+     *
+     * ═══════════════════════════════════════════════════════════════════════
+     * 为什么必须有这一个入口（而不是继续用 [uiLog]）
+     * ═══════════════════════════════════════════════════════════════════════
+     * 逐条编码那种循环按**块**说话：一份 3 MB 的整篇文档切出上万块，
+     * 一趟建库就是上万行日志。而 [uiLog] 的去向有四个 ——
+     * `pushLog`（ring buffer + 通知 UI）→ `logSink`（日志页重绘）→ **落盘**
+     * （`LogFileStore` 轮转）→ `logcat`。上万行同时砸进去，主线程排在
+     * RingBuffer 的监听器上做排版，而用户看到的是**整个界面卡住、点一下就闪退**
+     *（用户报的原文）。
+     *
+     * 所以这一档的语义**刻意**定成"说进度"而不是"留证据"：
+     *   · 不进 ring：日志页里不留一万行噪声（真正要复盘的"开始/结束/失败"走 uiLog）；
+     *   · 不落盘、不进 logcat：它是**屏幕上的一个数字**，不是证据；
+     *   · 但它**照样穿过 logSink** —— 那一层由 UI 自己用 `post` 做节流
+     *     （见 `EngineActivity` 的进度行），而不是在这里 sleep 或丢帧。
+     *
+     * ⚠ 这一条**不是**"少记日志"：该留的判据（切了多少块、多少条失败、结论是什么）
+     * 全在 [uiLog] 那一档里，一条不少。省掉的只是"第 3741 块好了"这种只在
+     * 屏幕上活一秒的信息。
+     */
+    fun uiProgress(t: String) {
         try { logSink?.invoke(t) } catch (_: Exception) {}
     }
 
@@ -541,6 +686,15 @@ object LlmEngine {
         }
         val p = if (a != null && a.size >= 4 && a[0].isNotEmpty() && a[1] != "-1")
             GgufProbe(a[0], a[1].toIntOrNull() ?: -1, a[2] == "1", a[3]) else null
+        // "读不出" 必须出声：此前它只体现在"日志里少一行 [HTP判定]"，
+        // 与"这次根本没调预读"完全同形。a[3] 是 native 给的**原因**
+        // （文件头检查未通过 / header 读取失败 / 路径为空…），如实转述。
+        // Issue #238 之后这一点更重要：native 的前置检查正是为了**不**把
+        // 读不了的文件交给库去解析，所以"没读出来"是设计内结果，不该静默。
+        if (p == null) {
+            val why = a?.getOrNull(3)?.takeIf { it.isNotEmpty() } ?: "未返回原因"
+            uiLog("[HTP判定] 预读不可用（$why），回退按文件名判断")
+        }
         probeId = id
         probeVal = p
         return p
@@ -833,11 +987,36 @@ object LlmEngine {
             uiLog("[HTP配额] NPU层份额=" + (if (sharePct < 0) "待实测" else "$sharePct%") +
                     " ｜ HTP在池下标=#" + HtpProbe.htpPoolIndex() +
                     (if (devPool.isEmpty()) "" else " ｜ $devPool"))
+        // 模型档案单独一行，与上面的读数**分开**：上面那两行描述"这一次加载怎么算的"，
+        // 这一行描述"加载进来的到底是什么"。混在一行会让两种口径在同一条日志里打架。
+        //
+        // 只在**加载成功**时报：失败时 S.model 已清空，档案必然读不到，
+        // 报一行空的 `[模型档案]` 会被读成"这个模型没有档案" —— 而实际是"这次没加载成"。
+        // 另外它**不算是错误**：档案是纯只读的装饰，读不到就不报，绝不因此让加载失败。
+        if (err == null) {
+            val prof = modelProfile()
+            if (prof.available) uiLog("${LogFileStore.TAG_PROFILE} ${prof.describe()}")
+        }
         if (err == null) currentPath = path
         return err
     }
 
     fun modelDesc(): String = nativeModelDesc()
+
+    /**
+     * 模型档案：库**真读出来的**那几个数（权重字节 / 参数个数 / 上下文上限 / 层数 /
+     * 词表 / dtype / 元数据条数），供 `/v1/models/{id}` 与 `[模型档案]` 日志行。
+     *
+     * 为什么要有它：App 里此前只有一个 `modelDesc()`（库自己拼的 256 字节短描述），
+     * 而 `ModelStore.Row.bytes` 是**文件字节** —— 「文件多大」「权重多大」「多少个参数」
+     * 「上下文上限多少」是**四件不同的事**，本仓库踩过的坑几乎全是"把两个数当成一回事"。
+     *
+     * 每次调用都重读 native（`/v1/models` 是低频轮询端点，不做缓存）：
+     * 缓存就要回答"换模型时怎么失效"，而失效判据恰好是这类静默 bug 的温床。
+     */
+    fun modelProfile(): ModelProfile = ModelProfile.fromNative(
+        runCatching { nativeModelMeta() }.getOrNull())
+
     fun contextSize(): Int = nativeCtxSize()
     fun contextUsed(): Int = nativeCtxUsed()
 
@@ -852,6 +1031,20 @@ object LlmEngine {
      */
     val lastReuseTokens: Int get() = runCatching { nativeKvCacheStats()[0] }.getOrDefault(0)
     val lastPrefillTokens: Int get() = runCatching { nativeKvCacheStats()[1] }.getOrDefault(0)
+
+    /**
+     * 上一轮的**逐 token 最长公共前缀**长度（不设门槛）。与 [lastReuseTokens]
+     * **必须成对读** —— 这是第 5 步给 KV 复用加的可观测面。
+     *
+     * 只有 `reuse` 时，"没命中"是个笼统结论，它至少有两种成因、处置相反：
+     *   · `lastLcpTokens` 很大（如 300）却没命中 -> 是**门槛/容量**拦下的
+     *     （prompt 已达 n_ctx，或 `total-1 < 16`），属于"差一点"；
+     *   · `lastLcpTokens` 很小（如 2）-> 两轮 prompt **真的不一样** ——
+     *     开了知识库时检索结果每轮都变，分叉点就落在最前面的 system 段里，
+     *     这是**注入位置**的问题（第 4 步），调参没用。
+     * 只报 `reuse=0` 时这两种在日志与 /health 上逐字相同，用户只能猜。
+     */
+    val lastLcpTokens: Int get() = runCatching { nativeKvCacheStats()[3] }.getOrDefault(0)
 
     /**
      * 已经跑完 prefill 的轮次数。与 [kvCacheValid] **必须成对读**：
@@ -1025,7 +1218,8 @@ object LlmEngine {
                    responseFormat: ResponseFormat = ResponseFormat.None,
                    generationPrompt: String? = null,
                    chatTemplateOverride: String? = null,
-                   thinkingOn: Boolean = true): Boolean =
+                   thinkingOn: Boolean = true,
+                   biasIds: IntArray? = null, biasVals: FloatArray? = null): Boolean =
         nativeNewSampler(temp, topP, minP, topK, repPenalty, penaltyN, freqPenalty, presencePenalty, seed,
             // 空列表传 null（而不是空数组）：native 侧据此判断"要不要挂 stop 采样器"，
             // 挂一个什么都不匹配的采样器只是白搭一次链上调用。
@@ -1041,7 +1235,11 @@ object LlmEngine {
             chatTemplateOverride,
             // 思考开关：**必须与渲染侧同一个值**，理由见 nativeNewSampler 的说明与
             // gbnf_from_json_schema 的判据 ④。回落 ChatML 那条路也把它带下去。
-            thinkingOn)
+            thinkingOn,
+            // logit_bias 的平行数组。两者同源（[ProtocolFields.biasIds]/[biasValues]
+            // 来自同一个 `List<Bias>`），所以长度天然相等 —— native 侧仍会再判一次
+            // 并在不等时整条不挂（守 "宁可不挂，也不要一半"）。
+            biasIds, biasVals)
 
     /**
      * 开始一轮生成：清 KV -> tokenize(含 BOS) -> 分块 prefill。
@@ -1083,7 +1281,11 @@ object LlmEngine {
             uiLog("${LogFileStore.TAG_TIME} KV 前缀复用：复用 %d tok / 新算 %d tok（共 %d）".format(
                     reused, newTok, genPromptTok))
         } else {
-            uiLog("${LogFileStore.TAG_TIME} KV 前缀复用：未命中，全量 prefill %d tok".format(newTok))
+            // 未命中时把**公共前缀**一起报出来（第 5 步）：没有它，「差一点没命中」
+            // 与「两轮 prompt 真不一样」在日志上逐字相同，用户只能猜是门槛拦的
+            // 还是注入位置的问题（开着知识库时检索结果每轮都变，分叉点在最前面）。
+            uiLog("${LogFileStore.TAG_TIME} KV 前缀复用：未命中（公共前缀 %d tok / 门槛 16），全量 prefill %d tok".format(
+                    lastLcpTokens, newTok))
         }
         return null
     }
@@ -1091,7 +1293,7 @@ object LlmEngine {
     /** 采样一步并返回一个完整 UTF-8 片段；null=结束。 */
     fun step(): String? {
         val s = nativeStep()
-        if (s != null) lastProgressAt = System.currentTimeMillis()
+        if (s != null) lastProgressAt = System.nanoTime()
         if (genActive) { if (s != null) genTok++ else finishGeneration() }
         return s
     }
@@ -1145,20 +1347,24 @@ object LlmEngine {
     }
 
     /**
-     * 把"已 free、但还没归还内核的匿名页"补一次 `madvise(MADV_DONTNEED)`，并报前后 RSS。
+     * 让分配器把"已 free、但还没归还内核的匿名页"交还，并报前后 RSS。
      *
      * 为什么必须有这一脚：**CPU 侧的默认分配器会缓存刚释放的堆段**（glibc 的
      * `M_TRIM_THRESHOLD`/`M_MMAP_THRESHOLD`、scudo 的 size class 缓存，Android 上
      * 是后者）。它的直接后果是 —— repack 的匿名拷贝、KV、compute buffer 虽然都
      * `free` 了，**VmRSS 照样不降**。于是应用列表里显示的占用一直很高，
      * 看起来像"repack 根本没省"，而实际省下来的只是"还没归还"。
-     * 只有 `malloc_trim(0)`（把空闲堆段还给内核）或整进程重启能把这段要回来。
+     *
+     * 只有让**分配器自己**动手（`malloc_trim(0)`）或整进程重启能把这段要回来。
+     * ⚠ 旧版在 native 侧绕过分配器、直接对"最大的匿名段"补 `madvise(DONTNEED)`，
+     * **那条路会抹掉活对象并把进程 abort 掉**（ISSUE #274 的闪退根因），已移除 ——
+     * 详见 native `nativeReclaimReleasedHeap` 上方的注释。bionic 没有 `malloc_trim`
+     * 等价接口，那边现在**什么都不做**：宁可这一脚不省内存，也不做一件可能崩的事。
      *
      * 判据（与 `[mmap释放]` 同一套写法，**自证**）：前后各读一次 VmRSS 打进日志。
      *
      * 为什么只在**卸载后空闲**这一刻做，不在加载后做：`malloc_trim` 会把页还掉，
-     * 下一次分配又要重新缺页（代价是加载/首轮推理变慢）；而 `madvise(MADV_DONTNEED)`
-     * 对**已释放**的块没有副作用（它们本来就不该被读）。空闲时调用是净收益。
+     * 下一次分配又要重新缺页（代价是加载/首轮推理变慢）。空闲时调用是净收益。
      *
      * 为什么**必须**在 native 里做而不是 Kotlin：判据是"运行期拿到的 `mallinfo`/RSS
      * 真实变化"，而且是 native 自己 malloc 出来的匿名页；Kotlin 那侧的 System/API
@@ -1172,6 +1378,2265 @@ object LlmEngine {
         val log = runCatching { nativeReclaimReleasedHeap() }.getOrNull() ?: return
         if (log.isNotEmpty()) uiLog(log)
     }
+
+    // ══════════════════════════════════════════════════════════════════════════
+    //  嵌入（embedding）模型 —— 双常驻：与对话模型**同时**驻留
+    // ══════════════════════════════════════════════════════════════════════════
+    //
+    // 为什么单独一把锁：嵌入路径与生成路径**不共用** native 状态（各持一份
+    // Session，见 native 侧 `S` / `E`），所以它们不需要互相等。用 `loadLock`
+    // 会让"检索一条"排在"生成一整轮"后面 —— 那正是双常驻要消掉的等待。
+    //
+    // ⚠ 但仍**必须**有自己的锁：同一份嵌入 Session 上的两次加载/卸载交错，
+    // 与 0.9.70 那次"两个 loadModel 同时动 native 状态"是同一个病。
+    private val embedLock = Any()
+
+    /** 嵌入模型是否已驻留（与对话模型无关）。 */
+    val hasEmbedModel: Boolean
+        get() = try { nativeHasEmbedModel() } catch (t: Throwable) { false }
+
+    /** 嵌入向量维度；0 = 没有可用嵌入模型。供索引指纹与检索校验用。 */
+    val embedDim: Int
+        get() = try { nativeEmbedDim() } catch (t: Throwable) { 0 }
+
+    /**
+     * 输出侧维度（`llama_model_n_embd_out`）；0 = 取不到。
+     *
+     * 与 [embedDim] 分开报的理由：库按输出侧维度分配 output buffer，而读取按
+     * `n_embd` 步长走 —— 两者不等时"读一行"是未定义行为（读到相邻 buffer，
+     * 含未初始化的 NaN）。症状正是用户报的"某些条归一化失败、且时好时坏"。
+     * 只报一个维度时，这两个数的**差值**（真正的根因）根本无从看见。
+     */
+    val embedOutDim: Int
+        get() = try { nativeEmbedOutDim() } catch (t: Throwable) { 0 }
+
+    /** 嵌入模型声明的池化类型：0=NONE / 1=MEAN / 2=CLS / 3=LAST / -1=取不到。 */
+    val embedPooling: Int
+        get() = try { nativeEmbedPooling() } catch (t: Throwable) { -1 }
+
+    /**
+     * 最近一次嵌入失败的**可归因**详情（解析自 native 的固定格式串）。
+     *
+     * 为什么把它带出来而不是只留日志：用户看不到 logcat，而 UI 上那句
+     * "检查嵌入模型与内存"在**两个不同根因**下都成立（池化取错 / 维度不匹配），
+     * 等于没有排查方向。同时"哪一条失败"从来没有被记下来 —— 100 条坏 3 条时
+     * 只能二分重试，而失败详情在失败当场才拿得到，事后回不来。
+     */
+    data class EmbedFail(
+        val reason: String,
+        val nTokens: Int,
+        val nEmbd: Int,
+        val nEmbdOut: Int,
+        val pooling: Int,
+        val norm: Double
+    ) {
+        /**
+         * 给用户看的一句话（含实值，而不是无差别的那句"检查内存"）。
+         *
+         * ⚠ 两处**不能只有"可能是"**：
+         *   · `zero_norm` 在多条上都出现时，它**不是**"可能不符"，而是**确定不符** ——
+         *     `pooling=$poolingText` 已经把话说到明处（CLS 却按 LAST 取，范数必然下溢）。
+         *     说"可能"会让用户去查内存、换模型，方向是错的。
+         *   · `decode_failed` 必须带上池化方式：库里 `llama_decode` 失败的一个**确定**
+         *     来源就是"CLS 却只把部分 token 标成 output"（库的前置校验直接拒）。
+         *     不带 pooling 时它与"内存不够"长得一模一样。
+         * 实值（token 数 / 维度 / 池化）全部打出来 —— 用户拿到的必须是**信息**。
+         */
+        fun describe(): String = when (reason) {
+            "dim_mismatch" -> "输出维度不匹配（n_embd=$nEmbd, n_embd_out=$nEmbdOut）—— 该模型与当前读取方式不兼容"
+            "zero_norm" -> "向量范数为 $norm（零向量/下溢）；池化方式 ${poolingText()} 与取值位置不符 —— 这一条无法编码"
+            "no_output" -> "库没有留下该 token 的输出（embeddings 未生效或库版本不同）；pooling=$pooling"
+            "decode_failed" -> "前向计算失败（n_tokens=$nTokens, pooling=${poolingText()}）—— 该池化方式的前置条件不满足"
+            "pooling_contract" -> "池化契约不满足（pooling=${poolingText()}，n_tokens=$nTokens）—— 填充逻辑的 bug，不是模型问题"
+            "truncated_empty" -> "截断后没有可用 token"
+            "bad_input" -> "输入无法编码（空文本 / tokenize 失败）"
+            else -> "编码失败（$reason）"
+        }
+
+        /** 池化方式的**原值 + 人话**：光看 `2` 谁也不知道那是 CLS。 */
+        fun poolingText(): String = "$pooling（${
+            when (pooling) {
+                0 -> "NONE/last"; 1 -> "MEAN"; 2 -> "CLS"; 3 -> "LAST"; -1 -> "UNSPECIFIED"
+                else -> "未知"
+            }
+        }）"
+    }
+
+    /**
+     * 解析 native 的失败详情串（`reason|n_tokens|n_embd|n_embd_out|pooling|norm`）。
+     * 空串 / 格式不符返回 null —— **不猜**：归因错了比没有归因更糟。
+     */
+    private fun parseEmbedFailure(raw: String): EmbedFail? {
+        if (raw.isEmpty()) return null
+        val f = raw.split('|')
+        if (f.size != 6) return null
+        return try {
+            EmbedFail(f[0], f[1].toInt(), f[2].toInt(), f[3].toInt(), f[4].toInt(), f[5].toDouble())
+        } catch (t: Throwable) { null }
+    }
+
+    /** 取走"最近一次嵌入失败"的详情；没失败返回 null。 */
+    fun lastEmbedFailure(): EmbedFail? =
+        try { parseEmbedFailure(nativeEmbedLastFailure()) } catch (t: Throwable) { null }
+
+    /**
+     * 嵌入模型的短描述；空串 = 没有已驻留的嵌入模型。
+     *
+     * 为什么要有它：`/health` 需要能**分开**报出"对话那份"与"嵌入那份"分别是什么。
+     * 只有 [modelDesc] 时，双常驻下两份读数是同一个字符串 —— 于是"嵌入到底装上没有"
+     * 在探活里完全看不出来，用户只能靠翻日志猜。
+     */
+    fun embedModelDesc(): String =
+        try { nativeEmbedModelDesc() } catch (t: Throwable) { "" }
+
+    /**
+     * 本机可用的**性能核数** —— 建库/嵌入这类"纯 CPU 密集"工作的默认线程数。
+     *
+     * ═══════════════════════════════════════════════════════════════════════
+     * 为什么要有这个函数（而不是继续写死 4）
+     * ═══════════════════════════════════════════════════════════════════════
+     * 用户报的现象：8e（骁龙 8 Elite，8 核）手机上建索引 **1 秒 1.3 条**，
+     * 7000 条约等于两小时。而 `loadEmbedModel` 的默认值写死 `nThreads = 4`，
+     * 且 UI 侧调它时**不传线程数** —— 于是那台 8 核机器上有一半核心全程闲着，
+     * 而屏幕上唯一的读数是一句走得极慢的进度。
+     *
+     * 这不是"参数没调好"，是**默认值与设备无关**：同一个 4 在 4 核机器上是对的、
+     * 在 8 核旗舰上浪费一半、在 6 核中端机上也不对。写死的默认值只能对一种机器正确。
+     *
+     * ⚠ 取的是 `availableProcessors()`（**含大小核在内**），不是
+     * "只挑性能核"。理由：本仓库没有可靠的 Android 大小核判据
+     * （`/sys/devices/system/cpu/cpuN/cpu_capacity` 不是所有 ROM 都给，且
+     *  `taskset` 亲和性在部分机型上会反而把线程全排到小核）。而 llama.cpp
+     * 自己会做负载均衡 —— 给多了顶多是"小核拖一点后腿"，
+     * 给少了是**确定的、线性的一半算力白扔**。两害相权取其小。
+     *
+     * ⚠ 上限 8：线程再往上对内存带宽已经饱和（嵌入是逐条的小前向，
+     * 每次都要重读权重），多线程只剩同步开销。下限 2：单线程会让本来能跑的
+     * 机器慢到不可用。
+     */
+    fun defaultThreads(): Int = try {
+        Runtime.getRuntime().availableProcessors().coerceIn(2, 8)
+    } catch (_: Throwable) {
+        4
+    }
+
+    /**
+     * 加载嵌入模型。**不碰**对话模型（双常驻的契约）。
+     *
+     * 返回错误信息，null=成功。与 [loadModel] 同一口径：不抛异常给调用方，
+     * 因为它在后台线程上被调，未捕获的异常会闪退整机。
+     *
+     * `nCtx` 是**每条文本**的预算（native 侧再乘 [kEmbedBatchRows] 得到 ctx 总量，
+     * 并把总量钳到 native 的 `kEmbedMaxCtx`）。它同时决定三件事：
+     *   · 每条的截断点（`n_ctx_seq`）—— 块比它长就截；
+     *   · 两道门（`n_batch` / `n_ubatch`）—— native 侧把它们设成同一个总量，
+     *     所以"8 条满长能不能一次装下"由它决定（见 native `kEmbedGate` 那段）；
+     *   · `embeddings=true` 时常驻的 KV / output / compute buffer —— **内存主项**。
+     *
+     * 默认来自 [kEmbedCtxDefault]（512）：那是"既够一条块的、又不白占内存"的档。
+     * 用户把它调大（例如 1024）时，每条预算、两道门、内存占用**一起**变大 ——
+     * 这正是"内存占用为啥高了"的答案，所以它必须是一个能看见、能改的输入框，
+     * 而不是藏在 native 里的常量（见 [kEmbedCtxMax] 的说明）。
+     *
+     * nThreads 默认走 [defaultThreads]（本机核数，钳 2~8）—— 见那里的长注释。
+     * ⚠ 建库耗时**直接乘在这个数上**：它是逐条前向，线程数就是吞吐的线性因子。
+     * UI 那边（`EngineActivity.doLoadEmbed`）传的是用户在设置页填的值，
+     * 所以这里那个默认值只在"调用方没给"时才生效。
+     */
+    fun loadEmbedModel(
+        path: String,
+        nCtx: Int = 0,
+        nThreads: Int = defaultThreads(),
+        useMmap: Boolean = true
+    ): String? = synchronized(embedLock) {
+        if (!ensureReady()) {
+            return "引擎初始化失败：${lastInitError ?: "native 库尚未加载（无可用 Context）"}"
+        }
+        embedPath = null
+        val ok = try {
+            nativeLoadEmbedModel(path, nCtx, nThreads, useMmap)
+        } catch (t: Throwable) {
+            uiLog("[嵌入] 加载失败：${t.javaClass.simpleName}: ${t.message}")
+            false
+        }
+        if (!ok) return "嵌入模型加载失败（检查 GGUF 完整性 / ctx 是否超出可用内存）"
+        embedPath = path
+        // 批级读数的词典是"这个模型在这台机器上的合批命中率"（见 [EmbedBatchStats.reset] 的说明）——
+        // 换模型必须清零，否则从"合批型"换到"回落型"时，用户看到的仍是上一个
+        // 模型的命中率 —— 那个数字**看着正常**，只是描述的不是眼前这个模型。
+        EmbedBatchStats.reset()
+        // 逐位比对的结论同理（见 [EmbedParity.Last.reset] 的说明）：它描述的是
+        // "这个模型"的批行为，换模型后留着上一个模型的结论会被读成眼前这个的。
+        EmbedParity.Last.reset()
+        // 检索对照的结论同理（它描述的是"这个模型换批大小后答案稳不稳"）——
+        // 换模型后留着上一条会被读成眼前这个模型的（同一个病）。
+        EmbedRetrieveParity.Last.reset()
+        uiLog("[嵌入] 已加载：${path.substringAfterLast('/')}（n_embd=${embedDim}，与对话模型同时驻留）")
+        null
+    }
+
+    /** 卸载嵌入模型（只拆嵌入那一份，对话模型不受影响）。 */
+    fun unloadEmbedModel() = synchronized(embedLock) {
+        try { nativeUnloadEmbedModel() } catch (_: Throwable) {}
+        embedPath = null
+    }
+
+    /** 当前驻留的嵌入模型路径；null=未加载。 */
+    @Volatile var embedPath: String? = null
+        private set
+
+    /**
+     * 嵌入模型指纹的**唯一取值处**（建库与检索都走它）。
+     *
+     * ═══════════════════════════════════════════════════════════════════════
+     * 为什么必须"只有一处"
+     * ═══════════════════════════════════════════════════════════════════════
+     * 用户报的现象：**建库成功，检索时说"嵌入模型或切块参数与建库时不同"**。
+     * 这类 bug 的形态只有一种 —— 建库时算出的指纹与检索时算出的指纹**不是同一份**：
+     *
+     *   · `embedPath` 两处拼法不同（一个规范化、一个是原样）；
+     *   · 一处用 `embedDim`、另一处用 `embedOutDim` 或反了；
+     *   · 池化类型 / 模型 stat 只在一处取过（另一处漏了 → 一个写值、一个写空串）。
+     *
+     * 而它们的**症状完全一样**：界面说"参数变了"，用户去换模型（本来没问题），
+     * 或者反复重建（重建完还是那句）—— 因为差异不在值，在**取值的路**。
+     * 所以这里把"模型那一半"的取值收成**一个函数**，两处（建库 / 检索）都调它。
+     * 判据正面钉住"全仓 `FpInput` 的构造点恰好只有这一个函数"
+     * （`tools/rag_index/check_fp_wiring.py single-source`）。
+     *
+     * ⚠ [ChunkParams] 由调用方传入而不是在这里取默认值：建库时用的是**用户传进来
+     * 的那一份**（可能有非默认值），检索时用的是默认值 —— 两边都从同一个入口取
+     * 才不会再分岔（[buildIndex] 把它透传下来）。
+     *
+     * `null` 的字段 = **不知道**（`.txt_embed` 那份手写配置没有模型元数据），
+     * 见 [RagIndexStore.FpInput] —— 不猜、也不写哨兵值。
+     */
+    private fun embedFpInput(cp: RagIndexStore.ChunkParams,
+                             embedBatch: Int): RagIndexStore.FpInput? {
+        val path = embedPath ?: return null
+        val stat = RagIndexStore.statModel(path) ?: return null
+        val (bytes, mtime) = stat
+        // 维度：**同一处**取，且取的就是实际读取向量用的那个（`n_embd`）。
+        // 与"模型声明的 n_embd_out"分开报（后者只做归因，不进判据的 dim 那一格），
+        // 免得两个数在名字上分不清 —— 见 FpInput.embedOutDim 的说明。
+        val dim = embedDim
+        if (dim <= 0) return null
+        return RagIndexStore.FpInput(
+            embedPath = path,
+            modelBytes = bytes,
+            modelMtime = mtime,
+            dim = dim,
+            cp = cp,
+            embedBytes = bytes,
+            embedMtime = mtime,
+            pooling = embedPooling,
+            embedOutDim = embedOutDim,
+            // 合批每批条数：由调用方传进来（建库用"实际跑的那个" ——
+            // 已经被 [kEmbedBatchLimit] 钳过；检索用"当前配置的那个"）。两处
+            // 各取一遍的话，"建库时跑 8、检索时算成 1"会让指纹**永远不匹配**
+            // （= 每次打开都在重建，只是慢，所以没人会去查）。
+            embedBatch = embedBatch
+        )
+    }
+
+    /**
+     * 把一条文本编码成**已归一化**的向量；返回 null = 这一条没有可用向量
+     * （空文本 / 没加载嵌入模型 / 归一化失败）。
+     *
+     * 不抛异常：调用方（索引构建、检索）在后台线程上跑，未捕获会闪退；
+     * 而且"这一条失败"本来就是正常路径（空段落、超长截断后为空），
+     * 不该让整次索引构建挂掉。
+     */
+    fun embed(text: String): FloatArray? = synchronized(embedLock) {
+        try {
+            nativeEmbed(text) ?: run {
+                // 失败时把 native 的结构化详情翻译成一句**带实值**的话 ——
+                // 原文 "归一化失败（零范数/NaN）" 在"池化取错"与"维度不匹配"两个
+                // 根因下都会出现，用户据此只能猜到"内存/模型坏了"，方向是错的。
+                lastEmbedFailure()?.let { uiLog("[嵌入] 这一条失败：${it.describe()}") }
+                null
+            }
+        } catch (t: Throwable) {
+            uiLog("[嵌入] 编码失败：${t.javaClass.simpleName}: ${t.message}")
+            null
+        }
+    }
+
+    /**
+     * 合批编码的结果（ISSUE #269 的另一半）。
+     *
+     * 为什么要一个专门的类型，而不是"`Array<FloatArray?>` 里 null 表示失败"：
+     * 合批的**整批不可用**（回落逐条）与**某几条失败**是两件完全不同的事，
+     * 处置也相反 ——
+     *   · 整批不可用 -> 调用方**回落逐条**（那才是唯一能归因的路）；
+     *   · 某几条失败 -> 调用方**照收其余几条**，把坏的那几条正文留下、标记需重建。
+     * 用一个"null 既表示整批失败又表示某条失败"的容器，这两件事在调用点
+     * 长得一模一样，而它们的正确处置是相反的 —— 那种情况下写对是运气。
+     */
+    sealed class BatchEmbed {
+        /** 整批不可用（维度不匹配 / 该池化档不合批 / 批过大 / decode 失败 / 全批 tokenize 不出）。 */
+        object Unavailable : BatchEmbed()
+
+        /**
+         * 批跑完了。`vectors[i]` 与输入的 `i` 一一对应；失败的那几条是 `null`
+         * （**不会**是零向量 —— 零向量在这里没有区分能力，见 [embedBatch] 的说明）。
+         */
+        class Ok(val vectors: List<FloatArray?>) : BatchEmbed()
+    }
+
+    /**
+     * 把 n 条文本**一次前向**编码（ISSUE #269 的另一半，PR #273 明确没走的那条）。
+     *
+     * ══════════════════════════════════════════════════════════════════════════
+     * 为什么它必须存在：每条一次 `llama_decode` 的固定开销与 token 数**无关**
+     * ══════════════════════════════════════════════════════════════════════════
+     * PR #273 拿回来的是"线程数按本机核数"（多核那一份算力）。而流水线本身
+     * 仍是**一条一次前向**：每次 decode 都要建图、分配、调度、同步 ——
+     * 在 400 字（≈300 token）这种小条目上，这份固定开销占了大头。
+     * 合批就是把这 n 份开销压成一份。
+     *
+     * 返回 [BatchEmbed.Unavailable] 时调用方**必须回落逐条**（不是"这一批全失败"）：
+     * 单条路径有完整的失败归因（`lastEmbedFailure`），合批这一层的失败信息量
+     * 少得多，把它当成"全批失败"会让用户看到"一批一批地坏"，而真相只是
+     * "这批不适合合批"。
+     *
+     * `dim` 不在这里取，由调用方传：它必须与**落盘时**写进索引头的那个数
+     * 同一个值（`buildIndex` 里已经有一个 `dim`），这里再取一次就有分岔的余地。
+     */
+    fun embedBatch(texts: List<String>, dim: Int): BatchEmbed = synchronized(embedLock) {
+        if (texts.isEmpty() || dim <= 0) return@synchronized BatchEmbed.Unavailable
+        try {
+            val flat = nativeEmbedBatch(texts.toTypedArray()) ?: return@synchronized BatchEmbed.Unavailable
+            // ⚠ 长度必须是**严格的** `texts.size * dim`：写了坏条目也是这个长度
+            //（它的那一段是全零，见 native 侧）。长度对不上说明协议碎了，
+            // 这时候**回落逐条**而不是"按能读多少读多少" —— 后者会让向量与正文
+            // 整体错位，而错位不报错。
+            if (flat.size != texts.size * dim) {
+                uiLog("[嵌入] 合批返回长度不对（${flat.size} != ${texts.size} * $dim），回落逐条")
+                return@synchronized BatchEmbed.Unavailable
+            }
+            val failed = parseBatchFailed(nativeEmbedBatchFailed())
+            val out = ArrayList<FloatArray?>(texts.size)
+            for (i in texts.indices) {
+                val v = FloatArray(dim)
+                System.arraycopy(flat, i * dim, v, 0, dim)
+                // ⚠ **两条**判据都要，各自堵一个方向（与单条路径的 `norm==0` 同源）：
+                //   · 下标在 `failed` 里（native 明确报了失败）；
+                //   · 向量是**全零** —— 这一条是兜底的，因为它不需要 native
+                //     把下标报对。合批里失败条目的那一段就是全零，
+                //     而若 `nativeEmbedBatchFailed()` 解析失败（`parseBatchFailed`
+                //     整段作废成空集），只看下标就会把那些全零当成**合法向量**
+                //     收进索引 —— 而归一化后的全零向量与任何查询的余弦都是
+                //     0/0 = NaN，排序未定义（正是 l2_normalize 拒绝它的理由）。
+                //     单条路径**天然**有这道闸（native 返回 null），合批这条
+                //     扁平数组没有，所以必须在这里补上。
+                if (failed.contains(i) || isAllZero(v)) { out.add(null); continue }
+                out.add(v)
+            }
+            if (failed.isNotEmpty()) {
+                uiLog("[嵌入] 合批里 ${failed.size}/${texts.size} 条失败（下标 ${failed.joinToString(",")}），" +
+                    "正文保留、这些条目的向量缺席")
+            }
+            BatchEmbed.Ok(out)
+        } catch (t: Throwable) {
+            uiLog("[嵌入] 合批编码失败：${t.javaClass.simpleName}: ${t.message}（回落逐条）")
+            BatchEmbed.Unavailable
+        }
+    }
+
+    /**
+     * 「同一批文本，逐条编 vs 合批编，向量是不是**逐位相同**」的真机对照
+     * （ISSUE #269 第 5 步）—— 把 0.9.218 里那条**待验断言**量出来。
+     *
+     * ══════════════════════════════════════════════════════════════════════
+     * 为什么必须有这个入口（而不是"改批大小以后眼睛看看检索还行"）
+     * ══════════════════════════════════════════════════════════════════════
+     * 0.9.218 把批大小 `g` 单独定级（`FpDiff.onlyBatch`），但**不授权沿用**：
+     * 「不同批大小下算出的向量逐位相同」这个断言**尚未在真机上验过**。
+     * 断言未验就沿用，索引会变成两种语义拼起来的 —— 症状是"检索分数像随机、
+     * 接口 200、日志干净"。而"眼睛看看检索还行"验不了这件事：两种向量混用时
+     * 分数**看着像个正常数**，只有逐位比才能说清。
+     *
+     * 所以这里把两条路径**在同一台机器、同一次调用里**跑一遍：
+     *   · `embed`      —— 逐条路径（每次一条，`nativeEmbed`）；
+     *   · `embedBatch` —— 合批路径（一次 n 条，`nativeEmbedBatch`）；
+     * 然后把两个向量表交给 [EmbedParity.compare] 逐位比。
+     *
+     * ⚠ 顺序**固定**为"先逐条、后合批"（不是"哪条路先跑"随便）：
+     *   KV / 中间缓冲在两条路之间共享，先跑谁**理论上**不影响已归一化的输出，
+     *   但一旦有残留状态（上一批的 KV 没清干净），"先跑的那条路"会是被污染的
+     *   那一侧。固定顺序让这个**偏差方向**在结果里恒为同一侧 —— 复现时可判。
+     *
+     * `texts` 由调用方给（诊断入口用同一批文本、同一个批大小）。返回 null =
+     * 没加载嵌入模型 / 维度取不到（那时对照没有意义，如实说没有，而不是报"相同"）。
+     */
+    fun probeEmbedBatchParity(texts: List<String>, label: String = ""): EmbedParity.Report? {
+        val dim = embedDim
+        if (dim <= 0 || texts.isEmpty()) {
+            uiLog("[嵌入] 逐位比对跳过：${if (dim <= 0) "维度取不到" else "没有可比对的文本"}（不报结论）")
+            return null
+        }
+        // 逐条那一侧：用与建库**同一条**编码函数（不是另写一遍 `nativeEmbed`
+        // 直调）—— 另写一遍就等于比的是"另一段代码算出来的向量"，
+        // 而它和后者的差异与批大小无关。
+        //
+        // ⚠ 这里**每条编两次**（`aRepeat`）：第二遍仍是同一条路、同一台机、
+        // 同一条文本。它回答的是**另一个问题** —— 首轮真机那条 `firstDiffDim=0`
+        // 到底是"批布局改语义"还是"编码本身不确定"。只跑一次时这两件事
+        // 混在一个读数里，分不开（见 `EmbedParity.Report.repeatRows`）。
+        // **合批那条路下面也重复一遍**（`aBatchedRepeat`）：两条路各查各的
+        // 重现性，少一条都答不了"差异来自哪里"（见 `Report.repeatBatchedRows`）。
+        val singles = ArrayList<FloatArray?>(texts.size)
+        val repeats = ArrayList<FloatArray?>(texts.size)
+        for (t in texts) {
+            singles.add(embed(t))
+            repeats.add(embed(t))
+        }
+        // 合批那一侧：同一批文本、同一次前向。
+        val batched = when (val r = embedBatch(texts, dim)) {
+            is BatchEmbed.Ok -> r.vectors
+            else -> {
+                // 合批整批不可用（回落逐条）时**不能**报"不相同"——
+                // 那一侧根本没有向量，是**缺失**。如实说，让用户先看
+                // `[embedBatch]` 那行（它给了不可用的原因）。
+                uiLog("[嵌入] 逐位比对：合批那一侧整批不可用（见上面的 [embedBatch] 行）—— 本次无结论")
+                return null
+            }
+        }
+        // ⚠ **合批那条路也要重复一遍**（同一批文本、再走一次 `embedBatch`）。
+        // 只重复逐条那条路时，读数里还剩一格没被排掉：合批自己复现不复现得了自己。
+        // 那一格有差异的话，"跨路不同"里就混着"合批自身不确定"这一份 ——
+        // 而它与"批布局改语义"是两件事（前者先查合批，后者才谈 `g` 收不收窄）。
+        // 合批第二次仍整批不可用 = 这一格**没测到**（不是"全绿"）：如实报空。
+        val batchedRepeat = when (val r2 = embedBatch(texts, dim)) {
+            is BatchEmbed.Ok -> r2.vectors
+            else -> {
+                uiLog("[嵌入] 逐位比对：合批那一侧第二次没跑出来 —— " +
+                    "「合批自己重复」这一格**没测到**（不报成全绿）")
+                emptyList()
+            }
+        }
+        val report = EmbedParity.compare(
+            singles, batched, dim, aRepeat = repeats, aBatchedRepeat = batchedRepeat)
+        val tag = if (label.isEmpty()) "" else "（$label）"
+        uiLog("[嵌入] ${report.describe()}$tag")
+        // 逐条明细（同一次调用里紧接着那行结论打）—— `describe()` 只说得出计数，
+        // 而"是哪一条不同"直接决定下一步：整批都不同 = 合批这条路整体不可信；
+        // 只有某几条不同 = 去查那几条（不等长合批的 padding / 超长那条的截断点）。
+        // 首轮真机读数是「6 条里 1 条不同」，而当时**没有任何地方**说得出是哪一条
+        // —— `Row.maxAbsDiff` / `Row.firstDiffDim` 算了却没人读（同"读数要有落点"）。
+        // 全绿时这一节是空的（几十条逐位相同会把上面那行结论淹掉）。
+        for (line in report.detailLines()) uiLog("[嵌入] $line")
+        // 结论同时落进对外读数（`/health` 的 embed_parity_*）—— 只在日志里说
+        // 时，用户要先动手翻日志，而这条结论是**跨版本**要对的那条（见 Last 的说明）。
+        //
+        // ⚠ 只把**长短悬殊那组**落进对外读数，缺 label 时落第一组。`/health`
+        // 只有一组字段，而两组样本**必须分开报**（见 `EmbedParityProbe.SAME_LEN`
+        // 对象头：并成一批时等长那几条会被悬殊那几条淹掉）。
+        //
+        // ⚠⚠ 取哪一组**不是自明的**，这里原来取的是**等长**那组，理由是"它把
+        // 批布局这一个变量单独摆出来" —— 那条理由本身没错，但它答的是**另一个
+        // 问题**。真机现场（PR #301 那本 `/health`）把它暴露出来了：报告里
+        // 「逐位相同 4/4 条 —— 整批逐位相同，批大小是纯加速旋钮（可考虑沿用）」
+        // 取自**等长**组，而同一份日志里长短悬殊那组是「真的不同 1 条、
+        // 最大分量差 4.510e-03」。于是读者拿到的结论恰好是**用构造上偏稳的
+        // 那组去回答"换批大小会不会改答案"** —— 而这格存在的全部理由就是判
+        // 「`g` 能不能按库放行」。等长组按构造就是稳的（每条字符数全等，
+        // 唯一变量只剩批布局），它永远说不出"会不会变"。
+        //
+        // 与检索那格（`probeRetrieveParity`）**取相反的一组**、理由同源：
+        // 那边取长短悬殊（"答案会不会变"），这边也取长短悬殊（"向量会不会变"）——
+        // 两格问的都是"能不能放行 `g`"，而放行与否取决于**最坏**的那组。
+        // 落盘时把组名一起带出去（`Last.record(report, label)`）：只报数字不报
+        // 来源时，"长短悬殊也稳"会被从必然稳的那组推出来（见 `State.group`）。
+        if (label.isEmpty() || label == LONG_SHORT_LABEL) EmbedParity.Last.record(report, label)
+        return report
+    }
+
+    /**
+     * 「**换批大小重建索引后，检索结果还是不是同一些行**」的真机对照
+     * （ISSUE #269 第 5 步：与 [probeEmbedBatchParity] 配对的那一半）。
+     *
+     * ═══════════════════════════════════════════════════════════════════════
+     * 为什么这一层必须存在（`probeEmbedBatchParity` 答不了它）
+     * ═══════════════════════════════════════════════════════════════════════
+     * [probeEmbedBatchParity] 量的是"**同一批文本**、逐条 vs 合批，向量逐位相同吗"。
+     * 而"改批大小要不要重建索引 / 能不能沿用"要问的是**另一句**：
+     * "两套索引**搜出来的东西**还是不是同几条"。这两句之间**没有蕴含关系**：
+     *
+     *   · 向量逐位不同（`firstDiffDim=0`、`4.5e-03`）**不代表**答案会变 ——
+     *     4e-03 的差落在 top-k 的第几名上，是一个**要量**的问题；
+     *   · 向量逐位相同也**不代表**答案一样（索引里还有正文行序、切分、分数比较）。
+     *
+     * 做法：把 [texts] 按 [batchA] / [batchB] 各编一遍（两套向量），再用同一组
+     * [queries] 各自检索，比"命中的行下标序列"。判据落在**集合**上（见
+     * [EmbedRetrieveParity] 对象头：集合变了 = 答案变了；只名次变了 = 打平处换序）。
+     *
+     * ⚠ **不落盘、不碰知识库**：两套向量都只在内存里（这条对照是"排除法"，
+     * 不是建库）。落盘会让它变成一个"用户没点过的知识库"，而它只是诊断。
+     *
+     * ⚠ 两套都**复用同一条编码入口** [embedBatch]（不是另写一遍 `nativeEmbed`）——
+     * 另写一遍就变成比"另一段代码算出来的向量"，与批大小无关（同
+     * [probeEmbedBatchParity] 里那条说明）。
+     *
+     * 返回 null = **没得到结论**（维度取不到 / 没有文本 / 没有查询 / 某一侧整批
+     * 不可用）。这一格**必须**是 null 而不是"空结论"：后者会被读成"答案一样"。
+     */
+    fun probeRetrieveParity(
+        texts: List<String>,
+        queries: List<String>,
+        batchA: Int,
+        batchB: Int,
+        topK: Int = kRetrieveParityTopK,
+        label: String = "",
+    ): EmbedRetrieveParity.Report? {
+        val dim = embedDim
+        if (dim <= 0 || texts.isEmpty() || queries.isEmpty()) {
+            uiLog("[检索对照] 跳过：${if (dim <= 0) "维度取不到" else "没有文本或没有查询"}（不报结论）")
+            return null
+        }
+        // ── 两侧批大小必须**真的不同**，否则这一格测的是"自己对自己" ──────────
+        // ⚠ 这是一道**兜底闸**（真机那轮闪退现场逼出来的）：入口写的本来就是
+        //   "两侧各编一套、只差批大小"，可一旦两侧取到同一个数（真机上真发生过：
+        //   `otherBatch = if (curBatch == baseBatch) 1 else baseBatch` 在
+        //   用户把配置设成 1 时让两侧都成了 8），比的就是"8 对 8" —— 命中集合
+        //   **恒等**、`answerChanged` 恒 0。那是一个**假的**"答案没变"，比"没有结论"
+        //   更坏：没有结论时人还会去查，假成立时人会据此**放行 `g`** —— 而这条
+        //   结论正是"`g` 能不能按库放行"的全部依据。
+        //   所以这里当场拦下并报**"没量到"**（不是"一致"）：两侧相同 = 这一格
+        //   没有任何信息量，只有 entry 侧改对（`EngineActivity` 的推导）才算修好，
+        //   入口这层负责让"忘记改"时也**不会**报出一个假的绿。
+        if (batchA == batchB || batchA <= 0 || batchB <= 0) {
+            uiLog("[检索对照] 没量到：两侧批大小相同（$batchA vs $batchB）—— " +
+                "它测的是『自己对自己』，命中集合恒等，不报结论")
+            return null
+        }
+        // 每一侧都按**同一个入口**编（顺序也同一份）：两套向量之间只差批大小。
+        val vecA = embedAllInMemory(texts, dim, batchA) ?: return null
+        val vecB = embedAllInMemory(texts, dim, batchB) ?: return null
+        // ⚠ 查询向量**用哪一侧的批大小**：用 [batchB] 那侧 —— 真机上的场景是
+        // "索引是按 batchA 建的，现在配置改成了 batchB"，于是查询来自新配置那一批
+        // （那正是索引里会混着两种语义的那个场景）。用 batchA 查会让两侧都"自洽"，
+        // 恰好把要量的那件事抹掉。
+        val qvRows = embedRowsInMemory(queries, dim, batchB)
+            ?: return null
+        if (qvRows.any { it == null || it.size != dim }) {
+            uiLog("[检索对照] 查询向量没算出来 —— 本次无结论")
+            return null
+        }
+        val qv = qvRows.map { it!! }
+        val indicesA = ArrayList<List<Int>>(queries.size)
+        val indicesB = ArrayList<List<Int>>(queries.size)
+        val scoreA = ArrayList<List<Float>>(queries.size)
+        val scoreB = ArrayList<List<Float>>(queries.size)
+        for (q in qv) {
+            val a = RagIndexStore.rank(vecA, texts.size, dim, q, topK, 0f)
+            val b = RagIndexStore.rank(vecB, texts.size, dim, q, topK, 0f)
+            indicesA.add(a.hits.map { it.index })
+            indicesB.add(b.hits.map { it.index })
+            scoreA.add(a.hits.map { it.score })
+            scoreB.add(b.hits.map { it.score })
+        }
+        val report = EmbedRetrieveParity.compare(
+            queries, indicesA, indicesB, batchA, batchB, topK, scoreA, scoreB)
+        val tag = if (label.isEmpty()) "" else "（$label）"
+        uiLog("[检索对照] ${report.describe()}$tag")
+        for (line in report.detailLines()) uiLog("[检索对照] $line")
+        // ⚠ 只把**长短悬殊**那组落进对外读数（缺 label 时落第一组）—— 与
+        //   `probeEmbedBatchParity` 里那条「只落等长那组」同源，但**取的是相反的一组**：
+        //   · 向量那格取**等长**组：它把"批布局"这一个变量单独摆出来；
+        //   · 检索这格取**长短悬殊**组：等长组按构造就是稳的（见 `SAME_LEN` 对象头），
+        //     把它落进 `/health` 等于**用必然成立的那组去回答"答案会不会变"**。
+        //   ⚠ 这条闸是**后加**的：`Last.record` 原先在两个调用点上各记一次、**无条件
+        //     覆盖**，于是 `/health` 永远报的是后跑的那组（等长）—— 而长短悬殊那组
+        //     （唯一能改变答案的）的读数**一次都没进过** `/health`。
+        if (label.isEmpty() || label == LONG_SHORT_LABEL) EmbedRetrieveParity.Last.record(report)
+        return report
+    }
+
+    /**
+     * 把 [texts] 逐条摊成每行一个向量（**只在内存里**，不落盘）。
+     *
+     * ⚠ [batch] 决定的是"几条一起进 `embedBatch`"，**不是"编几次"**：语料与
+     *   查询向量**都要**走这个入口。原来查询那一句写的是
+     *   `embedBatch(listOf(q), dim)` —— 那是**写死的 1 条一批**，与
+     *   "查询来自 [batchB] 那一侧"这条要求（见 `probeRetrieveParity` 里那段说明）
+     *   只在 `batchB == 1` 时才偶然一致。用户配置不是 1 时，这一格比的就成了
+     *   "batchA 建的库 vs 1 条一批的查询"，与要量的那件事无关 —— 而它**看起来仍然成立**。
+     *
+     * 返回 null = **某一批整批不可用**（那就不该拿去比检索 —— 结果是"缺失"
+     * 不是"不同"，同 [probeEmbedBatchParity] 的规矩）。
+     */
+    private fun embedRowsInMemory(texts: List<String>, dim: Int, batch: Int): List<FloatArray?>? {
+        val rows = if (batch > 0) batch else kEmbedBatchDefault
+        val out = ArrayList<FloatArray?>(texts.size)
+        var i = 0
+        while (i < texts.size) {
+            val end = minOf(i + rows, texts.size)
+            val r = embedBatch(texts.subList(i, end), dim)
+            if (r !is BatchEmbed.Ok) {
+                uiLog("[检索对照] 批大小 $rows 那一侧第 ${i / rows + 1} 段整批不可用 —— 本次无结论")
+                return null
+            }
+            for (k in 0 until (end - i)) out.add(r.vectors.getOrNull(k))
+            i = end
+        }
+        return out
+    }
+
+    /**
+     * 把 [texts] 按 [batch] 条一批编完，摊成一条扁平的 `FloatArray`
+     * （**只在内存里**，不落盘；检索要的是这种布局）。
+     *
+     * 返回 null = **某一批整批不可用**或**某条没有向量**（那就不该拿去比检索 ——
+     * 结果是"缺失"不是"不同"，同 [probeEmbedBatchParity] 的规矩）。
+     */
+    private fun embedAllInMemory(texts: List<String>, dim: Int, batch: Int): FloatArray? {
+        val rows = if (batch > 0) batch else kEmbedBatchDefault
+        val vectors = embedRowsInMemory(texts, dim, batch) ?: return null
+        val out = FloatArray(texts.size * dim)
+        for ((k, v) in vectors.withIndex()) {
+            if (v == null || v.size != dim) {
+                uiLog("[检索对照] 批大小 $rows 那一侧第 ${k + 1} 条没有向量 —— 本次无结论")
+                return null
+            }
+            System.arraycopy(v, 0, out, k * dim, dim)
+        }
+        return out
+    }
+
+    /** 检索对照用的查询集（写死 —— 与 [EmbedParityProbe] 同一条理由：跨版本要对上同一张图）。 */
+    val RETRIEVE_PARITY_QUERIES: List<String> = EmbedParityProbe.RETRIEVE_QUERIES
+
+    /**
+     * 检索对照取前几名（与用户实际用的 top-k 同一档，见 `RagInject.DEFAULT_TOP_K`）。
+     *
+     * 数值出处是 [EmbedLimits.kRetrieveParityTopK] —— 搬过去是为了让宿主单测
+     * 编得过（本对象依赖 Android，编不到宿主上）。见 `EmbedLimits` 的对象头。
+     */
+    const val kRetrieveParityTopK = EmbedLimits.kRetrieveParityTopK
+    /**
+     * 「等长」那组样本的标签（用于日志回显与界面分组，**不落** `/health`）。
+     *
+     * ⚠ 字面量的**唯一出处**是 [EmbedLimits.kSameLenLabel]（转发，不在这里
+     *   另写一份）：`HealthCheck.kt` 要认出组名按组换措辞，而它编在宿主上
+     *   （**不带** `LlmEngine.kt`）—— 组名只写在这里时那句引用编不过。
+     */
+    const val SAME_LEN_LABEL = EmbedLimits.kSameLenLabel
+
+    /**
+     * 「长短悬殊」那组样本的标签 —— 也是**落进 `/health`** 的那一组
+     * （`probeEmbedBatchParity` / `probeRetrieveParity` 各自只落这一组）。
+     *
+     * ⚠ 与 [SAME_LEN_LABEL] **不是同一个常量**、也**不是同一组样本**：两格
+     *   都取长短悬殊那组（放行 `g` 取决于**最坏**的那组），等长组只作对照 ——
+     *   共用一个名字会让"改的是哪一格"看不出来（本仓库反复记录的那族）。
+     *   出处同 [SAME_LEN_LABEL]：[EmbedLimits.kLongShortLabel]。
+     */
+    const val LONG_SHORT_LABEL = EmbedLimits.kLongShortLabel
+
+    /**
+     * 解析 `nativeEmbedBatchFailed()` 的下标串（逗号分隔；空串 = 全成功）。
+     *
+     * 单个下标解析不出来时**整段作废**（返回空集）：那种情况下"哪些条失败了"
+     * 是未知的，而返回一个**部分**集合会让调用方以为其余都成功了 ——
+     * 失败条目的正文会带着"我已成功"的假象进索引（或是被当成成功计数）。
+     * 未知就该是未知，宁可让调用方多判一轮（它会发现下标集合与全零段对不上）。
+     */
+    /**
+     * 这一段向量是不是**全零**（零向量的方向不存在，必须丢弃）。
+     *
+     * 与 native 的 `l2_normalize` 同一条判据（那里全零会返回 false）：合批这条
+     * 扁平数组里没有"null"这个位置，失败条目只能体现为全零 —— 于是"全零"
+     * 在这里必须被判成失败，否则它会被当成合法向量收进索引（见 `embedBatch`
+     * 里那段说明）。`Float` 的 `-0.0f == 0.0f` 成立，所以这一条也能抓住
+     * "带负号的全零"（那种值打印起来像一个正常数）。
+     */
+    private fun isAllZero(v: FloatArray): Boolean {
+        for (x in v) if (x != 0.0f) return false
+        return true
+    }
+
+    private fun parseBatchFailed(raw: String): Set<Int> {
+        if (raw.isEmpty()) return emptySet()
+        val out = LinkedHashSet<Int>()
+        for (piece in raw.split(',')) {
+            val v = piece.trim().toIntOrNull() ?: return emptySet()
+            out.add(v)
+        }
+        return out
+    }
+
+    /**
+     * 把一串 token id 还原成文本（用嵌入模型那一份 vocab）。
+     *
+     * 返回 null = 还原失败（没加载嵌入模型 / 有 id 越界 / 数组为空）。
+     * `EmbeddingsApi` 拿它把 `input: [1,2,3]` 变成文本后再走 [embed] ——
+     * 这样"id 数组"与"字符串"两种输入最终**共用同一条**编码路径，
+     * 不会出现"两条路各算一遍、结果却不一样"的分岔。
+     */
+    fun detokenize(ids: IntArray): String? = synchronized(embedLock) {
+        if (ids.isEmpty()) return@synchronized null
+        try {
+            nativeDetokenize(ids).ifEmpty { null }
+        } catch (t: Throwable) {
+            uiLog("[嵌入] id 还原失败：${t.javaClass.simpleName}: ${t.message}")
+            null
+        }
+    }
+
+    // ══════════════════════════════════════════════════════════════════════════
+    //  知识库索引构建（RAG 阶段 1）—— 分块 -> 逐块 embed -> 落盘
+    // ══════════════════════════════════════════════════════════════════════════
+    //
+    // 为什么"构建"必须是一个**独立于检索**的显式动作：
+    // 索引里的向量是**用某个特定 embed 模型 + 某组切块参数**算出来的。把它绑在
+    // 请求路径上（"检索时发现没有索引就顺手建"）会有两个后果 —— 第一次提问要
+    // 等整份文档编码完（长文档 = 分钟级，且期间 HTTP 请求超时、客户端重试、
+    // 于是又建一遍），以及"重建"这件事对调用方完全不可见（它只是慢）。
+    // 所以构建是显式入口，检索侧只负责"有就用、没有就当没配"。
+
+    /**
+     * 构建（或重建）一个知识库的索引。
+     *
+     * 返回 null = 成功；否则是给用户看的失败原因。**不抛异常**（后台线程上跑）。
+     *
+     * 关键约束（每一条都对应一类静默失效）：
+     * - **先加载嵌入模型**再算：没加载就 embed 会逐条返回 null，于是整库向量全空，
+     *   而"建库成功"照样返回 —— 表现为"检索永远为空"，看不出是模型没加载。
+     * - 维度从 [embedDim] 取，不写死：写死会在换模型后把错维度的向量落盘，
+     *   而 decode 之后维度"对得上"（因为索引头也是错的），点积读的是错位 float。
+     * - 空条目**丢弃**；编码失败的条目**正文留下、向量缺席、整库标记需重建**
+     *   （见 [RagIndexStore.savePartial]）：塞零向量会让余弦变 NaN，而**整条丢掉**
+     *   会让用户看不见自己敲的那条（100 条坏 3 条时只能二分重试）。
+     * - 分块结果为空（文档太短/全空白）时**不落盘**（见 [RagIndexStore.Load.empty] 的三态）：
+     *   落一个 count=0 的文件是合法的（"库确实是空的"），但"用户给了内容却切不出块"
+     *   必须报错，否则用户以为建好了。
+     *
+     * 返回值契约（UI 依赖它区分三种结局，**不能只看 null/非 null**）：
+     * - `null`            —— 全部成功，索引可直接检索；
+     * - `"成功 N 条，…"` —— **部分失败**：正文已全部落盘，索引待重建（用户改掉坏的那几条再重建）；
+     * - 其它字符串         —— 真失败（没写成任何东西）。
+     */
+    fun buildIndex(ctx: android.content.Context, name: String, docs: List<RagIndexStore.Entry>,
+                   cp: RagIndexStore.ChunkParams = RagIndexStore.ChunkParams(),
+                   nCtx: Int = 0,
+                   embedBatchSize: Int = kEmbedBatchDefault): String? {
+        val dir = RagIndexStore.dirOf(ctx, name)
+            ?: return "库名非法（只允许字母/数字/中文/-/_/.，且非空）"
+        if (!hasEmbedModel) return "尚未加载嵌入模型（索引必须用它算向量）"
+        val dim = embedDim
+        if (dim <= 0) return "嵌入模型维度取不到（加载可能不完整）"
+
+        // ── 批大小：归一到 native 的实际上限（ISSUE #269 第 2 步）───────────
+        // 调用方给的是**用户意愿**（设置页填的数），而能不能合批由
+        // native 的 `n_seq_max`（= [kEmbedBatchRows]，建 ctx 时写死）决定 ——
+        // 超了就是每批都被拒、回落逐条（合批白做而界面看不出）。
+        // 所以这里**当场钳到上限**并记一笔日志：用户填了 16 而上限是 8，
+        // 他必须在日志里看到"按 8 跑"—— 否则他会以为 16 生效了，
+        // 而真相是设置被静默地忽略了（与本 issue 最初那个
+        // "线程数输入框对建库完全无效"是同一个病）。
+        val batch = kEmbedBatchLimit(embedBatchSize)
+        if (batch != embedBatchSize) {
+            uiLog("[知识库] 批大小 $embedBatchSize 超过 native 上限 ${kEmbedBatchRows} 或非正，" +
+                "已按实际能跑的 $batch 跑（合批上限由建 ctx 时的序列数决定）")
+        }
+
+        // 指纹只给"与模型有关的那一半"：**正文那一半由 save 现算**（它才知道最终
+        // 写下去的字节）。让调用方自己算完整指纹有一个致命窗口 —— 它算的 hash 与
+        // 实际写下的字节之间隔着一次 encodeTexts，任何一边改了编码，写完的索引
+        // 就**立刻失效**，症状是"建库成功、检索永远为空"，没有日志指向这里。
+        //
+        // ⚠ 这一半**只从这里取**（[embedFpInput]）：检索侧走的是同一个函数。
+        // 两处各写一遍的形态，正是"建库成功 → 检索说『模型或参数已变』"的成因。
+        val fp = embedFpInput(cp, batch)
+            ?: return "嵌入模型文件不可读或维度取不到：${embedPath ?: "?"}"
+
+        // ── 分块 + 逐条编码 ────────────────────────────────────────────────
+        // 编码在 embedLock 内逐条做（embed() 自己加锁），所以这里不再包一层：
+        // 包了会与 embed() 的 synchronized 互斥同一把锁（可重入，无害），
+        // 但会让"构建期间无法 abort/卸载嵌入模型"这个窗口显得像设计而非巧合。
+        val texts = ArrayList<String>()
+        val sources = ArrayList<String>()
+        var totalChunks = 0
+        var skipped = 0
+        // 硬截计数：**一个库一条日志**，不是一块一条（块多的时候会把日志刷爆，
+        // 而用户要的是"这份文档为什么检索不准"这个整体判断）。
+        var hardCuts = 0
+        // 被 maxChunks 截住的条目：**不是块数，是条目数**。用户能动手的对象是
+        // "哪一条文档太大"，报"共被截掉多少块"对他没有意义（他也改不了块数）。
+        var truncatedDocs = 0
+        for (d in docs) {
+            if (d.text.isBlank()) continue
+            // 分块按字符算（与 rag_index.h 同一口径）；native 侧 tokenize 后
+            // 超 ctx 会截断并有日志，所以这里不必精确控 token —— 但块必须明显小于
+            // n_ctx，否则每块都被截断，语义只剩开头。
+            val hc = IntArray(1)
+            val tr = BooleanArray(1)
+            for (piece in chunk(d.text, cp, hc, tr)) {
+                totalChunks++
+                texts.add(piece.text)
+                sources.add(d.source)
+            }
+            hardCuts += hc[0]
+            if (tr[0]) truncatedDocs++
+        }
+        if (totalChunks == 0) return "没有可索引的内容（文档全为空或切不出块）"
+        // ── 硬截要说话（用户拍板：记进日志）─────────────────────────────────
+        // 为什么这条日志值钱：硬截 = "窗口内一个句读都没有"，那种块的开头/结尾
+        // 是**凭空截断**的 —— 语义被拦腰截断，检索命中率天生偏低。而它此前
+        // **没有任何痕迹**：用户看到的是"这份文档有些内容搜不到"，据此只能猜
+        // （换模型？改阈值？重写文档？），方向全靠碰。
+        // 一句 `N/M 块是硬截的` 就把"哪一份文档、多严重"变成可操作的信息
+        // （给那份文档补换行/句读，或干脆接受它的召回率）。
+        // ⚠ 只统计**切块阶段**的硬截；`skipped`（编码失败）是另一件事，分开报。
+        if (hardCuts > 0) {
+            uiLog("[知识库] $name 有 $hardCuts 块是硬截的（窗口内无句读，" +
+                "共切 $totalChunks 块）——这些块的语义可能被截断，补上换行/句读可改善召回")
+        }
+        // ── 被 maxChunks 截断也要说话（用户拍板：记进日志）──────────────────
+        // 为什么这条**比硬截那条更值钱**：硬截只是"块边界糙"，内容全在；
+        // 截断是**内容真的没进索引** —— 文档后半段一个字节都没算向量。
+        // 而它此前**完全没有痕迹**：`chunk()` 撞上限就 return，`buildIndex`
+        // 只报 `totalChunks`，于是"这份文档只索引了前半段"与"文档本来就这么多"
+        // 在日志与界面（条目数是**正文行数**，不是块数）上**逐字相同**。
+        // 用户唯一能观察到的现象是"后半段搜不到"，而那与"文档里没有"一模一样 ——
+        // 只能靠反复换关键词去猜，方向全靠碰。
+        // 一句 `N 条被截断（单条上限 M 块）` 就把"是哪一份、为什么、怎么办"
+        // 变成可操作的信息：拆成几条小的，或者接受"这份只索引前半段"。
+        // ⚠ 与硬截**分开报**：两者根因不同（句读少 vs 文档太大），处置也不同。
+        if (truncatedDocs > 0) {
+            uiLog("[知识库] $name 有 $truncatedDocs 条被截断：单条上限 ${cp.maxChunks} 块" +
+                "（约 ${cp.maxChunks} 块 × ${cp.targetChars} 字），超出的部分**未进索引**——" +
+                "拆成几条再建库，或缩短这一条")
+        }
+
+        // ── 续编（本次新增）：能不能接着上次编 ────────────────────────────────
+        // ⚠ 判据**只有一条**：把"将要写下的正文"与磁盘上那份索引的指纹比一次。
+        //   指纹里已经含了正文 hash + 正文行数 + 模型身份 + 切块参数 + 批大小——
+        //   任何一项与上次落盘时不一致，[RagIndexStore.load] 就交出 none（不是 partial），
+        //   于是这里退化成"从头编"。**不许**用"块列表看起来一样"来近似它：
+        //   那正是本仓库反复吃过的"两个数各推一遍，分岔时静默失效"。
+        //
+        // 为什么在**编码开始之前**就要把整份正文编出来：指纹里的正文 hash 是
+        // 完整正文的 hash（[RagIndexStore.savePartial] 也是这么写的），所以
+        // "这次会写下什么字节"必须在续编判据之前就知道。这一步只编码 JSON、
+        // 不算向量，相对一次前向可以忽略。
+        val allRows = ArrayList<RagIndexStore.Entry>(texts.size)
+        for (k in texts.indices) allRows.add(RagIndexStore.Entry(texts[k], sources.getOrElse(k) { "" }))
+        // ⚠ 正文只编一次（两次调 `encodeTexts` 是白算，且哪天它带了随机/时间成分就会分岔）
+        val allBytes = RagIndexStore.encodeTexts(allRows).toByteArray(Charsets.UTF_8)
+        val fullFp = RagIndexStore.fingerprintOf(
+            fp, RagIndexStore.textsHashOf(allBytes), RagIndexStore.rowsOf(allBytes))
+        // 前缀：上次已经算过的向量（半份索引）。null = 没有可续的（首建 / 指纹不符 / 齐整）。
+        val prefix = RagIndexStore.loadPrefix(ctx, name, fullFp)
+        val startFrom = if (prefix == null) 0 else RagIndexStore.resumeFrom(prefix.first, texts.size)
+        // ── 作废闸要**出声**（不许静默从头）──────────────────────────────────
+        // 磁盘上明明有索引、却续不上（= 判据判了"从头"）—— 这件事必须说出来，
+        // 否则用户遇到的是"我明明点的续跑，它又跑了两小时"，而日志里没有一行
+        // 指向原因。作废的三类来源各不相同，处置也不同：
+        //   · 换了嵌入模型 / 切块参数 / 批大小 -> 指纹不符（[RagIndexStore.lastDiff] 指名字段）；
+        //   · 正文改过（条数或内容变了）        -> 正文 hash 不符；
+        //   · 索引本来就齐整                    -> 没有缺口，不该续（上面 loadPrefix 返回 null）。
+        // ⚠ 只在前两种情况出声（第三种"齐整"不是作废，是"已经编完了"，报它反而制造困惑）。
+        if (prefix == null && RagIndexStore.isPresent(ctx, name)) {
+            val d = RagIndexStore.lastDiff
+            if (!d.same) {
+                uiLog("[知识库] $name 没有可续的半份索引（${d.field}：${d.detail}）—— 从头编")
+                // ── "只差批大小"要**多说一句"能救多少"**（ISSUE #269 第 5 步）─────
+                // `g` 与别的字段是两类东西（见 [RagIndexStore.FpDiff.onlyBatch]）：
+                // 换模型 / 正文改过 -> 那 N 块**真的**救不回来；而只差批大小 ->
+                // 那 N 块**语义同源**，只是"不同批大小的向量是否逐位相同"还没验
+                //（第 5 步那个真机逐位比对）。不验之前按**不可沿用**处置（安全），
+                // 但用户必须被告知**有多少块是可救的** —— 否则他看到一行"从头编"
+                // 只能认为这几十几分钟全白费，而真相是"换个批大小回来就能续上"。
+                if (d.onlyBatch && d.salvage > 0) {
+                    uiLog("[知识库] $name ↑ 其中前 ${d.salvage}/${texts.size} 块**语义同源**（只差批大小）：" +
+                        "把「每批编几条」改回来（或重建）即可沿用；在此之前不同批大小的向量" +
+                        "是否逐位相同**尚未验证**（ISSUE #269 第 5 步），所以这次不敢沿用")
+                }
+            }
+        }
+        if (prefix != null && startFrom > 0) {
+            // ── 续编要**说出来**（不许静默从头）───────────────────────────────
+            // 用户要的就是"下次能接上"，而他判断"接上了没有"的唯一依据是这一行。
+            // 只报"开始建索引"在他眼里与"从头跑"逐字相同 —— 而两者耗时差几十分钟。
+            uiLog("[知识库] $name 检测到上次建到 $startFrom/${texts.size} 块（指纹一致），" +
+                "从第 ${startFrom + 1} 块接着编，前 $startFrom 块沿用上次的结果")
+        }
+
+        // 计数：`okCount` 含**沿用**的前缀条数（前 `startFrom` 块），不含失败的。
+        var okCount = startFrom
+        val rows = ArrayList<RagIndexStore.Entry>(texts.size)
+        // 前缀向量原样搬运：**不重算**（重算是续编存在的意义），也不改它的顺序——
+        // 向量区第 i 行必须就是正文第 i 行（见 [RagIndexStore.savePartial] 的说明）。
+        if (prefix != null && startFrom > 0) {
+            val pf = prefix.second
+            for (k in 0 until startFrom) {
+                val off = k * dim
+                val v = if (off + dim <= pf.size) pf.copyOfRange(off, off + dim) else FloatArray(0)
+                rows.add(RagIndexStore.Entry(texts[k], sources.getOrElse(k) { "" }, v))
+            }
+        }
+        // ── 逐条编码，并把**失败的那几条**记下来（方案 C）──────────────────
+        // 早先的实现只 `skipped++`，连"哪一条"都不记 —— 而失败详情在失败当场
+        // 才拿得到，事后回不来；用户能看到的只有 UI 上那句"检查嵌入模型与内存"，
+        // 而那句话在两个不同根因下都成立，等于没有排查方向。
+        // 所以这里逐条收集：正文（用于定位）+ 原因（用于判断该怎么修）。
+        // 失败明细带上**自己的下标**（不是靠 indexOf 反查）：同一个 EmbedFail 值
+        // 可能出现多条（同一根因），`fails.indexOf(it)` 会永远命中第一条 ——
+        // 于是"#N 条失败"里的 N 是错的，而它恰恰是用户去定位的那把钥匙。
+        val fails = ArrayList<Pair<Int, EmbedFail>>()   // ≤ kMaxReportedFails 条，避免刷爆界面
+        val failedIdx = ArrayList<Int>()                // 全部失败的下标（进 meta.json）
+        // ── 进度回执（不是日志，见 [uiProgress]）────────────────────────────
+        // 为什么这一屏非要有进度不可：建库的耗时由**块数**主导，而块数由文档长度
+        // 决定 —— 一份 3 MB 的整篇能切出上万块，就是几十分钟。此前那几十分钟里
+        // 屏幕上只有一句静态的「正在建库…」，用户唯一能得出的结论是"卡死了"，
+        // 于是他去点屏幕（用户报的原文："点击卡住的页面，app 闪退"）。
+        // 一个走得动的计数就把"卡死"与"慢"分开 —— 两者的处置完全不同。
+        //
+        // ⚠ 只走 uiProgress：见那里的注释（上万行不进 ring / 不落盘 / 不进 logcat）。
+        //
+        // ── 一批一批地编码（ISSUE #269 的另一半）───────────────────────────
+        // 不再是"一条一次 `nativeEmbed`"，而是**一次前向编 n 条**（`kEmbedBatch`）。
+        // 这一半 PR #273 明确没走，理由写在它自己的"放弃方案"里：
+        // "嵌入每条是独立前向（每条前都要清 KV），合批要先证明条目间语义不串"。
+        // 那件事现在**已经证明并落到判据上**了：隔离靠 `llama_batch` 的 `seq_id`
+        // （库按 seq 分块建注意力掩码，不同 seq 互不可见），每条的 `pos` 从 0 起 ——
+        // 见 native 侧 `nativeEmbedBatch` 与 `embed_text.h::plan_batch`。
+        //
+        // ⚠ 合批**不改变失败口径**：哪几条失败照样一条不漏地记进 `failedIdx`。
+        // 合批这一层只是"更快的同一条路"，它的失败语义必须与逐条**逐项相同** ——
+        // 否则"批大小"就渗透进索引内容了（用户改了批大小，哪几条进索引就变了，
+        // 而没有任何日志指向这里）。
+        // ⚠ 开工时刻取**单调钟**（不是墙钟）：这一行要报"已耗费时间"，
+        //   而墙钟做差会被 NTP 跳变/用户改时间拉歪（甚至算成负数）。
+        //   本仓库对此有一族专门的判据（`run_monotonic_clock_guard.sh` G1），
+        //   取钟的那一处**只在这里**，`RagProgress` 只收算好的毫秒数。
+        val buildT0 = System.nanoTime()
+        // ── 开工前先取一份**累计**读数（"本段"是怎么来的）────────────────────
+        // [EmbedBatchStats] 记的是**进程级累计**（跨多次建库累加，见它的对象头），
+        // 而这行日志要说给用户听的是"我点的**这一次**建库走了哪条路"。
+        // 两者不是一回事：此前拿累计值当"本轮"，于是 `合批 20/20 条（5 批）`
+        // 会被读成"这次编了 20 条"，其实是第 5 次建库之后的累计 —— 而用户
+        // 恰恰是拿这一行去比"批4 vs 批1"，两个几乎相等的累计值会被读成
+        // "批大小没生效"（真因只是相邻两次之间只差 4 条）。
+        // 所以开工先留一份基线，收尾时 [EmbedBatchStats.delta] 一减就是本段。
+        val statsBefore = EmbedBatchStats.snapshot()
+        // ── 定期落盘（本次新增）：中途被杀不再"从头跑" ────────────────────────
+        // ⚠ 落盘粒度按**块数**，不是按条数：一条 3 MB 的长文档能切出一万块，
+        //   "每 100 条存一次"在它面前一辈子碰不到（用户提的"每 100 条"是因为
+        //   他导入的多是短文 —— 那是样本恰好短，不是规则）。再叠一个
+        //   "至少每 3 分钟一次"兜住长尾（慢机器上 2000 块可能超过 3 分钟）。
+        // ⚠ 这里落的是 [RagIndexStore.saveProgress]（正文全量、向量只留前缀），
+        //   所以**不需要新文件格式**；下次 [RagIndexStore.loadPrefix] 就靠它续编。
+        //   而"落一份半成品"绝不会被误当"能检索"—— 指纹里正文行数与向量行数不等，
+        //   load 见到就是 [RagIndexStore.Load.partial]。
+        // ⚠ "正文全量"这四个字是**契约**，不是形容词：写成前缀就是**删正文**
+        //   （见下面那个 bug 的说明）。
+        val persistEveryChunks = kEmbedResumePersistChunks
+        val persistEveryMs = kEmbedResumePersistMs
+        var lastPersistAt = System.nanoTime()
+        var persistedUpto = startFrom
+        var i = startFrom
+        while (i < texts.size) {
+            // ⚠ 库名照旧带着（`（xs002）`）：整屏上只有这一行说得清"是哪一趟" ——
+            //   而这个 App 允许**同时开着好几个库**，用户切来切去时
+            //   "这趟是在建哪个"是比"走到第几条"更前面的问题。
+            uiProgress(RagProgress.PREFIX + RagProgress.line(
+                i, totalChunks, (System.nanoTime() - buildT0) / 1_000_000L) + "（$name）")
+            val end = minOf(i + batch, texts.size)
+            val slice = texts.subList(i, end)
+            // ── 批级计时（ISSUE #269 第 1 步：先量）──────────────────────
+            // 合批是**纯加速**：生效与不生效在协议上完全看不出来（同样的 200、
+            // 同样的向量）。没有这一笔读数，"到底省了多少"只能靠推断 ——
+            // 而推断对不对，只有真机上看得到。所以这里按**批**计时（不按条：
+            // 逐条计时是上万次取时钟，而它们的和就是这一笔）。
+            val batchT0 = System.nanoTime()
+            val r = embedBatch(slice, dim)
+            val got: List<FloatArray?> = when (r) {
+                is BatchEmbed.Ok -> {
+                    EmbedBatchStats.record(EmbedBatchStats.Sample(
+                        EmbedBatchStats.Route.BATCHED, end - i,
+                        (System.nanoTime() - batchT0) / 1_000_000L))
+                    r.vectors
+                }
+                is BatchEmbed.Unavailable -> {
+                    // 整批不可用 -> **回落逐条**（不是"这批全失败"）。单条路径有完整
+                    // 的失败归因，合批这一层没有 —— 把"这批不适合合批"当成"这批全坏"
+                    // 会让用户看到一批一批地坏，而真相只是批大小或模型档位的问题。
+                    // ⚠ 回落只影响**这一批**，不改动批大小之外的任何东西。
+                    // ⚠ 回落这一批**不计入合批耗时**（它走的是逐条路径，那份耗时
+                    //   不是合批省下的）—— 但批次与条数**必须记**，否则看不出
+                    //   "整轮建库一条都没合批"这个关键读数。
+                    EmbedBatchStats.record(EmbedBatchStats.Sample(
+                        EmbedBatchStats.Route.FELL_BACK, end - i,
+                        (System.nanoTime() - batchT0) / 1_000_000L))
+                    List(end - i) { k -> embed(texts[i + k]) }
+                }
+            }
+            for (k in i until end) {
+                val src = sources.getOrElse(k) { "" }
+                val v = got.getOrNull(k - i)
+                if (v == null || v.size != dim) {
+                    // 失败的**正文照样留下**（用户敲的东西不许丢），向量缺席，
+                    // 整库标为"需重建" —— 与用户拍板的口径一致（见 RagIndexStore.savePartial）。
+                    rows.add(RagIndexStore.Entry(texts[k], src))
+                    failedIdx.add(k)
+                    skipped++
+                    if (fails.size < kMaxReportedFails) {
+                        fails.add(k to (lastEmbedFailure()
+                            ?: EmbedFail("unknown", 0, dim, embedOutDim, embedPooling, 0.0)))
+                    }
+                    continue
+                }
+                rows.add(RagIndexStore.Entry(texts[k], src, v))
+                okCount++
+            }
+            i = end
+            // ── 定期落盘（只在**没有失败**时落）───────────────────────────────
+            // ⚠ 有失败时不落：失败会让 `rows` 里出现"缺向量"的行，而
+            //   [RagIndexStore.savePartial] 的语义是"正文全量、向量只留**连续前缀**"
+            //   —— 一旦这批有失败，后续块的向量**不能往前挤**（挤了就是整体错位，
+            //   检索分数对、注入内容错，且不报错）。
+            //   所以这里只在"到目前为止全部成功"时才把前缀落盘；
+            //   有失败时这一轮的**收尾**（下面的 savePartial）会按老口径整份写下，
+            //   而那份是"待重建"的（用户改掉坏的那几条再重建）。
+            //   换句话说：**续编只服务于"一路顺利但被杀"这一种场景**，
+            //   它不会把"有失败的那一轮"变成可续 —— 那是两件事，不能混。
+            if (failedIdx.isEmpty() &&
+                (i - persistedUpto >= persistEveryChunks ||
+                    (System.nanoTime() - lastPersistAt) / 1_000_000L >= persistEveryMs)) {
+                // 前缀落盘：**正文全量 + 前 i 块有向量**。
+                // ⚠ 这里**不能**把 `rows` 直接传给 `savePartial`：`rows` 此刻只装到
+                //   第 i 块，是"已编过的前缀"，不是"这份库的正文"。`savePartial`
+                //   的契约是"传进来的就是**整份正文**"，于是它会把前缀当整份写下去
+                //   —— 后 `texts.size - i` 块的字**从 `texts.jsonl` 里消失**，
+                //   而索引与剩下的正文**自洽**（count == 行数-1、正文 hash 对得上），
+                //   下次进来判成 `Load.valid`：界面报"库建成功了"，条目数却是
+                //   截断后的那个。这不是"少算几块"，是**用户导进来的正文被删掉**
+                //   （用户报的："导 1000 条、建到 216 条被杀、重启只剩 216 条"）。
+                //   同一处还连带第二个错：指纹里的正文 hash/行数会按**前缀**算，
+                //   于是下次 `loadPrefix(fullFp)` 永远比对不上 —— 续编一次都不生效
+                //   （而它不报错，只是"又从 0 开始"）。
+                //   所以"前缀向量 + 全量正文"的拼接收口到
+                //   [RagIndexStore.saveProgress] 一处：调用方只报"编完了几块"。
+                //   这样"传错列表"在类型上就不可能发生 —— 比在调用点写一句
+                //   "注意要传全量"可靠：那句注释当时**也在**（就写在这上面），
+                //   而它没拦住这个 bug。
+                // 已编那 `i` 块的向量摊平（`rows` 装的正是这段前缀，顺序即行号）。
+                val prefixVec = FloatArray(i * dim)
+                for (k in 0 until i) {
+                    val v = rows[k].vector
+                    if (v.size == dim) System.arraycopy(v, 0, prefixVec, k * dim, dim)
+                }
+                val okP = RagIndexStore.saveProgress(ctx, name, fp, dim, i,
+                    texts, sources, prefixVec,
+                    partialMeta(name, i, texts.size, dim, cp))
+                if (okP) {
+                    persistedUpto = i
+                    lastPersistAt = System.nanoTime()
+                    uiLog("[知识库] $name 阶段性落盘：已编 $i/${texts.size} 块（中途退出可从这里接着编）")
+                } else {
+                    // 落盘失败**不中止**建库（存储空间/权限问题不该让已经算好的白费），
+                    // 但要说出来 —— 静默的后果是"下次还是从头跑"，而用户不知道为什么。
+                    uiLog("⚠ [知识库] $name 阶段性落盘失败（已编 $i/${texts.size} 块）——" +
+                        "若中途退出，下次会从头编")
+                }
+            }
+        }
+        if (rows.isEmpty()) return "没有可索引的内容（文档全为空或切不出块）"
+
+        // ── 落盘：全成功走 save（索引可用），有失败走 savePartial（正文在、索引待重建）
+        // 这条分界决定了用户下一步该做什么，所以两条路都必须显式存在，不能合并 ——
+        // 合并成一个"尽力而为"的默认行为会让"建好了能检索"与"建好了但不能检索"
+        // 在界面上长得一样。
+        val stale = failedIdx.isNotEmpty()
+        val metaObj = org.json.JSONObject()
+            .put("library", name)
+            .put("entries", if (stale) okCount else rows.size)
+            .put("rows", rows.size)
+            .put("chunks", totalChunks)
+            .put("skipped", skipped)
+            .put("dim", dim)
+            .put("targetChars", cp.targetChars)
+            .put("overlapChars", cp.overlapChars)
+            // 嵌入模型路径：取的是**实际加载进来的那一份**（`embedPath`），不是
+            // 调用方给的字面值 —— 文件可以被覆盖、路径可以带软链，fp 里写的也是这个。
+            // ⚠ 这两个字符（模型身份）此前是 `modelPath`，6f40ff2 改名为 `embedPath`
+            //   时漏掉了这一处 → 整条 fluent 链类型推断断掉、连带 1645 行的 `.put` 一起报错。
+            .put("model", embedPath ?: "")
+            .put("modelOutDim", embedOutDim)
+            .put("pooling", embedPooling)
+            .put("builtAt", System.currentTimeMillis())
+            // 失败的下标与原因进 meta.json：这是"刷新后仍能看见哪几条是坏的"的
+            // 唯一载体（日志会滚、UI 会重画）。字段名固定、原因码是英文短名
+            //（见 embed_text.h 的 failure_name），守卫正面钉住这两点。
+            .put("failedIndices", org.json.JSONArray(failedIdx))
+            .put("failReason", fails.firstOrNull()?.second?.reason ?: "")
+        val meta = metaObj.toString()
+
+        val okSave = if (stale) {
+            RagIndexStore.savePartial(ctx, name, fp, dim, rows, meta)
+        } else {
+            // 全成功：向量与正文行号一一对应，指纹与正文一致 → 索引**可直接检索**。
+            // 这里刻意仍然走 save（而不是 savePartial）—— 它带"向量行数 == 正文行数"
+            // 的硬校验，是"能检索"这个结论的判据本身。
+            val flat = FloatArray(rows.size * dim)
+            for (i in rows.indices) System.arraycopy(rows[i].vector, 0, flat, i * dim, dim)
+            RagIndexStore.save(ctx, name, fp, dim, flat, meta, rows)
+        }
+        if (!okSave) return "索引写入失败（存储空间？）"
+
+        if (stale) {
+            // 汇报必须**同时**给出四件事：成功几条 / 失败几条 / 失败的是哪几条（含原因）
+            // / **这些失败说明什么、该做什么**。
+            //
+            // ⚠ 第四件是本轮补上的。前一轮只给了前三件 —— 数据很全，结论为零：
+            // 用户看到"#1 向量范数为 0.0 …… 池化方式可能与该模型不符"之后，
+            // 仍然不知道该去查什么（"可能不符"是猜测，不是结论），于是他去换模型
+            // 或者反复重建，而真正的毛病是**填充逻辑没满足库的前置条件**。
+            // 数据不缺、缺的是把数据变成一个**可执行**的判断 —— 见 [verdictOf]。
+            val detail = fails.joinToString("；") { (i, f) -> "#${i + 1} ${f.describe()}" }
+            val more = if (failedIdx.size > fails.size) "，另有 ${failedIdx.size - fails.size} 条同类失败" else ""
+            val verdict = verdictOf(fails.map { it.second }, okCount, failedIdx.size)
+            uiLog("[知识库] $name 索引已生成但**待重建**：成功 $okCount / 失败 ${failedIdx.size} 条" +
+                "（切块 $totalChunks，正文 $rows.size 行已保留），dim=$dim")
+            uiLog("[知识库] 失败明细：$detail$more")
+            uiLog("[知识库] 结论：$verdict")
+            // 部分失败这条路也要报批级路由：它正是"为什么这批慢"的唯一线索，
+            // 而失败与回落常常同时出现（同一个档位问题）。
+            logBatchRoute(name, batch, statsBefore)
+            return "成功 $okCount 条，${failedIdx.size} 条编码失败（正文已保留，但索引需重建）—— " +
+                "$detail$more\n结论：$verdict"
+        }
+
+        uiLog("[知识库] $name 索引已重建：$okCount 条（切块 $totalChunks，跳过 $skipped），dim=$dim")
+        logBatchRoute(name, batch, statsBefore)
+        return null
+    }
+
+    /**
+     * 把**这一段建库**的批级路由说一句（ISSUE #269 第 1 步：先量）。
+     *
+     * ── 为什么非要这一行 ───────────────────────────────────
+     * 合批是**纯加速**：生效与不生效在协议上完全看不出来。此前唯一的
+     * 读数是"回落时打一行 `[embedBatch]`"—— 而那行只在**出错**时出现：
+     *  · 合批正常工作时，日志里**什么都没有**；
+     *  · 合批一次都没生效时，也只有一行行 Unavailable，而那些行与
+     *    "某一条文本空"混在一起，看不出"整轮一条都没合批"。
+     *
+     * 合一句就把"到底省了多少"从推断变成读数 —— 而这个读数
+     * 又正好是第 3 步（把 MEAN / CLS / LAST 试到可合批）要的基准。
+     *
+     * ── [before] 这个参数是干什么的 ───────────────────────────
+     * 报的是**本段增量**，不是累计。[EmbedBatchStats] 记的是进程级累计量
+     * （跨多次建库累加），而这一行说给用户听的是"我点的这一次建库"。
+     * 把累计值写成"本轮"是本仓库真出过的一处措辞错：用户拿这行去比
+     * "批4 vs 批1"时，读到的是两个几乎相等的累计值（相邻两次只差 4 条），
+     * 会读成"批大小没生效"。所以开工时留一份基线 [before]，此处一减就是本段。
+     *
+     * ⚠ 只在**批级**打（一轮建库一行），不逐条打：逐条打会在一个万条库上
+     * 产生一万行（正是 [uiProgress] 那段说的"上万行不进 ring"的原因）。
+     * ⚠ 那两处 `hint` 的判据也一并从"本段"读：一句话里"回落 N 批"是段的数，
+     *   而"合批一次都没生效"这个结论必须与它同源 —— 拿累计值判 hint、
+     *   拿段值报数字，会出现"本段合批 4 批"配"合批一次都没生效"的自相矛盾。
+     */
+    private fun logBatchRoute(name: String, batch: Int, before: EmbedBatchStats.Snapshot) {
+        val s = EmbedBatchStats.delta(before, EmbedBatchStats.snapshot())
+        // 合批一次都没生效时这一行必须**明说**原因方向（档位？批大小？）——
+        // 否则用户只看到"回落 N 批"，而下一步该去哪儿看完全没线索。
+        val hint = when {
+            s.fellBackBatches <= 0L -> ""
+            s.batchedBatches <= 0L ->
+                // ⚠ 0.9.208 起 pooling 档位**不再**是"合批不生效"的可能原因
+                //（所有 `plan_pooling` 认的档都能合批了，详见
+                // `embedtext::batchable_pooling`）。这句话此前写的是
+                // "MEAN/CLS/LAST 那三档不合批" —— 留着它就是一句**过期且指向错方向**
+                // 的排查提示（用户会去换模型，而真正的原因在批大小或某几条文本上）。
+                "（本段合批**一次都没生效**：先看上面的 `[embedBatch]` 行——" +
+                    "它报的是这一批为什么被拒，多半是批大小超过 native 上限）"
+            else -> "（本段部分回落：看上面的 `[embedBatch]` 行定位是档位还是某条文本）"
+        }
+        uiLog("[知识库] $name 批级读数（本段批大小=$batch，只算这一次建库）：" +
+            "${EmbedBatchStats.describe(s, EmbedBatchStats.kScopeThisBuild)}$hint")
+    }
+
+    /** 汇报给用户的失败明细上限：再多就刷爆界面，而"有几条"另有总数。 */
+    private val kMaxReportedFails = 20
+
+    /**
+     * 建索引时**每编多少块**就把"已算好的前缀"落一次盘（续编的粒度）。
+     *
+     * ═══════════════════════════════════════════════════════════════════════
+     * 为什么是**块数**而不是条数
+     * ═══════════════════════════════════════════════════════════════════════
+     * 用户提的是"每 100 条存一次"——那是按**正文条数**算的，而建库的耗时由
+     * **块数**主导：一条 3 MB 的长文档能切出一万块，100 条这个粒度在它面前
+     * 一辈子碰不到（一条就有一万块）。所以粒度必须与耗时同源。
+     *
+     * 取 2000 的道理：按合批 8 条一批、每批几十毫秒到几百毫秒估，2000 块 ≈
+     * 几十秒到几分钟落一次 —— 中途被杀最多重跑这一档。再小（比如 200）
+     * 会让落盘本身成为可观开销（每次都是全量重写 [RagIndexStore.savePartial]，
+     * 而它要写整份正文 + 全部前缀向量）。
+     * ⚠ 与 [kEmbedResumePersistMs] 是**两道闸**（谁先到算谁）：块数闸管"编得快"，
+     *   时间闸管"编得慢"（慢机器上 2000 块可能超过 3 分钟，那时时间闸先到）。
+     */
+    private const val kEmbedResumePersistChunks = 2000
+
+    /**
+     * 建索引时**至少每多少毫秒**落一次盘（与 [kEmbedResumePersistChunks] 并行的第二道闸）。
+     *
+     * 取 3 分钟：用户提的"每 3 分钟一次"。它兜住的是"块很大 / 机器很慢"那种
+     * 一档都编不完的情形 —— 只有块数闸的话，一份上万块的文档在慢机器上
+     * 可能十几分钟才落一次，而中途被杀就白费那十几分钟。
+     */
+    private const val kEmbedResumePersistMs = 3 * 60 * 1000L
+
+    /**
+     * 阶段性落盘（续编用）写进 `meta.json` 的那份说明。
+     *
+     * ⚠ 它与收尾那份 meta 是**两份**：收尾那份带 `failedIndices` / `failReason`
+     *（"哪几条坏了"），而阶段性的这份**必然没有失败**（有失败就不落，见 [buildIndex]），
+     * 所以它不写那两个字段。共用一份的后果是：阶段性那份里 `failedIndices`
+     * 是空数组、"没有失败"与"还没编到"在 meta 上长得一样 —— 而 meta 是
+     * 排障时唯一一眼能看的东西。
+     *
+     * `entries` 与 `rows` 都写**预计总数**（不是已编数）：meta 描述的是"这个库
+     * 应该有多少条"，而不是"这次跑到哪了"—— 后者由 `index.bin` 头里的 count 说。
+     * 两份都写"已编数"会让"中途退出"与"库里就这么几条"在 meta 上分不开。
+     */
+    private fun partialMeta(name: String, done: Int, total: Int, dim: Int,
+                            cp: RagIndexStore.ChunkParams): String = org.json.JSONObject()
+        .put("library", name)
+        .put("entries", total)
+        .put("rows", total)
+        .put("chunks", total)
+        .put("skipped", 0)
+        .put("dim", dim)
+        .put("targetChars", cp.targetChars)
+        .put("overlapChars", cp.overlapChars)
+        .put("model", embedPath ?: "")
+        .put("modelOutDim", embedOutDim)
+        .put("pooling", embedPooling)
+        .put("builtAt", System.currentTimeMillis())
+        // 续编进度**自报**（只给人看，不参与判据）：真值在 index.bin 的 count 里，
+        // 但排障时"这份 index.bin 到底编到哪了"能在一眼处看到，比去算 count 省事。
+        .put("resumeUpto", done)
+        .toString()
+
+    /**
+     * 逐条编码时**每多少条**回一次进度。
+     *
+     * 取 32 的道理：一条嵌入在手机上约几毫秒到几十毫秒，32 条 ≈ 0.1~1 秒 ——
+     * 那就够让计数"看着在走"了，而 UI 侧还有一层时间节流（见 EngineActivity 的
+     * 进度行），两道闸合起来保证不管块数多大，主线程每秒最多排几次版。
+     * 取 1 会把每个块都过一遍整流（上万次跨线程 post），取 1000 又会让小库
+     * 一次进度都不报（那正是"卡死"的观感）。
+     */
+    private const val kProgressEvery = 32
+
+    /**
+     * 每批默认塞几条（ISSUE #269 的另一半；第 2 步起可调）。
+     *
+     * ⚠ 它是**默认值**，不再是硬编进循环里的常量：真正跑多少由
+     * [buildIndex] 的 `embedBatchSize` 参数决定（设置页可改），经 [kEmbedBatchLimit] 钳到
+     * native 的上限。
+     *
+     * 数值与那段"为什么是 8"的推导都在 [EmbedLimits.kEmbedBatchDefault] ——
+     * 搬过去是为了让宿主单测编得过（本文件依赖 Android，编不到宿主上）。
+     */
+    const val kEmbedBatchDefault = EmbedLimits.kEmbedBatchDefault
+
+    /**
+     * native 侧合批的**真实上限**（= 建嵌入 ctx 时写进 `n_seq_max` 的 `kEmbedBatchRows`）。
+     *
+     * 与 native 那一份**同一个数**，判据正面钉住（`check_embed_batch_wiring.py`）；
+     * 为什么 Kotlin 这边也留一份、以及"不等就白批"的那段推导，见
+     * [EmbedLimits.kEmbedBatchRows]。
+     */
+    const val kEmbedBatchRows = EmbedLimits.kEmbedBatchRows
+
+    /**
+     * **每条**文本的上下文预算（默认，= native 侧 `kEmbedDefaultCtx`）。
+     *
+     * ⚠ 与 [kEmbedBatchRows] 是同一个数的两面，**必须一起看**：native 侧
+     * `n_ctx = 每条预算 × kEmbedBatchRows`（再按 [kEmbedCtxMax] 钳），
+     * 而两道门（`n_batch` / `n_ubatch`）设成这个总量 —— "8 条满长能不能一次装下"
+     * 就是 `8 × (预算-1) ≤ 总量` 这件事。
+     *
+     * 它同时是**内存主项**：`embeddings=true` 时 KV / output / compute buffer
+     * 都按它分配。所以"内存占用为啥高"的答案通常在这一格，而不是在批大小那格
+     *（批大小只决定"一次塞几条"，不改 ctx 容量）。
+     */
+    const val kEmbedCtxDefault = 512
+
+    /**
+     * 每条预算的**上限**（= native 侧 `kEmbedMaxCtx` 与 `n_ctx` 总量的上限）。
+     *
+     * 与 native 那个常量**同一个数**（守卫正面钉两处相等，见
+     * `check_embed_gate_settings.py`）：设置页要在加载**之前**就知道合法区间，
+     * 而那个价值只有加载完成后才由库给出 —— 所以只能在这儿再写一份 + 守卫比对。
+     *
+     * ⚠ 之所以不是"想填多大就多大"：这个数直接乘出 ctx 总量，而 ctx 总量决定
+     * 一份**不可协商**的内存分配。给大了的表现是"嵌入模型加载失败"，
+     * 而用户完全看不出是这一格给大了（他会以为 GGUF 坏了）—— 与"嵌入 n_ctx
+     * 必须被钳"那条守卫守的是同一件事。
+     */
+    const val kEmbedCtxMax = 4096
+
+    /**
+     * 把用户意愿钳到 native 真能跑的区间：`1..kEmbedCtxMax`。
+     *
+     * 与 [kEmbedBatchLimit] 同一形态、同一理由：设置页（限制输入）与加载
+     *（真正传给 native）两处各钳一遍时迟早分岔，而分岔的症状是
+     * "输入框里 4096、日志里跑 512，界面上一个字都没有"。
+     * 非正数当默认值：0 在 native 侧是"用默认"，而这一格填 0 的用户意图是
+     * "别给我搞坏"，不是"要一个 0 的上下文"。
+     */
+    fun kEmbedCtxLimit(want: Int): Int =
+        if (want <= 0) kEmbedCtxDefault else minOf(want, kEmbedCtxMax)
+
+    /**
+     * 把用户意愿钳到**native 真能跑的区间**：`1..kEmbedBatchRows`。
+     *
+     * 一个纯函数（可离线单测），为什么：它被**设置页**（限制输入）与
+     * **建库**（真正跑多少）两处调用，两处各写一份时很容易分岔 ——
+     * 而分岔的症状是"输入框里写 16、日志里跑 8，界面上一个字都没有"（正是
+     * 本 issue 最初那个"线程数输入框对建库无效"的同一形态）。
+     *
+     * 下限是 1（= 关合批，每次只编一条 —— 逐条路径本来就是合法的，用户要对比时需要它）。
+     * 非正数（ 0 / 负）当 1：0 在循环里是死循环（`end == i` 永远不进）——
+     * 而"死循环"是比"跑慢" 更坏的一种失败（界面卡死而不报错）。
+     */
+    fun kEmbedBatchLimit(want: Int): Int =
+        if (want <= 0) 1 else minOf(want, kEmbedBatchRows)
+
+    /**
+     * 切块用的分隔符表 —— **与 `rag_index.h` 的 `kChunkSeps` 是逐条契约**。
+     *
+     * ═══════════════════════════════════════════════════════════════════════
+     * 为什么只有两级（段落 + 句读），以及为什么必需与 C++ 侧一模一样
+     * ═══════════════════════════════════════════════════════════════════════
+     * 上一版这里是"段落 > 换行 > 任意位置"三级，而 C++ 侧同源。用户提出的
+     * 五级阶梯（再加逗号 / 顿号 / 空格 / `-`）被否掉了，理由写在 `rag_index.h`
+     * 的 `kChunkSeps` 注释里（两条会切出错块的路径，穷举都撞出来了）：
+     * ① 切在 UTF-8 码点中间（`。` 是 3 字节，而切点是**字节偏移**）；
+     * ② 窗口内找不到就往回找最近的一次，`cut <= pos` 时兜底成"前进 1 字节"，
+     *    于是 `pos` 到那次匹配之间的正文**整段丢掉**，不报错、块数正常。
+     * 修法就是这份表现在这个样子：两级 + "窗口内找不到就硬截"这一条铁律。
+     *
+     * 两份**表**与**次序**都必须逐条相等：`t`/`o` 只描述"块多大"，
+     * 描述不了"从哪儿切"。表分了家而两个数相同 -> 指纹相同 -> 旧索引被当新的用，
+     * 而"用旧边界算的向量命中、注入新边界切出的正文"是**静默**的。
+     * `tools/run_rag_index_guard.sh` 的 `chunk_seps_consistent` 逐条比对。
+     *
+     * ⚠ 表本身**不在这个文件里**：它是 [TextBoundary.SOFT_CUT_SEPS]。而它还有
+     *   第二个消费方 —— `RagArchive.splitLongLine`（导入超长正文时切成多条条目）。
+     *   那边此前抄了第二份表（并多出 `…` `:`、少了段落级），那份表**没有任何判据
+     *   绑着**：改这里或改那里，另一处不会红，而症状是"同一份正文按行导入与按库
+     *   建索引切得不一样"，逐字相同地看不出来。合并成一份之后，本文件只剩
+     *   "怎么用"，"用什么"在那一处。
+     */
+    private val kChunkSeps: List<Pair<String, Boolean>> get() = TextBoundary.SOFT_CUT_SEPS
+
+    /** [kChunkSeps] 里最长分隔符的宽度（code unit）—— 找切点时的回看距离。 */
+    private val kSepMaxWidth: Int = TextBoundary.maxSepWidth()
+
+    /**
+     * 从**失败形态**得出一个可执行的结论 —— 这是"数据"与"判断"的分界线。
+     *
+     * ═══════════════════════════════════════════════════════════════════════
+     * 为什么必须有这一步（而不是把失败明细直接丢给用户）
+     * ═══════════════════════════════════════════════════════════════════════
+     * `EmbedFail.describe()` 给的是**这一条为什么失败**（含实值），
+     * 那是归因，不是结论。两者差多远，用用户报的那两例量一下：
+     *
+     *   · BGE 系：**全部**失败，每条 `zero_norm`（或本轮修掉之前的 `decode_failed`）。
+     *     结论应该是"这个库**一条都建不起来**，别再单条重试了 —— 看下面那一条
+     *     关于池化/契约的话"。而"逐条给出原因"会让用户以为是个别内容的问题，
+     *     于是他去改文案、去重试那几条 —— 方向完全错（换任何内容都一样失败）。
+     *
+     *   · Qwen3-Embedding：**有的成功、有的失败**。
+     *     这才更像"个别条目"的问题，结论应该是"索引整体可用（前 N 条排上了），
+     *     把这 M 条改掉再重建"。
+     *
+     * 两种形态在失败数量上长得一样（都是"失败 M 条"），而**处置完全相反**：
+     * 全败要看**配置**（模型/池化/契约），部分失败要看**内容**。
+     * 把"看配置"的故障说成"看内容"，用户会在错的方向上耗掉一整个晚上 ——
+     * 而这恰好就是这次真实的经历。所以这一句不给猜，只给**判据能支撑的结论**。
+     *
+     * 判据与实测对齐：**全败**（`okCount == 0`）才算"配置/契约"级；
+     * 只要有一条成功，就说明"模型能跑、池化对、契约满足"，
+     * 剩下的失败只可能来自内容或内存压力（那才该逐条看）。
+     */
+    private fun verdictOf(fails: List<EmbedFail>, okCount: Int, failCount: Int): String {
+        if (failCount == 0) return "无失败"
+        val reasons = fails.map { it.reason }.toSet()
+        // 全败：问题在"这套配置"上，不在某几条内容上。
+        if (okCount == 0) {
+            val head = "这一批**一条都没成功** —— 问题不在内容，在**嵌入配置**上"
+            return when {
+                // 契约失败是我们自己的填充 bug，说清楚别让用户去换模型。
+                //
+                // ⚠ 这里**不再写"升级到含本修复的版本"**。那句话是上一轮留下的，
+                // 而它把用户带进了错方向：他手上的包**已经有**那个修复（日志里
+                // 同时出现了只有新版才打的归因行），症状却照旧 —— 于是"升级"
+                // 变成了一句无法执行、也无法反驳的建议，他只能反复换模型。
+                // 结论只写**判据能支撑的那一句**：这是我们这边的问题，不是模型/内容。
+                "pooling_contract" in reasons ->
+                    "${head}：我们提交给库的输出标记不满足该池化方式的前置要求" +
+                        "（这是我们填充逻辑的问题，与你的模型和文本都无关；" +
+                        "请把这条日志连同模型文件名一起反馈）"
+                "dim_mismatch" in reasons ->
+                    "${head}：模型上报名义维度与实际输出维度不一致（n_embd!=n_embd_out），" +
+                        "当前版本拒绝读取；换一个 GGUF 试，并把两个维度一起反馈"
+                // 零范数：**可能**是取错了位置（读取侧），也可能是这一档池化
+                // 还没被支持。不再甩一句"升级"—— 那是把举证责任推给用户，
+                // 而我们连"是读取侧的哪一支"都还没定位到时，那句话等于没信息。
+                "zero_norm" in reasons ->
+                    "${head}：向量范数恒为 0 —— 这一档池化的取值位置我们还没取对。" +
+                        "与你的模型和文本无关（换内容、换模型都一样失败）；" +
+                        "请把这条日志连同模型文件名一起反馈"
+                "decode_failed" in reasons ->
+                    "${head}：前向计算**每一条**都失败 —— 优先怀疑嵌入模型的 ctx/线程参数，" +
+                        "而不是这一批文本"
+                else -> "${head}：按下面的明细逐条看，但它们「全败」这件事本身指向配置"
+            }
+        }
+        // 部分失败：索引整体可用，是个别条目的问题。
+        return "索引整体可用（$okCount 条已排上），只有 $failCount 条没编上 —— " +
+            "按 #序号 改掉那几条内容（或缩短它们）再点「建库/重建」；" +
+            "不必换模型"
+    }
+
+    /**
+     * 把编好的正文**只保存**（不重算向量、不重建索引）。RAG 阶段 2 的「保存正文」用它。
+     *
+     * 返回 null = 已保存；否则是给用户看的失败原因。**不抛异常**（后台线程上跑）。
+     *
+     * 为什么先要求"该库已有索引"：**"保存"这件事的语义是"改写一个已经建好的库"**
+     * （`texts.jsonl` 与 `index.bin` 行号一一对应，而这里只改前者）。
+     * 一个从来没有索引的库要落盘，走的是另一条路 ——「建索引/重建索引」或
+     * pending 的自动保存（`importEntries`）—— 那条路会把正文与向量一起建起来。
+     *
+     * [!] 两条判据是**分开**问的（库在不在 / 索引在不在），因为它们的处置不同：
+     *     · 库不存在 -> "先新建或导入一个"；
+     *     · 库在、索引不在（待重建）-> "先点建索引/重建索引"。
+     *     合成一句"该库还没有索引"的后果：用户拿着一个**已经导入完正文**的库
+     *     点保存，得到的指引是"先点建索引/重建索引"，而那句话对"我要把这次编辑
+     *     存下来"给不出出路（他只能整库重建，几十秒）。
+     *
+     * ⚠ 保存后索引会**失效**（指纹里的正文 hash 对不上了）：正文与向量是一对，
+     * 改了正文而没重算向量，检索会用旧语义命中、注入新正文。用户必须点
+     * 「建库/重建」才恢复可检索 —— 状态行会明确这么说，不靠用户自己猜。
+     */
+    fun saveTexts(ctx: android.content.Context, name: String, docs: List<RagIndexStore.Entry>): String? {
+        if (RagIndexStore.dirOf(ctx, name) == null) return "库名非法（只允许字母/数字/中文/-/_/.，且非空）"
+        if (!RagIndexStore.isPresent(ctx, name)) return "磁盘上没有这个库：先新建或导入一个"
+        if (RagIndexStore.indexFile(ctx, name)?.isFile != true) return "该库还没有索引：先点「建索引/重建索引」"
+        if (!RagIndexStore.saveTexts(ctx, name, docs)) return "正文写入失败（存储空间？）"
+        val sync = RagIndexStore.textsInSync(ctx, name)
+        uiLog("[知识库] $name 正文已保存：${docs.size} 条" +
+            if (sync) "（与索引一致，检索不受影响）"
+            else "（与索引不一致，检索已停用：点「建库/重建」恢复）")
+        return null
+    }
+
+    // ══════════════════════════════════════════════════════════════════════════
+    //  导入 / 导出（知识库正文）—— 不需要嵌入模型，纯文件读写
+    // ══════════════════════════════════════════════════════════════════════════
+
+    /**
+     * 导出某个库的正文为信封 JSON（见 [RagArchive]）。返回 (文件名正文, 内容)，
+     * 库空 / 库名非法返回 null。
+     *
+     * 为什么**不经过 native**：导出只是把 `texts.jsonl` 换个壳，一条向量都不碰。
+     * 把它接到嵌入模型上会让"导出"在模型没加载时不可用 —— 而导出的最典型场景
+     * 恰恰是"准备换手机/重装"，那时候模型可能根本没装。
+     */
+    fun exportRagArchive(ctx: android.content.Context, name: String): String? {
+        if (RagIndexStore.dirOf(ctx, name) == null) return null
+        val rows = RagIndexStore.exportEntries(ctx, name)
+        if (rows.isEmpty()) return null
+        return RagArchive.encode(name, rows, System.currentTimeMillis())
+    }
+
+    /**
+     * 导入正文到某个库（**合并追加**，不覆盖）。
+     *
+     * 返回给用户看的**结果文案**（不是 null/异常二态）：条数、跳过数、
+     * 以及"索引已作废，请点重建"这句**必须**说出来的话。
+     *
+     * 为什么必须说"需重建"而不能只说"导入成功"：合并之后正文比索引多，
+     * 检索已经停了。用户如果以为"导入完就能搜"，他会对着一个搜不出东西的库
+     * 反复试同一个关键词 —— 而那是本仓库最忌讳的那种"没有任何现象指向原因"。
+     */
+    fun importRagEntries(ctx: android.content.Context, name: String,
+                         entries: List<RagIndexStore.Entry>): String {
+        if (RagIndexStore.dirOf(ctx, name) == null) {
+            return "库名非法（只允许字母/数字/中文/-/_/.，且非空）"
+        }
+        val hadIndex = RagIndexStore.isPresent(ctx, name)
+        val total = RagIndexStore.importEntries(ctx, name, entries)
+        if (total < 0) return "导入失败：正文写入失败（存储空间？或超过单库上限）"
+        uiLog("[知识库] $name 导入 ${entries.size} 条 → 共 $total 条" +
+            if (hadIndex) "（原索引已作废：正文变了，向量必须重算）" else "（该库尚无索引）")
+        return "已导入 ${entries.size} 条，共 $total 条。\n" +
+            (if (hadIndex) "⚠ 原索引已作废（正文变了、向量还是旧的）——点「建库/重建」才能重新检索"
+             else "该库还没有索引——点「建库/重建」后才能检索")
+    }
+
+    // ══════════════════════════════════════════════════════════════════════════
+    //  追加一条 / 删除单条（RAG 阶段 3）—— 只编码一条，其余向量原样搬
+    // ══════════════════════════════════════════════════════════════════════════
+    //
+    // 阶段 2 之前，"加一条"只有两条路：重粘全量再重建（100 条要等 5~30 秒），
+    // 或者改完正文只保存（索引立刻失效、检索停用）。于是"维护知识库"在用户手里
+    // 永远是一次**整库操作**，而他想做的往往只是"补一句笔记"。
+    //
+    // 这一层只做两件事：把**一条**文本编码成向量，然后把它交给存储层去做
+    // 追加/删除。判据（行号对齐 / 指纹 / 三态）全在 [RagIndexStore] 里，
+    // 这里只负责"别把没编码成功的东西当成编码成功"。
+
+    /**
+     * 追加一条：只编码这一条，索引里其余向量原样搬。
+     *
+     * 返回 null = 成功；否则是给用户看的失败原因。**不抛异常**（后台线程上跑）。
+     *
+     * 先决条件与建库**同一组**（缺一不可，缺哪个都有对应的静默失效）：
+     * · 库名合法（非法名不静默回落成另一个名字）；
+     * · 该库**已有索引**（没有索引的目录不会出现在库列表里，写进去等于写进一个
+     *   谁也看不见的孤儿目录 —— "存成功了但看不到"比报错难查得多）；
+     * · 嵌入模型已加载（没加载时 embed() 返回 null，而"追加成功"照样显示）；
+     * · 该库的指纹**对得上**（正文被改过 / 换过模型时，先把向量补齐会造成
+     *   "旧向量 + 新正文"的一份索引 —— 那不是"追加"，那是"假装它是齐的"）。
+     *
+     * ⚠ 最后一条是本函数与"保存正文"的分工线：**改过正文的库不许追加**，
+     * 必须先「建库/重建」。追加是"索引本来是齐的，我只是在末尾补一条"，
+     * 而"索引本来就不齐"的情况下补齐末尾，只会让不齐的那部分更难发现。
+     */
+    fun addEntry(ctx: android.content.Context, name: String, text: String,
+                 source: String = ""): String? {
+        if (RagIndexStore.dirOf(ctx, name) == null) return "库名非法（只允许字母/数字/中文/-/_/.，且非空）"
+        if (!RagIndexStore.isPresent(ctx, name)) return "磁盘上没有这个库：先新建或导入一个"
+        if (RagIndexStore.indexFile(ctx, name)?.isFile != true) return "该库还没有索引：先点「建索引/重建索引」"
+        if (!hasEmbedModel) return "尚未加载嵌入模型（向量只能用它算）"
+        val dim = embedDim
+        if (dim <= 0) return "嵌入模型维度取不到（加载可能不完整）"
+        val trimmed = text.trim()
+        if (trimmed.isEmpty()) return "这一条是空的（空文本编码不出来，也不会进索引）"
+        // 超长先截到一块的大小：追加**不做分块**（一条进正文、一条进向量区，
+        // 行号一一对应）。让一条超长文本整条进去的后果是它被 native 截断到 n_ctx，
+        // 向量只覆盖开头那部分语义，而检索命中它时注入的却是**全文** ——
+        // 相关性判断与注入内容说的不是一件事。这里明确截到目标块大小并提示。
+        val cp = RagIndexStore.ChunkParams()
+        // ⚠ 截断**必须出声**（第 3 步，用户拍板）：旧代码注释写着"并提示"，但代码里
+        // 没有提示 —— 于是用户以为整条进去了，实际只索引了前 [targetChars] 个字，
+        // 而检索命中它时注入的是**全文**。也就是说「相关性判断」与「注入内容」
+        // 说的不是一件事：用户看到"这条命中得很准"，模型看到的却是另一段文本。
+        // 这里截断后仍照常编码（不改变行为），只多给一句可操作的话。
+        val truncated = trimmed.length > cp.targetChars
+        // ⚠ 按**字符边界**截（不是裸 `substring`）：截断点直接决定落进
+        //    `texts.jsonl` 的那条正文。切在代理对中间会留下一个孤立代理 ——
+        //    内存里 JSON 往返与 `==` 全都通过（单测用 `.length` 断言恒绿），
+        //    而 `toByteArray(UTF_8)` 时被替换成 `?`（不可逆）。
+        //    分块路径（[chunk]）早就走 `alignUtf8` 做同一件事，这里此前漏了。
+        //    与 `rag_index.h` 的 `align_utf8_back` 同源，见
+        //    [TextBoundary.clipAtCharBoundary]。
+        val clipped = if (truncated) TextBoundary.clipAtCharBoundary(trimmed, cp.targetChars) else trimmed
+        val v = embed(clipped) ?: run {
+            // 失败详情**带上这一条的内容**（截断到 40 字）：用户点「追加」时
+            // 他知道自己刚敲了什么，但 100 条里其他坏条目他不知道 —— 而"哪一条"
+            // 是唯一能让他动手的信息。早先那句"检查内存"在两个根因下都成立，
+            // 方向还是错的（真正的原因多半是池化/维度，不是内存）。
+            val why = lastEmbedFailure()?.describe() ?: "编码失败"
+            val head = if (trimmed.length > 40) trimmed.substring(0, 40) + "…" else trimmed
+            return "这一条追加失败：「$head」—— $why"
+        }
+        if (v.size != dim) return "编码维度不符（${v.size} != $dim，模型可能被换过）"
+        val src = if (source.isNotBlank()) source else "追加-$name"
+        return when (RagIndexStore.appendEntries(ctx, name,
+            listOf(RagIndexStore.Entry(clipped, src, v)))) {
+            RagIndexStore.EditResult.OK -> {
+                uiLog("[知识库] $name 追加 1 条（只编码这一条，其余向量原位保留）")
+                // 成功也要把截断说出来：这一条的**向量**只覆盖了前 [cp.targetChars]
+                // 个字，而检索命中它时注入的是全文 —— 不提示，用户永远不知道
+                // "这条为什么检索不太准"。
+                if (truncated) "已追加，但这一条超过 ${cp.targetChars} 字，只索引了前 ${cp.targetChars} 字" +
+                    "（检索命中时仍会注入全文）。建议拆成多条追加。" else null
+            }
+            RagIndexStore.EditResult.STALE -> {
+                uiLog("[知识库] $name 追加了正文但向量没落进去，索引需重建")
+                "正文已追加，但索引没跟上（需点「建库/重建」才可检索）"
+            }
+            RagIndexStore.EditResult.FAILED ->
+                "追加失败：该库的索引与正文对不上（或正文被改过）—— 请点「建库/重建」"
+        }
+    }
+
+
+    /**
+     * 「改内容、行数不变」→ **只重算改过的那几行向量**，正文与向量一起写回
+     * （ISSUE #228；返回 null = 全部写回且索引**仍然可用**）。
+     *
+     * ══════════════════════════════════════════════════════════════════════════
+     * 这条路径解决的正是用户问的那件事
+     * ══════════════════════════════════════════════════════════════════════════
+     * 用户原话：*"改内容、行数不变 → 重算改那一行。"*
+     *
+     * 在此之前，在正文框里改一个字只有两条路：
+     *   · 「保存正文」—— 只写 `texts.jsonl`，索引随即失效，**要整库重建**
+     *     （几千条 = 几十分钟）；
+     *   · 「删掉那一条 + 追加一条」—— 换了行号，也换了向量。
+     * 改错别字 / 补标点 / 修一句被切坏的话，是编辑里最常见的动作，而它此前
+     * 无论走哪条都**不划算**。这一条把它的代价降到"一条前向"。
+     *
+     * ══════════════════════════════════════════════════════════════════════════
+     * 为什么"只算改过的那几行"成立
+     * ══════════════════════════════════════════════════════════════════════════
+     * 一条正文的向量**只由那一条正文决定**（切块在建库时就定了，这里不动块集合）。
+     * 所以改第 3、7 行时，其余每一行的向量**逐位仍然是对的** —— 这正是
+     * [RagIndexStore.replaceRowsWithVectors] 只按行偏移替换的依据。
+     *
+     * ⚠ 前提是**索引本来就是齐整且与正文同步的**（见那个函数里 ③ 那段）。
+     *   不成立时整次退回"只写正文 + 报需重建"（[RagIndexStore.replaceRowsInPlace]
+     *   那条老路）—— 调用方据返回值区分，见 [RewriteResult]。
+     *
+     * ══════════════════════════════════════════════════════════════════════════
+     * 为什么**必须**先确认"当前索引可用"，而不是直接编码
+     * ══════════════════════════════════════════════════════════════════════════
+     * 1. 指纹里那 12 格（模型身份 / 池化 / 切块参数 / 批大小）是从**磁盘上那份索引**
+     *    照搬的（见 [RagIndexStore.replaceRowsWithVectors]）。若当前嵌入模型与
+     *    那份索引的模型**不是同一份**，我们算出来的向量与索引里其余行**不同源** ——
+     *    写下去就是"一份索引里两种语义"，而它**不报错**（分数看着像随机）。
+     *    这一条用 [RagIndexStore.load] 那把**与检索同源**的尺子挡：
+     *    "索引可用" = "指纹与当前模型/参数逐字段相同"，正是我们需要的那个前提。
+     *    自己另写一个"模型路径相同吗"的近似判据就是下一次分家（本仓库吃过的）。
+     * 2. 索引**半份**（建库中途被杀）时后面那些行没有向量，谈不上"改哪一行"。
+     *    这种情况 [RagIndexStore.replaceRowsWithVectors] 也会拒 —— 但先在这里
+     *    分出来，是为了给用户**不同的一句话**（续编 vs 重建），而不是笼统失败。
+     *
+     * @param indices 正文文件里的行号（可乱序）
+     * @param texts   与 [indices] 逐位对齐的新正文（**解码之后**的）
+     * @return [RewriteResult.IndexRebuilt] = 索引仍然可用（检索照常，命中的是新内容）；
+     *         [RewriteResult.TextsOnly]   = 正文写回了、但索引**待重建**
+     *         （改动不丢，检索停用 —— 与老口径逐字相同）；
+     *         [RewriteResult.Failed]      = 一个字节都没写。
+     */
+    fun rewriteRows(ctx: android.content.Context, name: String,
+                    indices: List<Int>, texts: List<String>): RewriteResult {
+        if (indices.isEmpty() || indices.size != texts.size) return RewriteResult.Failed(
+            "没有要改的行")
+        if (RagIndexStore.dirOf(ctx, name) == null) return RewriteResult.Failed(
+            "库名非法（只允许字母/数字/中文/-/_/.，且非空）")
+        if (RagIndexStore.indexFile(ctx, name)?.isFile != true) return RewriteResult.Failed(
+            "该库还没有索引：先点「建索引/重建索引」")
+        if (!hasEmbedModel) return RewriteResult.Failed(
+            "尚未加载嵌入模型：改字要重算这一条的向量")
+        val dim = embedDim
+        if (dim <= 0) return RewriteResult.Failed("嵌入模型维度取不到（加载可能不完整）")
+
+        // ── 编码**改过的那几条**（逐条，不是整库）───────────────────────────
+        // ⚠ 逐条而不是合批：这里的条数就是"用户改了几行"（通常 1~3 条），
+        //   合批那点固定开销的节省在这个量级上等于零，而合批会引入一个真问题 ——
+        //   `g`（每批条数）进了指纹，而磁盘上那份索引的 `g` 是**建库时**的值。
+        //   这里编码用的是"改了几条"，与那个值无关；指纹那一格仍然照搬磁盘那份
+        //   （见 [RagIndexStore.replaceRowsWithVectors]），所以不会写出一份
+        //   "指纹说 g=8、实际是 1 条编出来的"的索引。逐条编码让这件事根本没有歧义。
+        val vecs = ArrayList<FloatArray>(texts.size)
+        val failed = ArrayList<Int>()
+        for (k in texts.indices) {
+            val t = texts[k].trim()
+            if (t.isEmpty()) return RewriteResult.Failed(
+                "第 ${indices[k] + 1} 行改成了空的 —— 空文本编码不出来（要删这一条请用列表里的「删」）")
+            val v = embed(t)
+            if (v == null || v.size != dim) {
+                failed.add(k)
+                vecs.add(FloatArray(0))
+            } else {
+                vecs.add(v)
+            }
+        }
+        // ── 有任何一条编不出来 -> **整次不写**，退回"只写正文 + 待重建" ────────
+        // 为什么不是"成功的写回、失败的那条留着"：那会写出一份"部分新语义"的索引
+        // ——成功的行是新向量、失败的行还是旧向量（而它的正文**已经变了**），
+        // 于是那一行"向量与正文不同源"，症状是"这一条检索不准"，
+        // 而它**没有任何现象**。
+        // 退回老路（只写正文）之后，整个索引被判为"需重建" —— 一个说得清、
+        // 且用户下一步动作唯一的状态。详见 [RewriteResult] 的三态。
+        if (failed.isNotEmpty()) {
+            val why = lastEmbedFailure()?.describe() ?: "编码失败"
+            val rows = failed.map { indices[it] + 1 }.joinToString(",")
+            val textsWritten = RagIndexStore.replaceRowsInPlace(ctx, name, indices, texts)
+            uiLog("[知识库] $name 有 ${failed.size} 条（第 $rows 行）重算向量失败（$why）——" +
+                "已只写回正文，索引待重建")
+            return if (textsWritten == RagIndexStore.EditResult.OK)
+                RewriteResult.TextsOnly("第 $rows 行没能重算向量（$why）")
+            else RewriteResult.Failed("第 $rows 行重算失败，且正文也没写进磁盘")
+        }
+
+        // ── 先确认"磁盘上那份索引此刻可用" —— 否则退回老路（见函数头 1/2）──────
+        // 尺子与检索**同源**：`embedFpInput` + 磁盘上的正文 + 当前的批大小偏好。
+        // 批大小取 [EmbedBatchPref]（而不是"本次编了几条"）：判据是"当前配置下
+        // 这份索引还算不算数"，与 [search] 那一处逐字相同。
+        if (!indexUsableForRewrite(ctx, name)) {
+            val textsWritten = RagIndexStore.replaceRowsInPlace(ctx, name, indices, texts)
+            uiLog("[知识库] $name 索引与当前模型/参数不同源（或只是半份）——" +
+                "这次只写回正文，索引待重建")
+            return if (textsWritten == RagIndexStore.EditResult.OK)
+                RewriteResult.TextsOnly("索引当前不可用（与建库时的模型/参数不同，或只是半份）")
+            else RewriteResult.Failed("正文没能写进磁盘（行号对不上或磁盘满）")
+        }
+
+        return when (RagIndexStore.replaceRowsWithVectors(ctx, name, indices, texts, vecs)) {
+            RagIndexStore.EditResult.OK -> {
+                uiLog("[知识库] $name 按行改字 ${indices.size} 条（第 " +
+                    "${indices.joinToString(",") { (it + 1).toString() }} 行）——" +
+                    "只重算这几条的向量，其余向量原位保留，**无需重建**")
+                RewriteResult.IndexRebuilt
+            }
+            // `STALE` = 索引写下去了、正文没写上（或反过来）。两个文件此刻**不同源**，
+            // 于是索引会被判"需重建" —— 与"只写了正文"同一种可恢复状态，
+            // 但对用户是另一句话（"这次没改全"）。
+            RagIndexStore.EditResult.STALE -> {
+                uiLog("[知识库] $name 按行改字只写进去了一半（索引与正文不同源），索引待重建")
+                RewriteResult.TextsOnly("这次只写进去了一半，索引待重建")
+            }
+            RagIndexStore.EditResult.FAILED -> {
+                // 走到这里说明上面两道闸都过了、而写盘那一跳仍拒了 ——
+                // 最可能的是"读盘之后、写盘之前库被改过"（行号对不上）。
+                // 退回老路再试一次，让用户的改动至少落到正文里。
+                val textsWritten = RagIndexStore.replaceRowsInPlace(ctx, name, indices, texts)
+                uiLog("[知识库] $name 按行改字落盘被拒（索引状态在读取之后变了）")
+                if (textsWritten == RagIndexStore.EditResult.OK)
+                    RewriteResult.TextsOnly("索引状态在读取之后变了")
+                else RewriteResult.Failed("这一页的改动没能写进磁盘 —— 请点一下这个库重新载入再试")
+            }
+        }
+    }
+
+    /**
+     * 「磁盘上那份索引此刻还算数吗」—— 给 [rewriteRows] 用的前置判据。
+     *
+     * ⚠ 它与 [search] **共用同一把尺子**（同源取值 + [RagIndexStore.load]），
+     *   不是另写一个"模型路径相同吗"的近似：后者的失效形态是"索引看着可用、
+     *   实际是另一种语义"，而它不报错。判据只回答"能不能按行改字"，
+     *   不回答"检索会不会命中" —— 所以它**不**碰 topK / 阈值。
+     */
+    private fun indexUsableForRewrite(ctx: android.content.Context, name: String): Boolean {
+        val cp = RagIndexStore.ChunkParams()
+        val fpIn = embedFpInput(cp, EmbedBatchPref.get(ctx)) ?: return false
+        val textsRaw = RagIndexStore.readTexts(ctx, name) ?: return false
+        val fp = RagIndexStore.fingerprintOf(
+            fpIn, RagIndexStore.textsHashOf(textsRaw), RagIndexStore.rowsOf(textsRaw))
+        // ⚠ 只认 [RagIndexStore.Load.valid]：半份（partial）**不可**按行改字 ——
+        //   它后面那些行本来就没有向量（见函数头 2）。
+        return RagIndexStore.load(ctx, name, fp) is RagIndexStore.Load.valid
+    }
+
+    /**
+     * [rewriteRows] 的结果。**三态**，不是"成功/失败"两态。
+     *
+     * ══════════════════════════════════════════════════════════════════════════
+     * 为什么必须分三态（而不是返回一个 `String?` 的失败原因）
+     * ══════════════════════════════════════════════════════════════════════════
+     * 这三态在界面上要三句**不同**的话，而用户下一步动作也各不相同：
+     *
+     *   · [IndexRebuilt] —— 改完了，**索引仍然可用**。这是本轮新增的那条路：
+     *     检索照常，命中的就是新内容。回执应当说"无需重建"。
+     *   · [TextsOnly]    —— 改动**没丢**（正文写回磁盘了），但索引判为待重建。
+     *     它与 P1-b 的老口径**逐字相同**（`replaceRowsInPlace` + 指纹过期）。
+     *     用户下一步：点「建索引/重建索引」。回执**必须**说清"改动在、检索停用"，
+     *     否则他会以为这次保存没生效，然后再改一遍（或者更坏：重导，条目翻倍）。
+     *   · [Failed]       —— 一个字节都没写。回执要给"怎么重试"。
+     *
+     * 把 [TextsOnly] 与 [Failed] 压成一种（"失败"）是本仓库反复记录过的那种错：
+     * 报失败时用户以为"没存上"、重敲一遍；而实际是"存上了、只是还搜不到"。
+     * 这两种情况的下一步操作完全不同（重敲 vs 点重建）。
+     */
+    sealed class RewriteResult {
+        /**
+         * 正文与向量都写回了，**索引仍然可用**（正文 hash 与向量已重新对齐）。
+         *
+         * 不含任何载荷：这条路成功时"改了几行、写进了哪个库"由调用方（UI）
+         * 自己知道，而"无需重建"是它唯一需要额外说的一句。
+         */
+        object IndexRebuilt : RewriteResult()
+
+        /**
+         * 正文写回了、索引**待重建**（`why` 是人话原因，用于日志/回执）。
+         *
+         * ⚠ 它**不是失败**：用户的字一个都没丢。别把它显示成"保存失败"。
+         */
+        data class TextsOnly(val why: String) : RewriteResult()
+
+        /** 一个字节都没写（`why` 是给用户看的失败原因）。 */
+        data class Failed(val why: String) : RewriteResult()
+    }
+
+    /**
+     * 删除**某一行**（正文与向量同时移掉）。
+     *
+     * [index] 是**正文文件的行号**（检索命中报的那个行号）。
+     * 返回 null = 成功；否则是给用户看的失败原因。**不抛异常**。
+     *
+     * 这里不需要嵌入模型 —— 删除只搬向量，不编码任何东西。缺模型时把删除
+     * 也一并禁掉是"顺手加一道闸"，而它挡住的是一个真实场景：用户在没加载
+     * 模型的机器上想清理一条笔记，做不到，只能整库删掉重来。
+     */
+    fun deleteEntry(ctx: android.content.Context, name: String, index: Int): String? {
+        if (RagIndexStore.dirOf(ctx, name) == null) return "库名非法（只允许字母/数字/中文/-/_/.，且非空）"
+        if (RagIndexStore.indexFile(ctx, name)?.isFile != true) return "该库还没有索引"
+        return when (RagIndexStore.removeEntry(ctx, name, index)) {
+            RagIndexStore.EditResult.OK -> {
+                uiLog("[知识库] $name 删除第 ${index + 1} 行（正文与向量一起移掉，后面的行前移一位）")
+                null
+            }
+            RagIndexStore.EditResult.STALE -> {
+                uiLog("[知识库] $name 删除了正文但索引没跟上，需重建")
+                "正文已删除，但索引没跟上（需点「建库/重建」才可检索）"
+            }
+            // 行号不合法是**最常见**的失败形态（用户点的那一行在两次刷新之间
+            // 已经被删过 / 索引与正文本来就不齐），所以这句话要说清"怎么刷新"，
+            // 而不是一句"删除失败"。
+            RagIndexStore.EditResult.FAILED ->
+                "这一行删不了：索引与正文对不上（或它已经是最后一条）—— 刷新后重试，或点「建库/重建」"
+        }
+    }
+
+    /**
+     * 某一行在**当前正文文件**里的正文与来源（UI 渲染用，读失败返回 null）。
+     *
+     * 与 [textAt] 是同一份实现，但那条路专为"检索注入"服务；这里显式再引一次，
+     * 是为了让 UI 侧不必知道注入那条路的任何细节。
+     */
+    fun entryAt(ctx: android.content.Context, name: String, index: Int): RagIndexStore.Entry? =
+        try { RagIndexStore.entryAt(ctx, name, index) } catch (t: Throwable) { null }
+
+    /**
+     * 分块（Kotlin 侧）。与 `rag_index.h` 的 `chunk_text` / `pick_chunk_cut`
+     * **逐条同口径**（不再"允许边界略有差异"——见下）。
+     *
+     * ═══════════════════════════════════════════════════════════════════════
+     * 老口径被本轮改掉了
+     * ═══════════════════════════════════════════════════════════════════════
+     * 原先这里写着"两份实现只要求块大小与重叠一致，边界允许略有差异（分块本来
+     * 就不是唯一解）"。那个口径带来过一个真实故障的方向：两边的**降级规则**分家
+     * 之后，"建库时按 A 规则切、检索时按 B 规则算指纹"，而指纹里只有 `t`/`o`
+     * 两个数，差异**完全不可见**。所以本轮把两份实现的规则表与降级次序焊死，
+     * 由 `chunk_seps_consistent` 与 `chunk_rule_consistent` 两条判据正面钉住。
+     *
+     * 规则（与 C++ 侧同一张表、同一个次序）：
+     *   1. 段落 `\n\n`；2. 换行 `\n`；3. 句读 `。！？；，、!?;,`；4. 硬截 `pos + target`。
+     *
+     * 三条不变式：
+     *   · 窗口只在 `(pos, pos+target]` 内找 —— **不往窗口外找**（那是"整块丢字"的成因）；
+     *   · 候选切点对齐后 `<= pos` 就当**没找到**，继续降级（不许退化成"前进 1 字节"）；
+     *   · 每轮**严格前进 1 个完整码点**，硬截也按码点对齐。
+     *
+     * @param hardCuts 出参：硬截发生了几次。为什么报出来见 [buildIndex] ——
+     *   硬截 = "窗口内一个句读都没有"，那种块天生检索不准，而它此前没有任何痕迹。
+     * @param truncated 出参：**是否撞上 `maxChunks` 提前收工**（= 文档后半段没进索引）。
+     *   与 [hardCuts] 是两件事：那个说"块边界糙"（内容全在），这个说"块没了"
+     *   （**内容真的少了一截**）。后者在检索上与"文档里本来就没有"逐字相同，
+     *   所以必须由调用方写成日志，见 [buildIndex]。
+     */
+    fun chunk(text: String, cp: RagIndexStore.ChunkParams,
+              hardCuts: IntArray? = null,
+              truncated: BooleanArray? = null): List<RagIndexStore.Entry> {
+        if (hardCuts != null && hardCuts.isNotEmpty()) hardCuts[0] = 0
+        if (truncated != null && truncated.isNotEmpty()) truncated[0] = false
+        val out = ArrayList<RagIndexStore.Entry>()
+        if (text.isEmpty()) return out
+        // targetChars <= 0 = 整篇一块（与 C++ 侧同一条退化路径）。
+        if (cp.targetChars <= 0) {
+            if (text.isNotBlank()) out.add(RagIndexStore.Entry(text.trim(), ""))
+            return out
+        }
+        var overlap = cp.overlapChars
+        if (overlap >= cp.targetChars) overlap = if (cp.targetChars > 1) cp.targetChars / 2 else 0
+        var pos = 0
+        // "正常收尾"的显式标志（见函数尾部的 truncated 判据）：只有"最后一块走到
+        // 文末"那一支才算切完了，循环条件失败才算被截住。与 C++ 侧同一条控制流。
+        var brokeByEnd = false
+        while (pos < text.length && out.size < cp.maxChunks) {
+            var end = minOf(pos + cp.targetChars, text.length)
+            // `cutByRule` = 本轮是**软切**（窗口内找到了分隔符）还是**硬截**。
+            // 它决定"下一块起点"能不能重叠 —— 与 C++ 侧同一条控制流，见下面那一段。
+            var cutByRule = false
+            if (end < text.length) {
+                val cut = pickChunkCut(text, pos, end)
+                if (cut > pos) {
+                    end = cut
+                    cutByRule = true
+                } else {
+                    // 第三级：硬截。对齐后不许退化成"前进 1 字节"——
+                    // 中文尾字节落在 target 上时向前一个码点，仍 <= pos 才取下一个码点。
+                    if (hardCuts != null && hardCuts.isNotEmpty()) hardCuts[0]++
+                    var hard = alignUtf8(text, end)
+                    if (hard <= pos) {
+                        // target 小于一个码点时"向前对齐"会退到 pos 本身 —— 那一档
+                        // 只能**向后**推进到下一个码点起点。`pos + 1` 会切在码点中间，
+                        // 那一块 encode 必然失败（老实现栽的就是这条兜底）。
+                        hard = nextUtf8Start(text, pos + 1)
+                        if (hard <= pos) hard = text.length
+                    }
+                    end = if (hard > pos) hard else text.length
+                }
+            }
+            val piece = text.substring(pos, minOf(end, text.length)).trim()
+            if (piece.isNotEmpty()) out.add(RagIndexStore.Entry(piece, ""))
+            if (end >= text.length) { brokeByEnd = true; break }
+            // 下一块从 overlap 之前开始（并按字符边界对齐），但必须**严格前进**。
+            //
+            // ⚠ 硬截那一轮**不重叠**（`next = end`）。重叠的用途是"让语义跨块的那
+            //   一段两边都看得见"，而硬截 = 窗口内**一个分隔符都没有**：回退 overlap
+            //   得到的下一块，其窗口右端仍是"本轮起点 + target"，整段区间仍在上一轮
+            //   已消化过的范围里 —— 那一轮同样找不到分隔符、同样硬截。于是
+            //     · `overlap` 那段正文被切**两遍**（相邻块最长公共片段 ≥ overlap，
+            //       检索时同一段正文互相抢 top-k）；
+            //     · 硬截计数被灌水（"有 N 块是硬截的"里一半是重切）。
+            //   软切那一轮**保留**重叠：切点由分隔符决定，"语义跨边界"是真需求。
+            //   与 C++ 侧 `chunk_text` 逐条同形（差分测试钉着）。
+            var next = if (cutByRule) alignUtf8(text, (end - overlap).coerceAtLeast(0)) else end
+            if (next <= pos) next = end
+            if (next <= pos) next = pos + 1
+            pos = next
+        }
+        // 退出循环有两种原因：
+        //   · 最后一块走到文末（`brokeByEnd`）—— **切完了**；
+        //   · `out.size >= maxChunks` —— **被上限截住**，后半段一个字节都没进索引。
+        // 后者必须报出去（它此前完全没有痕迹，见 [truncated] 出参的说明）。
+        // ⚠ 判据不能写成 `pos < text.length`：最后一块走到文末时 `pos` 指向那一块的
+        //   **开头**，它当然小于 length —— 于是每一份正常文档都会被报成"截断"。
+        //   （C++ 侧第一版就是这么写的，`test_chunk_truncated_flag` 的四条正例当场抓到。）
+        if (truncated != null && truncated.isNotEmpty()) truncated[0] = !brokeByEnd
+        return out
+    }
+
+    /**
+     * 窗口内找一个合法切点（返回 `<= pos` 表示"没找到，走硬截"）。
+     *
+     * 与 `rag_index.h` 的 `pick_chunk_cut` **同一条控制流**：先段落、后句读；
+     * 同级里取最靠右的；候选点先对齐、对齐后 `<= pos` 就当没找到。
+     */
+    private fun pickChunkCut(text: String, pos: Int, end: Int): Int {
+        // 实现搬到了 [TextBoundary.pickCut]：**同一张表、同一条控制流**要与
+        // RagArchive 的导入切段共用（那边此前抄了第二份 + 第二张表，且没有任何
+        // 判据绑着它）。这里只留一个转发，接口不变 —— 调用点与判据都不用动。
+        return TextBoundary.pickCut(text, pos, end, kSepMaxWidth)
+    }
+
+    /**
+     * 把下标 `i` 向前调整到一个**字符边界**（Kotlin 的 Char = UTF-16 code unit）。
+     *
+     * ═══════════════════════════════════════════════════════════════════════
+     * 这里修掉了两个真实缺陷（本轮差分测试撞出来的，都不是新增的）
+     * ═══════════════════════════════════════════════════════════════════════
+     * 旧实现是 `var j = i.coerceIn(0, s.length); while (j > 0 && (s[j].code and 0xC0) == 0x80) j--`
+     * —— 它把 **C++ 那套按字节的判断**（continuation 是 `0b10xxxxxx`）直接搬到
+     * Kotlin 的 **UTF-16 code unit** 上了，于是有两处错：
+     *
+     *   ① **越界**：`coerceIn(0, s.length)` 允许 `j == s.length`，而
+     *      `while` 的条件先读 `s[j]` 再判 `j > 0` —— `s[s.length]` 直接抛
+     *      `StringIndexOutOfBoundsException`。实测 `alignUtf8("甲文乙", 3)` 必抛。
+     *      （Java/Kotlin 的 `&&` 从左到右求值，所以判据顺序真的是先取下标。）
+     *   ② **误判**：`s[j].code and 0xC0 == 0x80` 判的是"这个 UTF-16 code unit
+     *      的低字节长得像 continuation"。`文` = U+6587，`0x87 and 0xC0 == 0x80`
+     *      —— 于是**正常的一个汉字被当成半个字符**，函数往回退一格，
+     *      切点被凭空前移。实测 `alignUtf8("甲文乙", 1)` 返回 0 而不是 1。
+     *      在 CJK 正文里这种"低字节恰好是 0x80~0xBF"的字**很常见**，
+     *      于是块边界会随文档内容漂移，而两边（C++ 按字节 / Kotlin 按字符）
+     *      切出的块从此对不上 —— 症状是"同一份文档建库与追加切得不一样"。
+     *
+     * 正确的判断只有一条：**Kotlin 的下标只有在代理对中间才是"半个字符"**。
+     * 即 `s[j]` 是 low surrogate（U+DC00~U+DFFF）时，它和前面的 high surrogate
+     * 构成一个码点，应当一起收进前一块 —— 于是退到那个 high surrogate 上。
+     * BMP 字符（含全部 CJK）永远不在码点中间，所以这个函数对它们**恒等**，
+     * 与 C++ 那套"按字节对齐"在语义上等效（C++ 的字节对齐也是为了保证
+     * 不切在码点中间，只是它的单位是字节）。
+     */
+    private fun alignUtf8(s: String, i: Int): Int {
+        if (s.isEmpty()) return 0
+        // ⚠ `i >= s.length` 先**原样返回 length**，不能落进下面那个 `coerceIn`：
+        //   旧写法 `coerceIn(0, s.length)` 允许 j == length，而 `while` 要读 s[j]
+        //   —— `s[s.length]` 直接抛 StringIndexOutOfBoundsException（见上面 ①）。
+        //   这里显式分流：到末尾/越界 -> length（调用方把它当"这一段收干净了"）。
+        if (i >= s.length) return s.length
+        // 低代理区：只有落在代理对中间才需要往前收一格。
+        var j = i.coerceAtLeast(0)
+        while (j > 0 && s[j].isLowSurrogate()) j--
+        return j
+    }
+
+    /**
+     * 从 `i` **向后**找下一个字符边界；找不到返回 `length`。
+     *
+     * 只在 `targetChars` 小于一个码点时（比如 target=1 而一"字"占好几个 code unit）
+     * 需要：那时向前对齐会退到 `pos`、等于不前进，而 `pos + 1` 会切在代理对中间。
+     * 与 `rag_index.h` 的 `next_utf8_start` 是同一个函数的两份写法。
+     *
+     * ⚠ 判断与 [alignUtf8] 同一口径：只有 **low surrogate** 才是"半个字符"
+     *   （旧实现用 `(code and 0xC0) == 0x80`，对 `文` U+6587 会误判 —— 见 [alignUtf8]）。
+     */
+    private fun nextUtf8Start(s: String, i: Int): Int {
+        var j = i.coerceIn(0, s.length)
+        while (j < s.length && s[j].isLowSurrogate()) j++
+        return j
+    }
+
+    /**
+     * 从某个知识库检索与 `query` 最相关的若干条，连同**为什么是这个结果**。
+     *
+     * 返回 [Search] 三态：[Search.Hits]（有可用索引，可能 0 条命中）/
+     * [Search.NoIndex]（没有可用索引，附逐字段差异）/ [Search.QueryFailed]（查询编码失败）。
+     * 三态的**举证与处置都不同** —— 见 [Search] 的说明。早先把它们压成
+     * `List<SearchHit>?` 是用户报的"日志说成功却不引用"的一部分成因。
+     *
+     * 为什么检索**不**顺手重建索引：见 [buildIndex] 的说明。这里只负责
+     * "有就用"，且任何一步失败都降级成"没有索引"，绝不抛异常、绝不让请求失败。
+     *
+     * ── 一次检索的**结果 + 理由**（[Search]）───────────────────────────────
+     *
+     * 为什么不能只返回 `List<SearchHit>?`（第 2 步，用户拍板）：
+     * 旧签名把三件**完全不同**的事压成同一个出口，而它们的处置**不同**：
+     *
+     *   · 索引不可用      -> 用户要去重建 / 换回模型（配置问题）；
+     *   · 查询编码失败    -> 本轮是**偶发**的（模型/内存状态），重试或看 native 原因，
+     *                        用户**不该**去动索引 —— 旧代码把它和"没命中"混在一起；
+     *   · 真的没命中      -> 正常，什么都不用做（库里确实没有相关内容）。
+     *
+     * 三者写进日志的话**逐字不同**，用户与守卫都能一眼分清是哪一个。
+     *
+     * ⚠ 实现体刻意**留在 [search] 里**、不做"一行转发到另一个函数"：
+     * `tools/run_rag_index_guard.sh` 一组判据锚的是 **`fun search` 的函数体**里
+     * 有没有那一跳（`embedFpInput` / `fingerprintOf` / `load` / `rowsOf`）。
+     * 把实现搬走、`search` 只留一行转发，会让那些判据**全部变红** —— 而实现其实
+     * 一字没改。本仓库反复记录过这类"实现搬走反而判红"的坑。
+     */
+    sealed class Search {
+        /** 有可用索引：`rank.hits` 是过阈值并截断到 top-k 的命中；`rank.best` 是最高分。 */
+        data class Hits(val rank: RagIndexStore.Ranked) : Search()
+        /** 没有可用索引（库不存在 / 指纹不符 / 文件损坏）—— 处置是重建或换回模型。 */
+        data class NoIndex(val detail: String, val field: String, val stale: Boolean) : Search()
+        /** 查询向量编码失败（偶发，与索引无关）—— 处置是重试/看 native 原因，**别动索引**。 */
+        data class QueryFailed(val why: String) : Search()
+    }
+
+    fun search(ctx: android.content.Context, name: String, query: String,
+               topK: Int = 3, minScore: Float = 0.35f): Search {
+        if (query.isBlank()) return Search.Hits(RagIndexStore.Ranked(emptyList(), Float.NaN, 0))
+        if (!hasEmbedModel) return Search.NoIndex("尚未加载嵌入模型", "embed", false)
+        if (embedDim <= 0) return Search.NoIndex("嵌入模型维度取不到", "embed", false)
+        // 指纹用的切块参数必须与建库时**同一份**。索引文件头里落的就是建库时的
+        // 那一份，所以这里只要"当前配置"，它变 = 指纹不符 = 没索引（重建）。
+        val cp = RagIndexStore.ChunkParams()
+        // 正文 hash 从**当前磁盘上的正文文件**现算：
+        //   · 正文文件缺失（阶段 1 的老索引 / 被手动删了）按 0 字节算 —— 与
+        //     "本来是空库"用的是同一份输入，所以老索引会（且只会在换版本时）
+        //     一次性被判为要重建，而不是靠"幸好偶然对上了"。
+        //   · 读正文这件事只有几十 KB（100 条短笔记），比一次 prefill 便宜几个数量级，
+        //     而它能挡住"用旧向量命中、注入新正文"这类**不报错**的错位。
+        val textsRaw = RagIndexStore.readTexts(ctx, name) ?: ByteArray(0)
+        // ⚠ 与建库**同一个取值处**（[embedFpInput]）。两处各写一遍的后果是
+        // "建库成功、检索说参数变了"，而它不指向任何一处具体代码 ——
+        // 用户只能反复重建（重建完还是那句）。
+        // 批大小与建库**同一个取值处**（[EmbedBatchPref]）。检索这一边读的是
+        // "当前配置的那个"（而不是本次建库实际跑的那个 —— 检索时没有"本次"）：
+        // 用户把批大小从 8 改成 1，旧索引就该被判成"不可用"（重建）——
+        // 而它正好就是"改批大小必须重建索引"这条心智负担的执行处。
+        val fpIn = embedFpInput(cp, EmbedBatchPref.get(ctx))
+            ?: return Search.NoIndex("嵌入模型身份取不到", "p", false)
+        // ⚠⚠ `rows` 必须**现算**并传进来，不能用 `fingerprintOf` 的默认值 `-1`：
+        // `r`（正文行数）是 [RagIndexStore.compareFp] 的**必比字段**，而索引里
+        // 写的永远是真实行数（如 2）—— 省略它就变成"2 ≠ -1"，于是**每一次检索**
+        // 都被判"索引不可用：正文行数 变了"，而索引本身完全没问题。
+        // 真机日志逐字对应：
+        //   [知识库] 索引不可用（"tes2"）：正文行数 变了：索引 正文行数=2 ≠ 当前 -1
+        // 这正是用户说的"第三次建库成功、却无法在对话中使用"。
+        //
+        // 为什么这里读正文的**行数**而不是"从 meta 里拿"：正文文件才是
+        // "库里有几条"的唯一真值（见 [RagIndexStore.rowsOf] 的说明），
+        // 而这份字节本来就已经读进来了（上面那一步），再数一次行数是零成本。
+        val fp = RagIndexStore.fingerprintOf(
+            fpIn, RagIndexStore.textsHashOf(textsRaw), RagIndexStore.rowsOf(textsRaw))
+        val loaded = RagIndexStore.load(ctx, name, fp)
+        if (loaded is RagIndexStore.Load.none && RagIndexStore.isPresent(ctx, name)) {
+            // 把"指纹不匹配"拆成**可操作**的诊断 —— 它们在用户看来是两回事
+            // （换回模型 vs 重建索引），而现象完全一样（回答里什么都不带）。
+            //
+            // ⚠ 判据从"正文 hash 是否相等"换成了 [RagIndexStore.compareFp] 的
+            // **逐字段**结果：旧版只比正文 hash，于是"换了模型"与"池化语义变了"
+            // 与"切块参数变了"全被归成同一句"模型或切块参数与建库时不同" ——
+            // 用户拿着这句话**没法动手**（不知道该换模型还是该重建，
+            // 也不知道是哪一项）。用户拍板的正是这一条：不要静默作废。
+            val d = RagIndexStore.lastDiff
+            // 真·待重建：索引是我们**故意**写下的半份（建库时有条目失败）。
+            // 那句日志由调用方（[ragContext]）按 [Search.NoIndex.stale] 分别印，
+            // 因为"待重建"与"真不可用"用户处置不同，必须给两句不同的话。
+            return Search.NoIndex(d.detail, d.field, d.stale)
+        }
+        // 四态**显式分开**（判据锚这里，不许退化成两态）：
+        //   none    -> 没有可用索引（上面已附逐字段差异）；
+        //   empty   -> 索引有效但**库里一条都没有**：这不是"没索引"，不该触重建；
+        //   partial -> **半份索引**（建索引途中被杀留下的）。指纹与当前配置一致，
+        //              缺的只是尾段向量 —— 它**不能检索**（缺的那些行永远搜不到，
+        //              而这与"没命中"长得一样），但它是**可续**的（点「建索引」
+        //              接着编，不用重头跑）。所以这里必须把它当"没索引"报出来，
+        //              且**给它一句不同的话**（"续编"而不是"重建"）；
+        //   valid   -> 有向量区，继续算 query 向量。空库判成 none 的后果是
+        //              "每次检索都触发一次重建"，看起来像正常行为。
+        when (loaded) {
+            is RagIndexStore.Load.none -> return Search.NoIndex("索引文件缺失或损坏", "file", false)
+            is RagIndexStore.Load.empty -> return Search.Hits(RagIndexStore.Ranked(emptyList(), Float.NaN, 0))
+            is RagIndexStore.Load.partial -> return Search.NoIndex(
+                "索引只编到 ${loaded.count}/${loaded.rowsTotal} 条（上次中途结束）—— 点「建索引」接着编即可",
+                "partial", true)
+            is RagIndexStore.Load.valid -> Unit   // 落到下面继续算
+        }
+        val valid = loaded as RagIndexStore.Load.valid
+        // ⚠⚠ 查询编码失败**必须**在这里与"没命中"分开（第 2 步，用户拍板）：
+        // 旧代码写的是 `embed(query) ?: return emptyList()` —— 于是"本轮查询向量
+        // 没算出来（偶发）"与"库里确实没有相关内容（正常）"**共用同一句日志**
+        // `检索 0 条命中`，用户从日志上分不出是哪一种，而处置**完全不同**：
+        // 前者别动索引、重试即可，后者什么都不用做（调阈值/加内容）。
+        // 这层静默降级正是用户报的"时好时坏、日志说加入成功但不引用"的来源之一。
+        val q = embed(query) ?: return Search.QueryFailed(lastEmbedFailure()?.describe() ?: "查询向量编码失败")
+        if (q.size != valid.dim) {
+            // 维度不符 = 换了模型但指纹没跟上（正常路径下指纹已挡，这里是兜底）。
+            return Search.NoIndex("查询维度 ${q.size} ≠ 索引维度 ${valid.dim}", "d", false)
+        }
+        return Search.Hits(RagIndexStore.rank(valid.vec, valid.count, valid.dim, q, topK, minScore))
+    }
+
+    // ══════════════════════════════════════════════════════════════════════════
+    //  RAG 检索 -> 注入片段（RAG 阶段 2）
+    // ══════════════════════════════════════════════════════════════════════════
+
+    /**
+     * 一次检索的产出：可拼进 prompt 的文本 + **它来自哪个库、几条**。
+     *
+     * 为什么要带上库名与条数（而不是只返回那个字符串）：阶段 3 的远端路径要把
+     * "这一轮到底注入了没有"变成**协议层可见**的（[RagProtocol]）—— 而"注入了几条"
+     * 是那个字段的全部内容，它只有在注入发生的**当场**才拿得到。让调用方
+     * 从最终文本里去数（比如数 `（来源: ` 出现几次）是在拿**呈现格式**当判据：
+     * 正文里恰好含这个串就会数错，而错的方向是"报了一个没发生过的注入条数"。
+     */
+    data class RagBlock(val block: String, val kb: String, val count: Int)
+
+    // 为什么检索要单独有一层（而不是调用方自己 search + 拼字符串）：
+    // 它把"该不该检索"、"检索到了几条"、"拼出来是不是空"这三件事收敛到一处，
+    // 于是"开关关闭时一个字节都不注入"**只有一个判据点**（[RagInject.shouldSearch]）。
+    // 各写一遍的漂移方向恰好是"多注入一个字节"，而它没有任何现象。
+    //
+    // 返回 null = **本次不注入**（开关关 / 没选库 / 没查询词 / 没索引 / 没命中）。
+    // 非空 = 可直接拼进 prompt 的文本（以 [RagInject.MARK] 起头）+ 库名 + 条数。
+    // **绝不抛异常**：它在生成前的拼 prompt 路径上跑，抛出去等于整轮失败。
+    fun ragContext(
+        ctx: android.content.Context,
+        kbName: String?,
+        query: String,
+        enabled: Boolean,
+        topK: Int = RagInject.DEFAULT_TOP_K,
+        minScore: Float = RagInject.DEFAULT_MIN_SCORE
+    ): RagBlock? = try {
+        if (!RagInject.shouldSearch(enabled, kbName, query)) null
+        else {
+            when (val r = search(ctx, kbName!!, query, topK = topK, minScore = minScore)) {
+                // ── 「没有可用索引」：配置问题（重建 / 换回模型）──────────────
+                // 两种情形的处置**不同**，所以给两句不同的话：真·待重建（索引是我们
+                // 故意写下的半份，点重建即可）与真不可用（指纹不符/文件损坏）。
+                is Search.NoIndex -> {
+                    if (r.stale) {
+                        uiLog("[知识库] 索引待重建（\"$kbName\"）：${r.detail} —— 点「建库/重建」即可")
+                    } else {
+                        uiLog("[知识库] 检索跳过：\"$kbName\" 没有可用索引（${r.detail}）（字段 ${r.field}）")
+                    }
+                    null
+                }
+                // ── 「查询编码失败」：偶发，与索引无关，**别动索引** ──────────
+                // 旧代码把它和"没命中"混成同一句，用户从日志上分不出是哪一种，
+                // 而处置完全相反（这个要重试/看 native 原因，那个什么都不用做）。
+                is Search.QueryFailed -> {
+                    uiLog("[知识库] 查询向量编码失败（本轮不注入）：${r.why} —— 与索引无关，重试即可")
+                    null
+                }
+                // ── 「有可用索引」：命中与否 + 最高分（可观测面）────────────
+                // ⚠ 最高分是**过滤之前**的：没有它，「差一点」与「完全不像」
+                //   在日志上逐字相同（都是"0 条命中"），用户没法判断该调阈值还是该加内容。
+                is Search.Hits -> {
+                    val hits = r.rank.hits
+                    if (hits.isEmpty()) {
+                        uiLog("[知识库] 检索 0 条命中（最高分 ${fmtScore(r.rank.best)} / 阈值 $minScore），不注入")
+                        null
+                    } else {
+                        val picks = RagInject.select(
+                            hits.map { RagInject.Pick(it.index, it.score) }, topK, minScore)
+                        if (picks.isEmpty()) {
+                            uiLog("[知识库] 命中 ${hits.size} 条但全部低于阈值 ${minScore}，不注入")
+                            null
+                        } else {
+                            // ⚠⚠ `rows` **必须按行号对齐**（下标 `i` == 索引第 `i` 行），
+                            // 长度是**全库行数**而不是 `picks.size`。
+                            //
+                            // 为什么：`RagInject.render` 的契约是"按行号取源"（`rows[p.index]`，
+                            // 与 `rag_index.h::render_injection` 逐字对应）。旧代码在这里
+                            // **按命中顺序压紧**地 add（`rows[0]` 是"第 1 条命中"的正文），
+                            // 两者只在"命中的正好是第 0、1、2…行"时才偶然相等。于是有两个
+                            // 症状同源，且都不报错：
+                            //   · 命中的行号全部 ≥ picks.size -> `p.index >= rows.size` ->
+                            //     整块被跳过 -> 用户看到的「选中 N 条但正文为空」；
+                            //   · 命中的行号部分落在 0..picks.size-1 -> 注入的是**另一行**的
+                            //     正文（分数对、内容错）。
+                            // 这就是用户报的"选中一条，但内容为空"。
+                            //
+                            // 为什么一次读全库而不是逐条 [textAt]：见
+                            // [RagIndexStore.readEntriesAligned] 的说明 —— 既要对齐行号，
+                            // 又要避免"每条各读一次全文"；它读一次文件即可。
+                            val all = RagIndexStore.readEntriesAligned(ctx, kbName)
+                            val rows = ArrayList<String>(all.size)
+                            for (e in all) rows.add(e?.text.orEmpty())
+                            val block = RagInject.render(picks, rows)
+                            if (block.isEmpty()) {
+                                // ⚠ "越界"与"正文为空"是**两件不同的事**，处置也不同，
+                                // 不许共用一个出口（旧代码就是共用，于是"整块为空"能安静发生：
+                                // 用户只看到一句"正文为空"，而真正的原因是行号对不上）。
+                                //   · 越界 = 索引里的行号指向了正文文件之外 —— 两个文件不同步；
+                                //   · 空正文 = 那一行本来就（或坏了）没有正文 —— 内容问题。
+                                val outOfRange = picks.count { it.index >= rows.size || it.index < 0 }
+                                val emptyText = picks.size - outOfRange -
+                                    picks.count { it.index in rows.indices && rows[it.index].isNotEmpty() }
+                                uiLog(
+                                    "[知识库] 选中 ${picks.size} 条但正文为空，不注入" +
+                                        "（正文文件 ${rows.size} 行；越界 $outOfRange 条 / 空正文 $emptyText 条）" +
+                                        "—— 越界=索引与正文不同步，点「建库/重建」；空正文=那一行内容本身为空")
+                                null
+                            } else {
+                                uiLog("[知识库] 注入 ${picks.size} 条（阈值 ${minScore}）：" +
+                                    picks.joinToString { "#${it.index}=%.3f".format(it.score) })
+                                RagBlock(block, kbName, picks.size)
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    } catch (t: Throwable) {
+        // 检索失败**绝不能**让这一轮请求失败（与 kv_prefix 同一条准则：
+        // 附带的加速/增强能力不该变成新的可用性风险）。降级成"没配知识库"。
+        uiLog("[知识库] 检索异常（本轮不注入）：${t.javaClass.simpleName}: ${t.message}")
+        null
+    }
+
+    /**
+     * 分数打点：`NaN` 打成 `n/a`（= 一条都没算过），其余三位小数。
+     *
+     * 为什么不用 `"%.3f".format(x)` 一把梭：`format(NaN)` 会打出 `"NaN"`，
+     * 而用户看到"最高分 NaN"只会更困惑 —— 我们的语义是"没有可报的分数"，
+     * 那就写 `n/a`。这一点在空库（rows=0）上必现。
+     */
+    private fun fmtScore(x: Float): String = if (x.isNaN()) "n/a" else "%.3f".format(x)
 
     // ---- native ----
     /** libcpufeat.so 提供，返回 [dotprod, i8mm, hwcap, hwcap2]。 */
@@ -1194,12 +3659,18 @@ object LlmEngine {
         flashAttn: Boolean, useMmap: Boolean, cacheK: Int, cacheV: Int,
         parallelN: Int, batchSize: Int, ubatchSize: Int, npuQuotaPct: Int): Boolean
     @JvmStatic private external fun nativeModelDesc(): String
+
+    /**
+     * GGUF 元数据档案，返回 String[8]（顺序是接口，见 native 侧同名函数的注释与
+     * [ModelProfile.fromNative]）。未加载模型时返回 8 个空串。
+     */
+    @JvmStatic private external fun nativeModelMeta(): Array<String>
     @JvmStatic private external fun nativeCtxSize(): Int
     @JvmStatic private external fun nativeCtxUsed(): Int
     /**
-     * KV 前缀复用统计，返回 int[3] = {上一轮复用的 token 数, 上一轮新算的 token 数,
-     * 已跑完 prefill 的轮次数}。与 [lastReuseTokens] / [lastPrefillTokens] /
-     * [kvRounds] 成对，见那边的说明。
+     * KV 前缀复用统计，返回 int[4] = {上一轮复用的 token 数, 上一轮新算的 token 数,
+     * 已跑完 prefill 的轮次数, 上一轮的公共前缀 token 数}。与 [lastReuseTokens] /
+     * [lastPrefillTokens] / [kvRounds] / [lastLcpTokens] 成对，见那边的说明。
      */
     @JvmStatic private external fun nativeKvCacheStats(): IntArray
     /** KV 账本是否有效（下一轮能否复用）。 */
@@ -1228,7 +3699,12 @@ object LlmEngine {
      * （见 [ResponseFormat.GenerationPrompt]）。
      * [tmpl] 为这一轮的 chat 模板原文（与渲染侧同源）；空串表示"按模型自选"。
      */
-    @JvmStatic private external fun nativeNewSampler(temp: Float, topP: Float, minP: Float, topK: Int, repPenalty: Float, penaltyN: Int, freqPenalty: Float, presencePenalty: Float, seed: Long, stops: Array<String>?, schema: String?, genPrompt: String?, tmpl: String?, thinkingOn: Boolean): Boolean
+    /**
+     * [biasIds] / [biasVals] 是 `logit_bias` 的**平行数组**（长度必须相等，见
+     * [ProtocolFields.biasIds]）。null = 不带偏置，此时 native 侧不挂偏置采样器、
+     * 采样链与引入本特性之前**逐字节相同**。
+     */
+    @JvmStatic private external fun nativeNewSampler(temp: Float, topP: Float, minP: Float, topK: Int, repPenalty: Float, penaltyN: Int, freqPenalty: Float, presencePenalty: Float, seed: Long, stops: Array<String>?, schema: String?, genPrompt: String?, tmpl: String?, thinkingOn: Boolean, biasIds: IntArray?, biasVals: FloatArray?): Boolean
     @JvmStatic private external fun nativeStartCompletion(prompt: String, maxTokens: Int): Boolean
     @JvmStatic private external fun nativeStep(): String?
     /**
@@ -1298,4 +3774,65 @@ object LlmEngine {
 
     @JvmStatic private external fun nativeFreeSampler()
     @JvmStatic private external fun nativeUnloadModel()
+
+    // ── 嵌入模型（双常驻的第二份 Session；与对话模型互不影响）──────────────
+    /** 加载嵌入模型。`nCtx<=0` 时由 native 取默认（512，见 native 侧注释）。 */
+    @JvmStatic private external fun nativeLoadEmbedModel(
+        path: String, nCtx: Int, nThreads: Int, useMmap: Boolean): Boolean
+    /** 卸载嵌入模型（只拆嵌入那一份）。 */
+    @JvmStatic private external fun nativeUnloadEmbedModel()
+    /** 嵌入模型是否已驻留。 */
+    @JvmStatic private external fun nativeHasEmbedModel(): Boolean
+    /** 嵌入向量维度；0 = 无可用嵌入模型。 */
+    @JvmStatic private external fun nativeEmbedDim(): Int
+    /** 嵌入模型的短描述；空串 = 没有已驻留的嵌入模型。 */
+    @JvmStatic private external fun nativeEmbedModelDesc(): String
+    /**
+     * 输出侧维度（`llama_model_n_embd_out`）。库按它分配 output buffer，
+     * 而读取按 `n_embd` 步长走 —— 两者不等时读一行是未定义行为（见 native 侧注释）。
+     * 0 = 无可用嵌入模型。
+     */
+    @JvmStatic private external fun nativeEmbedOutDim(): Int
+
+    /** 嵌入模型声明的池化类型原值（-1 = 取不到 / UNSPECIFIED）。 */
+    @JvmStatic private external fun nativeEmbedPooling(): Int
+
+    /**
+     * 最近一次嵌入失败的详情，格式固定：
+     * `reason|n_tokens|n_embd|n_embd_out|pooling|norm`；空串 = 没失败。
+     */
+    @JvmStatic private external fun nativeEmbedLastFailure(): String
+
+    /** 一条文本 -> 已归一化向量；null = 这一条没有可用向量（**不抛**）。 */
+    @JvmStatic private external fun nativeEmbed(text: String): FloatArray?
+
+    /**
+     * n 条文本 -> 扁平向量数组（长度 = `texts.size * n_embd`），**一次**前向算完。
+     *
+     * 返回 null = **整批不可用**，调用方回落逐条（见 native 侧那段推导：
+     * 维度不匹配 / 该池化档不支持合批 / 批过大 / decode 失败 / 全批都 tokenize 不出）。
+     *
+     * ⚠ 失败可以是**部分**的：某几条归一化失败时，它在数组里留全零，
+     * 而"哪几条"要另问 [nativeEmbedBatchFailed] —— 全零与"真的零向量"同形，
+     * 单看数组分不出来（见 native 侧那句注释）。
+     */
+    @JvmStatic private external fun nativeEmbedBatch(texts: Array<String>): FloatArray?
+
+    /**
+     * 上一次 [nativeEmbedBatch] 里失败的那几条（**原下标**，逗号分隔；空串 = 全成功）。
+     *
+     * ⚠ 必须在**同一把锁内、紧跟着那一次调用**取走：它是 native 侧一个可变容器
+     * （见 `g_embed_batch_failed`），与 [nativeEmbedLastFailure] 同一条约定。
+     */
+    @JvmStatic private external fun nativeEmbedBatchFailed(): String
+
+    /**
+     * token id 数组 -> 文本（用**嵌入模型那一份** vocab）。空串 = 还原失败
+     * （没加载嵌入模型 / id 越界 / 数组为空）。
+     *
+     * 给 `/v1/embeddings` 的 `input: [1,2,3]` 形态用：id 先还原成文本，再走
+     * 与字符串输入**完全相同**的前向路径（见 native 侧 `nativeDetokenize` 注释里
+     * 为什么不能对 id 数组直接前向、也不能由调用方自己重编码）。
+     */
+    @JvmStatic private external fun nativeDetokenize(ids: IntArray): String
 }

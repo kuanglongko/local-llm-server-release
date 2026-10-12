@@ -19,6 +19,7 @@
 # 运行：sh tools/run_web_chat_guard_tests.sh
 set -e
 cd "$(dirname "$0")/.."
+. "$(dirname "$0")/with_worktree_lock.sh"   # 工作区独占锁：见该文件顶部说明
 
 PY=${PYTHON:-python3}
 GUARD=tools/run_web_chat_guard.sh
@@ -42,7 +43,13 @@ restore() {
     cp "$TMP/readme.bak" "$README"; cp "$TMP/changelog.bak" "$CHANGELOG"
     rm -rf "$TMP"
 }
-trap restore EXIT
+# 退出即还原：EXIT / INT / TERM / HUP 都走同一个还原 ——
+# 只 trap EXIT 时，CI 的 kill（默认 TERM）不会触发 EXIT trap，
+# 打桩源码就会留在工作区（正是 #126 那轮脏工作区的机制）。
+# 就地打桩前先抢工作区独占锁：本脚本会改真源码再 trap 还原，
+# 与其他同套路自测并行时会互相盖桩（假红/漏桩）。见 tools/with_worktree_lock.sh。
+worktree_lock_acquire "$0"
+trap restore EXIT INT TERM HUP
 
 run_guard() {
     set +e
@@ -357,6 +364,69 @@ s = s.replace(old2, "      signal: abort.signal,", 1)
 open(p, "w", encoding="utf-8").write(s)
 PYEOF
 must_red "桩㉒（句柄不自己留一份，收尾判据失去依据）" "FAIL  本轮句柄自己留一份 myCtl"
+reset_src
+
+# ── 23. 桩㈣（单条删除只动气泡、不动 history —— 视觉与上下文不一致）──────────
+# 这一族的失效**两个方向都看不出来**：
+#   · 只删气泡 -> 页面上没了，模型还记得（用户以为自己删掉了）；
+#   · 只删 history -> 模型那边没了，页面上还在（用户以为自己没删掉。）
+# 而且它不报错、不异常 —— 只能靠断言钉“两边都动”。
+"$PY" - $WEB <<'PYEOF'
+import sys
+p = sys.argv[1]; s = open(p, encoding="utf-8").read()
+# 桩要打的是"删了 history 那一半"（现在写成 `inRange` 判定 + splice），
+# 打掉它之后守卫必须报"删除同时动气泡与 history"。
+old = """  const inRange = hi >= 0 && hi < history.length;
+  if (inRange) history.splice(hi, 1);"""
+assert s.count(old) == 1, "stub23: anchor not found"
+open(p, "w", encoding="utf-8").write(s.replace(old, "  const inRange = false;", 1))
+PYEOF
+must_red "桩㉓（删除只动气泡不动 history）" "FAIL  删除同时动气泡与 history"
+reset_src
+
+# ── 23b. 桩㉓b（生成中删除的**闸门掉了** —— 这正是 D-2 的原始形态）──────────
+# 后果不仅是"删了不算"：本轮还没进 history，删掉只会让气泡消失、上下文照样
+# 被污染，而收尾时那条回答又被 push 回去 —— 用户以为自己删掉了，模型还记得。
+"$PY" - $WEB <<'PYEOF'
+import sys
+p = sys.argv[1]; s = open(p, encoding="utf-8").read()
+old = """  if (abort) { show($('out'), '生成中，请先停止再删除（本轮的回答还没定型）。', 'err'); return; }"""
+assert s.count(old) == 1, "stub23b: anchor not found"
+open(p, "w", encoding="utf-8").write(s.replace(old, "", 1))
+PYEOF
+must_red "桩㉓b（生成中删除的闸门掉了）" "FAIL  生成中禁止删除"
+reset_src
+
+# ── 23c. 桩㉓c（越界退回静默跳过 + 照样说"已删除"）──────────────────────────
+# 旧写法就是 `if (hi >= 0 && hi < history.length) history.splice(hi, 1);` —— 
+# 越界什么都不做，却照样回一句"已删除这一条"。那正是"删了不算"的形态。
+"$PY" - $WEB <<'PYEOF'
+import sys
+p = sys.argv[1]; s = open(p, encoding="utf-8").read()
+old = """  if (inRange) {
+    show($('out'), '已删除这一条（不再进入后续请求的历史）。', '');
+  } else {"""
+assert s.count(old) == 1, "stub23c: anchor not found"
+new = """  if (true) {
+    show($('out'), '已删除这一条（不再进入后续请求的历史）。', '');
+  } else {"""
+open(p, "w", encoding="utf-8").write(s.replace(old, new, 1))
+PYEOF
+must_red "桩㉓c（越界也报已删除）" "FAIL  删除的成功/越界是两条出口"
+reset_src
+
+# ── 24. 桩㈤（滑动落点挂到 document 上 —— 抢走输入框的光标左右移动）──────────
+# 页面里有两个 textarea（schema 与对话输入）。挂在 document 上时，
+# 用户想在文本框里左右移动光标，页面却跳到了另一页 ——
+# 而“输入框里没法移光标”很少有人会归因到一个滑动监听器。
+"$PY" - $WEB <<'PYEOF'
+import sys
+p = sys.argv[1]; s = open(p, encoding="utf-8").read()
+old = "  const pg = $('pager');"
+assert s.count(old) == 1, "stub24: anchor not found"
+open(p, "w", encoding="utf-8").write(s.replace(old, "  const pg = document;", 1))
+PYEOF
+must_red "桩㉔（滑动落点挂到 document）" "FAIL  滑动落点是内容节点而不是 document"
 reset_src
 
 echo ""

@@ -25,11 +25,11 @@ c "取尾部而非头部"                      "grep -q 'lines.takeLast(shown)' 
 # ── 2) 日志页必须贴底跟随，否则新行（探针摘要）永远看不见
 c "有日志页贴底函数"                    "grep -q 'private fun followLogBottom()' \$ACT"
 c "渲染日志后调用贴底"                  "sed -n '/private fun renderLog()/,/^    }/p' \$ACT | grep -q 'followLogBottom'"
-c "切到日志页时也贴底一次"              "grep -q 'else if (i == 2) { rootScroll.post { followLogBottom() } }' \$ACT"
+c "切到日志页时也贴底一次"              "grep -q 'else if (i == 3) { rootScroll.post { followLogBottom() } }' \$ACT"
 
 # ── 3) 贴底不得把用户上滑看历史的动作抢回去（否则比不跟随更难用）
 c "上滑后停止跟随（有跟随标志）"        "grep -q 'private var logFollowBottom' \$ACT"
-c "跟随标志在滚动回调里更新"            "grep -q 'if (curTab == 2) logFollowBottom = isLogAtBottom()' \$ACT"
+c "跟随标志在滚动回调里更新"            "grep -q 'if (curTab == 3) logFollowBottom = isLogAtBottom()' \$ACT"
 c "跟随标志是贴底判据而非位移方向"      "grep -q 'private fun isLogAtBottom(): Boolean = chatAtBottom()' \$ACT"
 
 # ── 4) 截断不静默：显示了多少、被截掉多少，必须在页面上说出来

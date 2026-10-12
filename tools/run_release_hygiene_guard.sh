@@ -30,6 +30,12 @@ RULES=scripts/release-rules.json
 README=README.md
 GH=.github/workflows/build.yml
 CI=.cnb.yml
+# ⚠ `.cnb.yml` 只是"入口"，它在 2026-10-10 之后把 170 KB 的 stage 正文
+# 交给了 `scripts/ci-apk-stage.sh`（内联会让 CNB runner 的 fork/exec 报
+# `argument list too long`，一行都不跑）。所以"CNB 到底跑了多少个 tools/run_*"
+# 必须把两个文件合起来数 —— 只看 `.cnb.yml` 会数出 **0**，而这条判据的下限
+# 是 20，于是 J-4 变成一条恒假断言（红得和"质量门禁真的没了"一模一样）。
+CI_STAGE=scripts/ci-apk-stage.sh
 
 ok=0; bad=0
 c() { if eval "$2"; then echo "PASS  $1"; ok=$((ok+1)); else echo "FAIL  $1"; bad=$((bad+1)); fi; }
@@ -38,14 +44,17 @@ TMP=$(mktemp -d)
 trap 'rm -rf "$TMP"' EXIT
 
 # ── 用真 python 抽结构关系（grep 表达不了"这个函数体内""这行在锁内"这类判据）──
-python3 - "$REL" "$RULES" "$README" "$GH" "$CI" > "$TMP/report.txt" <<'PY'
+python3 - "$REL" "$RULES" "$README" "$GH" "$CI" "$CI_STAGE" > "$TMP/report.txt" <<'PY'
 import json, os, re, sys
 
-rel_path, rules_path, readme_path, gh_path, ci_path = sys.argv[1:6]
+rel_path, rules_path, readme_path, gh_path, ci_path, ci_stage_path = sys.argv[1:7]
 rel = open(rel_path, encoding='utf-8').read()
 README = open(readme_path, encoding='utf-8').read()
 GH = open(gh_path, encoding='utf-8').read()
+# CI 的调用清单 = 入口 + stage 正文（见上面 CI_STAGE 的说明）。
 CI = open(ci_path, encoding='utf-8').read()
+if os.path.exists(ci_stage_path):
+    CI += '\n' + open(ci_stage_path, encoding='utf-8').read()
 
 
 def emit(k, v):
@@ -245,6 +254,43 @@ emit('ARG_VERBOSE_REGISTERED', registered('--hygiene-selfcheck-verbose'))
 emit('ARG_SKIP_REGISTERED', registered('--skip-hygiene-selfcheck'))
 emit('ARG_SKIP_HONOURED',
      '1' if 'args.skip_hygiene_selfcheck' in body_main else '0')
+
+# ── F) `DROP_EXACT` 真的是一份"清单"，不是一个装饰性字面量 ────────────────
+# 起因（Issue #110 帐目②）：`DROP_EXACT` 是"只存在于日常线、不随发布分发"的
+# **硬编码清单**。`fix(release)` 那次（`00946a5`）把它扩了一项
+# （`docs/REVIEW-110-SUMMARY.md` —— 它就是被误发进发布包的那份小结），
+# 但**只动了 release.py 自己**，此守卫里 `grep DROP` = 0。
+# 于是：**把这 4 个名字里任何一个删掉，没有任何东西会红** —— 而"这份小结
+# 被误发进发布包"正是这条规则存在的全部理由。
+#
+# 判据锚的是**结构关系**，不是存在性（本仓库反复吃过这一课）：
+#   ① `DROP_EXACT` 必须真的**含有**这几项（含本次那项），且取自**集合字面量**
+#      —— 不是"文件里出现过这个名字"（那种断言，把它写进**注释**就恒真）；
+#   ② `is_dropped()` 必须真的**读** `DROP_EXACT`（钉调用/引用关系）——
+#      定义了却不用，规则就是装饰品；
+#   ③ 每一项必须**真的存在于磁盘上**：拼错一个字母 → 规则恒不命中，
+#      而发布器照旧"清洗过了"，是"看着像生效、实则空转"的形态。
+_drop_src = rel  # 原文（带注释）—— ① 要的是字面量本身的形状，不是去注释后的
+_m = re.search(r'DROP_EXACT\s*=\s*\{([^}]*)\}', _drop_src)
+emit('DROP_EXACT_FOUND', '1' if _m else '0')
+_drop_items = set(re.findall(r"'([^']+)'", _m.group(1))) if _m else set()
+emit('DROP_EXACT_ITEMS', ';'.join(sorted(_drop_items)))
+# 这 4 项是"必须绝迹于发布包"的最小集：改掉任何一个都必须有人来解释。
+REQUIRED_DROP = {'CHANGELOG.md', 'docs/RELEASE-WORKFLOW.md',
+                 'docs/REVIEW-110-SUMMARY.md', 'HTP-STATUS.md'}
+_drop_missing = sorted(REQUIRED_DROP - _drop_items)
+emit('DROP_EXACT_MISSING', ';'.join(_drop_missing))
+# ② `is_dropped()` 真的引用 `DROP_EXACT`（去掉注释后再判，防注释里写一句骗过）
+_isdrop = func_body(REL_NO_COMMENT, 'is_dropped')
+emit('IS_DROPPED_FOUND', '1' if _isdrop else '0')
+emit('IS_DROPPED_USES_EXACT',
+     '1' if re.search(r'\bDROP_EXACT\b', _isdrop) else '0')
+# ③ 每一项真在磁盘上（相对仓库根）。
+# ⚠ 只对 `DROP_EXACT` 做，不对 `DROP_PREFIX` 做：后者是**前缀**，其中有
+#   `scripts/release-overrides/` —— 目录**刻意不存在**（见 HTP-STATUS 第五节
+#   "覆盖层通路从未被跑过"），按"必须存在"判会误红。
+_drop_on_disk = sorted(p_ for p_ in _drop_items if os.path.exists(p_))
+emit('DROP_EXACT_ON_DISK', len(_drop_on_disk))
 PY
 
 v() { awk -F= -v k="$1" '$1==k {sub(/^[^=]*=/,""); print; exit}' "$TMP/report.txt"; }
@@ -311,6 +357,16 @@ c "--skip-hygiene-selfcheck 真的在 argparse 里注册了" \
   "[ \"\$(v ARG_SKIP_REGISTERED)\" = 1 ]"
 c "--skip-hygiene-selfcheck 真的被读到（不是死参数）" \
   "[ \"\$(v ARG_SKIP_HONOURED)\" = 1 ]"
+
+# ── F) `DROP_EXACT` 的清单完整性（帐目②）──────────────────────────────────
+c "release.py 里 DROP_EXACT 是一个可解析的集合字面量（抽到了 $(v DROP_EXACT_ITEMS)）" \
+  "[ \"\$(v DROP_EXACT_FOUND)\" = 1 ]"
+c "DROP_EXACT 含全部 4 个开发期文档（缺：${DROP_EXACT_MISSING:-无}）" \
+  "[ -z \"\$(v DROP_EXACT_MISSING)\" ]"
+c "is_dropped() 真的读 DROP_EXACT（定义了却不用 = 规则是装饰品）" \
+  "[ \"\$(v IS_DROPPED_USES_EXACT)\" = 1 ]"
+c "DROP_EXACT 的每一项都真的存在于磁盘（拼错一个字母 = 规则恒不命中）" \
+  "[ \"\$(v DROP_EXACT_ON_DISK)\" -ge 4 ]"
 
 echo ""
 if [ "$bad" = "0" ]; then echo "=== 发布器自洽守卫：PASS $ok / FAIL 0 ==="; exit 0; fi

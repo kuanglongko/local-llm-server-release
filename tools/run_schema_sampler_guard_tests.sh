@@ -25,6 +25,7 @@
 # 运行：sh tools/run_schema_sampler_guard_tests.sh
 set -e
 cd "$(dirname "$0")/.."
+. "$(dirname "$0")/with_worktree_lock.sh"   # 工作区独占锁：见该文件顶部说明
 
 PY=${PYTHON:-python3}
 GUARD=tools/run_schema_sampler_guard.sh
@@ -34,7 +35,7 @@ HTTP=app/src/main/java/com/xiaowan/localinference/HttpApi.kt
 PURE=app/src/main/java/com/xiaowan/localinference/JsonSchemaFormat.kt
 SRC_RP=app/src/main/java/com/xiaowan/localinference/RenderedPrompt.kt
 PROBE=app/src/main/cpp/probe_util.h
-CI=.cnb.yml
+CI=scripts/ci-apk-stage.sh
 RLP=tools/root_literal_probe_test.cpp
 
 command -v "$PY" >/dev/null 2>&1 || { echo "缺少 python3（本测试只用标准库）"; exit 2; }
@@ -58,11 +59,21 @@ restore() {
     cp "$TMP/rlp.bak" "$RLP"
     rm -rf "$TMP"
 }
-trap restore EXIT
+# 退出即还原：EXIT / INT / TERM / HUP 都走同一个还原 ——
+# 只 trap EXIT 时，CI 的 kill（默认 TERM）不会触发 EXIT trap，
+# 打桩源码就会留在工作区（正是 #126 那轮脏工作区的机制）。
+# 就地打桩前先抢工作区独占锁：本脚本会改真源码再 trap 还原，
+# 与其他同套路自测并行时会互相盖桩（假红/漏桩）。见 tools/with_worktree_lock.sh。
+worktree_lock_acquire "$0"
+trap restore EXIT INT TERM HUP
 
 run_guard() {
     set +e
-    sh "$GUARD" > "$TMP/guard.out" 2>&1
+    # ⚠ `SKIP_STUB_SELFTEST=1` 必须在这里设：守卫最后一节会**反过来跑一次本自测**
+    #   （判"桩有没有全部被执行到"——那一格只有真跑才知道）。本自测又跑守卫，
+    #   不加这个开关就是**无限递归**（本判据第一版就是这么挂的：拉满 10 分钟被强杀）。
+    #   开关只断"守卫 -> 自测 -> 守卫"这一环，守卫那一节的判据本身照常生效。
+    SKIP_STUB_SELFTEST=1 sh "$GUARD" > "$TMP/guard.out" 2>&1
     rc=$?
     set -e
     return $rc
@@ -93,19 +104,21 @@ must_green() {
 # ── 0. 基线 ─────────────────────────────────────────────────────────────
 must_green "基线：未改动源码树"
 
-# ── 1. 桩①：schema 为 null 也挂采样器（改掉所有既有请求的输出分布）────────
+# ── 1. 桩①：空 GBNF 也真的入链（改掉所有既有请求的输出分布）────────────────
+# ⚠ 桩的方向与判据一起改过一次。原来这条桩是把调用点的 `if (!sg.gbnf.empty())`
+#   删掉；而那个条件后来**收进了 attach_grammar_sampler 自身**
+#   （`if (!chain || !gbnf || !*gbnf) return false;`），调用点已经没有那两行可删。
+#   现在桩打在被调方的**空值闸**上：把它放宽成"只判指针非空"，
+#   于是空串 GBNF 照样进链 —— 那正是判据要逮的"没给 schema 也挂了 grammar"。
 "$PY" - "$JNI" <<'EOF'
 import sys
 p = sys.argv[1]; s = open(p, encoding='utf-8').read()
-old = """            if (!sg.gbnf.empty())
-                attach_grammar_sampler(ch, sg.gbnf.c_str(), sg.prefill.c_str(), gp,
-                                       sg.pegLiteral.c_str());"""
-new = """            attach_grammar_sampler(ch, sg.gbnf.c_str(), sg.prefill.c_str(), gp,
-                                   sg.pegLiteral.c_str());"""
-assert s.count(old) == 1, "桩①：没找到调用点"
+old = """    if (!chain || !gbnf || !*gbnf) return false;"""
+new = """    if (!chain || !gbnf) return false;"""
+assert s.count(old) == 1, "桩①：没找到空值闸"
 open(p, 'w', encoding='utf-8').write(s.replace(old, new, 1))
 EOF
-must_red "桩①（无条件挂 grammar）" "调用点先判 gbnf 非空才挂采样器"
+must_red "桩①（空 GBNF 也能入链）" "空 / 失败的 GBNF 一律不挂采样器"
 reset_src
 
 # ── 2. 桩②：取 GBNF 那一跳去掉 catch（异常穿 JNI = SIGABRT）──────────────
@@ -169,9 +182,8 @@ block = """    {
             // 预填只把 grammar 推过"首字面量"那一截；真后缀比它长的那一段（错位段）
             // 也要一起咽下去，否则 grammar 的落点与模型续写的位置差着那一段 ——
             // 见 advance_grammar_past_mismatch 的文件头（第十处成因）。
-            if (!sg.gbnf.empty())
-                attach_grammar_sampler(ch, sg.gbnf.c_str(), sg.prefill.c_str(), gp,
-                                       sg.pegLiteral.c_str());
+            attach_grammar_sampler(ch, sg.gbnf.c_str(), sg.prefill.c_str(), gp,
+                                   sg.pegLiteral.c_str());
             if (gp) env->ReleaseStringUTFChars(jgenPrompt, gp);
         }
         if (tm) env->ReleaseStringUTFChars(jtmpl, tm);
@@ -215,15 +227,24 @@ must_red "桩⑥（只有一个端点接上）" "两个端点都把 respFormat �
 reset_src
 
 # ── 7. 桩⑦：Kotlin 侧 native 声明漏掉 schema（形参漂移 -> UnsatisfiedLinkError）──
+# ⚠ 本桩漂移过一次（甲-1 顺手发现、本轮修）：它锚的是**声明整行原文**，而这条声明
+#   在 `0.9.145` 之后又长了两个形参（logit_bias 的平行数组 `biasIds` / `biasVals`）——
+#   桩的 `old` 停在旧尾巴上，`assert s.count(old) == 1` 当场失败。因为脚本是 `set -e`，
+#   自测**在桩⑦ 处整体中止**，桩⑧ 之后全都没跑 —— 「看着 74 条判据，实际执行到桩⑥ 就断」，
+#   正是甲-1 那一轮要防的"没被执行"的另一种形态，只是发生在自测桩这一层。
+#
+#   修法不是把 `old` 再抄一遍现文（下一次追加形参还会漂），而是把桩的改动面**收窄到
+#   `schema` 这一个形参**：删掉 `schema: String?, ` 这一段即等价于"声明漏掉 schema"，
+#   而它前面/后面的形参怎么长都与本桩无关。这样桩关心的是"漏没漏 schema"这件事，
+#   而不是"这一行的尾巴长什么样"—— 后者本来就不是本桩要测的东西。
 "$PY" - "$KT" <<'EOF'
 import sys
 p = sys.argv[1]; s = open(p, encoding='utf-8').read()
-old = "stops: Array<String>?, schema: String?, genPrompt: String?, tmpl: String?, thinkingOn: Boolean): Boolean"
-new = "stops: Array<String>?, schema: String?): Boolean"
-assert s.count(old) == 1, "桩⑦：没找到 native 声明"
-open(p, 'w', encoding='utf-8').write(s.replace(old, new, 1))
+old = "schema: String?, "
+assert s.count(old) == 1, "桩⑦：没找到 native 声明里的 schema 形参"
+open(p, 'w', encoding='utf-8').write(s.replace(old, "", 1))
 EOF
-must_red "桩⑦（Kotlin 形参漏 schema）" "Kotlin nativeNewSampler 声明的尾参逐字一致"
+must_red "桩⑦（Kotlin 形参漏 schema）" "Kotlin nativeNewSampler 声明的这些参数逐字一致"
 reset_src
 
 # ── 8. 桩⑧：判据文件里把 json_object 折成 null（该类型静默失效）──────────
@@ -299,7 +320,12 @@ s = s.replace(decl, '', 1)
 marker = 'JNIEXPORT jboolean JNICALL\nJava_com_xiaowan_localinference_LlmEngine_nativeNewSampler('
 assert s.count(marker) == 1
 idx = s.index(marker)
-brace = s.index('{', s.index('jboolean jthinkingOn)', idx))
+# ⚠ 这里原来是 `s.index('jboolean jthinkingOn)')` —— 形参表在 `0.9.145` 之后又长了
+#   两个（`jintArray jbiasIds, jfloatArray jbiasVals`），`jthinkingOn` 不再是**最后一个**
+#   形参，那个闭括号串在源码里已经不存在 -> ValueError: substring not found -> `set -e`
+#   让整份自测在桩⑩b 处中止。改成认**形参表结束的那个 `) {`**，即 marker 之后第一个
+#   `) {`：它不随形参增减漂移，是本桩真正要的东西（函数体开头）。
+brace = s.index(') {', idx) + 1
 s = s[:brace + 1] + '\n    ' + decl.replace('\n', '\n    ').rstrip() + s[brace + 1:]
 open(p, 'w', encoding='utf-8').write(s)
 EOF
@@ -320,13 +346,33 @@ EOF
 must_red "桩⑬（生成后缀写死成 true）" "生成后缀由调用方透传"
 
 # ── 9c. 桩⑪：模板又写死成空串（库内自选那份与运行时不是同一份）──────────
+# ⚠ 本桩也漂移过（与桩⑦ 同一轮发现、同一轮修）：它锚的 `templates_init(S.model, tmpl)`
+#   是 **`gbnf_from_json_schema` 里那一处**的原文，而 `llama_jni.cpp` 里
+#   `templates_init` 现在共有 **4 处**调用点，写法各不相同：
+#       3286  common_chat_templates_init(S.model, tmpl);                         <- 只有这一处是本桩的原文
+#       3489  common_chat_templates_init(S.model, tmpl.empty() ? "" : tmpl);     <- applyChatTemplate
+#       3603  common_chat_templates_init(S.model, tmpl.empty() ? "" : tmpl);     <- 带 tools
+#       3792  common_chat_templates_init(S.model, tmplOverride.empty() ? "" : tmplOverride); <- parseToolCalls
+#   而守卫的判据是 `grep -q 'templates_init(S.model, tmpl)'` —— 它只认第一处的原文。
+#   桩把第一处改成空串之后，判据本该红；但**另外三处**是后来才长的（`0.9.145` 前后），
+#   它们的原文都**不含** `(S.model, tmpl)` 那个形状……桩的 `assert count == 1` 因此
+#   仍然成立、改动也照做，但这条桩测的是"第一处有没有被改"，而判据测的是
+#   "源码里还有没有 `(S.model, tmpl)` 这个串" —— 一旦有人把第一处也写成三元的形状，
+#   两边就各说各话。
+#
+#   所以本桩改成**四处一起打桩**：把每一处调用点的模板实参都写成空串 ——
+#   这正是"模板又写死成空串"这件事的完整形态（只改一处 = 换个入口就换一种行为）。
+#   判据只认 `(S.model, tmpl)` 是它自己的窄，不在本模块范围；这里先把桩写对。
 "$PY" - "$JNI" <<'EOF'
-import sys
+import sys, re
 p = sys.argv[1]; s = open(p, encoding='utf-8').read()
-old = "tmpls = common_chat_templates_init(S.model, tmpl);"
-new = 'tmpls = common_chat_templates_init(S.model, "");   // 桩⑪：写死空串'
-assert s.count(old) == 1, "桩⑪：没找到模板取用点"
-open(p, 'w', encoding='utf-8').write(s.replace(old, new, 1))
+# ⚠ 不逐条抄原文（那正是桩⑦ 漂移的成因）：按**调用点前缀** `common_chat_templates_init(S.model, `
+#   切出来，把每个实参都换成空串。这样新长出来的调用点自动进桩，不必再改本桩。
+pat = re.compile(r'common_chat_templates_init\(S\.model, ([^;]*)\);')
+hits = pat.findall(s)
+assert len(hits) == 4, "桩⑪：templates_init 调用点期望 4 处，实际 %d" % len(hits)
+s = pat.sub('common_chat_templates_init(S.model, "");   // 桩⑪', s)
+open(p, 'w', encoding='utf-8').write(s)
 EOF
 must_red "桩⑪（模板写死空串）" "模板由调用方透传"
 
@@ -508,11 +554,15 @@ reset_src
 "$PY" - "$JNI" <<'EOF'
 import sys
 p = sys.argv[1]; s = open(p, encoding='utf-8').read()
-old1 = """        jobjectArray jstops, jstring jschema, jstring jgenPrompt, jstring jtmpl,
-        jboolean jthinkingOn) {"""
-new1 = """        jobjectArray jstops, jstring jschema, jstring jgenPrompt, jstring jtmpl) {"""
-assert s.count(old1) == 1, "stub23: 没找到 C++ 入口尾参"
-s = s.replace(old1, new1, 1)
+# ⚠ 这一处也漂移过（本轮修）：原来锚的是**尾参** `jboolean jthinkingOn) {`，
+#   而形参表后来长了 `jintArray jbiasIds, jfloatArray jbiasVals` —— `jthinkingOn`
+#   不再是尾参，那个串在源码里不存在 -> assert 失败 -> `set -e` 让自测在桩㉓ 处中止。
+#   木桩要测的是"C++ 收到的实参**少了一个**"，所以改动面收窄到 `jboolean jthinkingOn, `
+#   这一段本身：删掉它即等价于"C++ 半边丢了 thinkingOn"，与它后面还有没有别的形参无关。
+#   同时把 C++ 入口的行区间（下面 old2 的 awk 面）也跟着改成不依赖尾参的形状。
+old1 = "        jboolean jthinkingOn, "
+assert s.count(old1) == 1, "stub23: 没找到 C++ 入口的 thinkingOn 形参"
+s = s.replace(old1, "        ", 1)
 old2 = "                gbnf_from_json_schema(sc, tm, gp, jthinkingOn == JNI_TRUE);"
 new2 = "                gbnf_from_json_schema(sc, tm, gp);"
 assert s.count(old2) == 1, "stub23: 没找到 C++ 调用点"

@@ -24,6 +24,12 @@
 **只收录能自报总数的套件**：kotlinc 编译的宿主单测逐条打印 `PASS`、不汇总，
 硬凑一个条数只会制造新的漂移源。`--write` 对跑不出总数的项**保留原值**，
 不把它抹成 null —— 否则本机缺工具链时跑一次就会把整份清单打回原形。
+
+除了逐套件的「N 条」，`--write` 还落一个 **`suite_total`**：目录里到底有多少个
+离线套件。这是「N 个套件」这句口径的**唯一真值** —— 此前文档里
+「83 个套件」「42 → 81 个」这类**总数**没有任何东西核对（判据⑤ 的正则只认
+表格里写 `N 条` 的行），于是「N 条」有尺子、「N 个套件」没有，同一族漂移在
+总数这一维上原样复现。`--check-total` 就是那把缺的尺子。
 """
 import glob
 import json
@@ -78,6 +84,29 @@ NESTED = (
 )
 
 
+def _interpreter(script):
+    """按首行 shebang 给出运行这个套件的命令前缀。
+
+    认三种：`python3`（含 `#!/usr/bin/env python3`）、`sh` / `bash`、`node`。
+    认不出时退回扩展名（`.py -> python3`，其余 `sh`）—— 那是"没有 shebang"
+    时的合理默认，而不是猜。
+    """
+    try:
+        first = open(script, encoding="utf-8", errors="replace").readline()
+    except OSError:
+        first = ""
+    if first.startswith("#!"):
+        if "python" in first:
+            return ["python3"]
+        if "node" in first:
+            return ["node"]
+        if "bash" in first:
+            return ["bash"]
+        if "sh" in first:
+            return ["sh"]
+    return ["python3"] if script.endswith(".py") else ["sh"]
+
+
 def totals_from(text):
     """取脚本输出里当前实现的总条数；跑不出返回 None。
 
@@ -103,7 +132,22 @@ def totals_from(text):
 
 
 def measure(script, timeout=300):
-    cmd = ["python3", script] if script.endswith(".py") else ["sh", script]
+    # ⚠ 解释器按**首行 shebang** 选，不按扩展名。
+    #
+    # 这条规则是被一次实测逼出来的：`run_release_rules_guard.py` 与
+    # `run_http_scope_order.py` 都以 `#!/usr/bin/env python3` 开头，此前却按
+    # `.py -> python3` 判（对），而 `run_llama_jni_abort_tests.sh` /
+    # `run_rag_kb_state_guard.sh` / `run_sse_forensics_tests.sh` 是**薄壳**：
+    # 它们是 `#!/bin/sh`，正文只做 `exec python3 tools/xxx/check.py` —— 按扩展名
+    # 判也对。真正分家的是另一种写法：**表里叫 `run_*.py`、文件却是 sh 语法**
+    # （或反过来），按扩展名挑解释器会直接 `Syntax error` 退出，读数落成 None，
+    # 清单与实测对不上 —— 而"对不上"在 CI 里就是一条**假漂移**。
+    #
+    # 所以从文件首行取。取不到（没有 shebang）时退回扩展名。
+    cmd = _interpreter(script) + [script]
+    # 按套件覆盖预算（见 MEASURE_TIMEOUTS）。相对路径归一成 `tools/xxx`。
+    key = "tools/" + os.path.basename(script)
+    timeout = MEASURE_TIMEOUTS.get(key, timeout)
     try:
         p = subprocess.run(
             cmd, cwd=ROOT, capture_output=True, text=True, timeout=timeout
@@ -174,6 +218,38 @@ def toolchain_dependent():
     return dep
 
 
+# 「按套件给的测量预算」（秒）。默认 300s —— 正常套件几秒到几十秒。
+# 少数套件**自身**是分钟级的（框架如此，不是慢在环境上），给足预算才能量到条数；
+# 预算不够时 measure() 会把它 kill 掉，读数落成 None —— 那不算"漂移"，
+# 但会让 `--check` 报一条假漂移（清单里记着真值、实测却永远是 None）。
+#
+# ⚠ 这里**只该放宽预算，不该把套件从核对面里拿掉**：拿掉 = 少核对，
+# 正是这份清单要防的"数字漂移"回到门内。真放宽不动的（超过 CI 愿意等的上限），
+# 才在下面 `SLOW_SUITES` 里显式列出、由快检跳过，且必须写清为什么。
+# ⚠ 放宽预算要付的代价是**让 `--check` 每次多等这么久**，所以只在
+# "这分钟的等待本身买得到条数"时才用。实测 `run_assertion_anchor_guard_tests.sh`
+# 要 ~6.5 分钟（它跑 4 轮 `run_assertion_anchor_guard.py`，后者已从 ~310s
+# 降到 ~80s —— 见该守卫里 collect 阶段的注释）—— 4 轮仍超过快检的 300s 预算，
+# 于是它进 `SLOW_SUITES` 而不是这里。当前无套件需要放宽。
+MEASURE_TIMEOUTS = {}
+
+# 快检（`--check --static-only`）**明确跳过**的套件：放宽预算也买不到条数
+# （耗时远超 CI 肯等的上限）。与 `toolchain_dependent()` 同一个思路
+# —— 都是"快检这台机器上量不动" —— 但判据不同：那里缺的是工具链，
+# 这里缺的是**时间预算**。
+#
+# 列在这里的套件**不会失去保障**：它的条数由它自己（跑起来就打印汇总）
+# 与它被 `.cnb.yml` 调起的那一节保证，只是不进快检的逐套件对账。
+# `--check`（非快检、给足时间的模式）仍然会核对它。
+SLOW_SUITES = {
+    # ~6.5 分钟：内部要跑 4 轮 `run_assertion_anchor_guard.py`（单轮已 ~80s，
+    # 见该守卫 collect 阶段的注释）。4 轮仍超过快检的 300s 预算，会被 kill 成
+    # `实测=None`，对着清单里的真值就是一条**假漂移** —— 这正是它此前一直挂在
+    # `实测=None` 上的原因。
+    "run_assertion_anchor_guard_tests.sh",
+}
+
+
 def load_manifest():
     with open(MANIFEST, encoding="utf-8") as fh:
         return json.load(fh)["totals"]
@@ -192,9 +268,34 @@ def collect(old=None):
     return out
 
 
+def disk_suite_total():
+    """目录里离线套件的个数 —— 「N 个套件」这句口径的**唯一真值**。
+
+    与 `suite_scripts()` 同一把尺子（同一个 glob），不另写一份近似：
+    两处各写一遍就是判据漂移的起点（模块 J 的原始形态）。
+    """
+    return len(suite_scripts())
+
+
 def main():
     args = set(sys.argv[1:])
     old = load_manifest() if os.path.exists(MANIFEST) else None
+    if "--check-total" in args:
+        # 「N 个套件」的尺子：清单里落的 suite_total 必须等于磁盘上的套件个数。
+        # 这是判据⑤ 的**数量维延伸** —— 判据⑤ 只管逐套件的「N 条」，
+        # 文档里的**总数**（「83 个套件」「42 → 81 个」）此前无人核对。
+        # 静态、秒级，CI 里与接线守卫同一节跑。
+        manifest = json.load(open(MANIFEST, encoding="utf-8")) if os.path.exists(MANIFEST) else {}
+        want = manifest.get("suite_total")
+        got = disk_suite_total()
+        if want is None:
+            print("清单里没有 suite_total —— 请跑 python3 tools/count_suite_totals.py --write")
+            return 1
+        if want != got:
+            print(f"套件总数与磁盘不符：清单={want} 磁盘={got}")
+            return 1
+        print(f"套件总数与磁盘一致（{got} 个）")
+        return 0
     if "--check" in args:
         want = old or {}
         # `--static-only`：只核对"不依赖 kotlinc / g++ 之外工具链"的快套件。
@@ -213,10 +314,22 @@ def main():
                 continue
             if static_only and os.path.basename(path) in toolchain_dep:
                 continue  # 依赖工具链（含**传递**依赖），快检模式跳过
+            if static_only and os.path.basename(path) in SLOW_SUITES:
+                continue  # 耗时远超快检定位（见 SLOW_SUITES），快检模式跳过
+            # ⚠ 每项先报一行进度，且**立刻 flush** —— 不是日志洁癖。
+            # 这一步要串行跑几百个套件、静默几分钟，而 CNB runner 有一条
+            # 「任务超过(10m0s)没有任何输出」的**静默超时**：全程不打印的进程
+            # 会被当成卡死杀掉。本次就真踩到了 —— 构建停在
+            # `=== 套件条数清单 vs 实测（判据⑤ 的另一半）===` 之后一行不输出，
+            # 报的是"没有任何输出而被强制关闭"，看起来像套件慢，其实是这段
+            # 代码把几百项的输出全憋在最后一起打。进度行同时也让"卡在哪一项"
+            # 变得可读（上一次排障全靠人肉 ps 才看出来）。
+            print(f"[{checked + 1}] {name} …", flush=True)
             got = measure(path)
             checked += 1
             if got != w:
                 drift.append(f"{name}: 清单={w} 实测={got}")
+                print(f"    漂移：清单={w} 实测={got}", flush=True)
         if drift:
             print("套件条数清单与实测不符：")
             for d in drift:
@@ -229,7 +342,10 @@ def main():
         {
             "note": "每个套件自报的总条数清单，由 tools/count_suite_totals.py "
                     "--write 生成；null = 该脚本逐条打印 PASS、不汇总"
-                    "（或依赖真实 native 栈，本机算不准）",
+                    "（或依赖真实 native 栈，本机算不准）。"
+                    "suite_total = 目录里离线套件的个数，是文档里「N 个套件」"
+                    "这句口径的唯一真值（--check-total 核对）。",
+            "suite_total": disk_suite_total(),
             "totals": totals,
         },
         ensure_ascii=False, indent=2, sort_keys=True,

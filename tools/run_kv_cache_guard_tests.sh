@@ -24,6 +24,7 @@
 # 运行：sh tools/run_kv_cache_guard_tests.sh
 set -e
 cd "$(dirname "$0")/.."
+. "$(dirname "$0")/with_worktree_lock.sh"   # 工作区独占锁：见该文件顶部说明
 
 PY=${PYTHON:-python3}
 GUARD=tools/run_kv_cache_guard.sh
@@ -46,7 +47,13 @@ restore() {
     cp "$TMP/http.bak" "$HTTP"; cp "$TMP/eng.bak" "$ENG"
     rm -rf "$TMP"
 }
-trap restore EXIT
+# 退出即还原：EXIT / INT / TERM / HUP 都走同一个还原 ——
+# 只 trap EXIT 时，CI 的 kill（默认 TERM）不会触发 EXIT trap，
+# 打桩源码就会留在工作区（正是 #126 那轮脏工作区的机制）。
+# 就地打桩前先抢工作区独占锁：本脚本会改真源码再 trap 还原，
+# 与其他同套路自测并行时会互相盖桩（假红/漏桩）。见 tools/with_worktree_lock.sh。
+worktree_lock_acquire "$0"
+trap restore EXIT INT TERM HUP
 
 run_guard() { # -> 打印输出，返回守卫退出码
     set +e
@@ -155,7 +162,45 @@ EOF
 must_red "桩⑦（去掉复用门槛）" "门槛真的参与判定"
 reset_src
 
-# ── 8. 收尾：还原后必须恢复全绿 ─────────────────────────────────────────────
+# ── 8. 桩⑧：lcp 记在两道闸**之后**（未命中场景恒为 0，可观测面在关键时没用）──
+# 第 5 步的可观测面**只在"没命中"时才有价值**（命中时 reuse 已经说明了问题）。
+# 桩把 `p.lcp = lcp;` 挪到 `if (lcp < kMinReuseTokens) return p;` **之后** ——
+# 那样凡是"没命中"的轮次 lcp 都是 0，日志永远说"公共前缀 0"，
+# 于是它不但没用，还**误导**（看起来像"两轮完全不同"）。
+"$PY" - "$HDR" <<'EOF'
+import sys
+p = sys.argv[1]; s = open(p, encoding='utf-8').read()
+old = "    p.lcp = lcp;                                                // 可观测面：无论是否命中都记下\n    if (lcp < kMinReuseTokens) return p;"
+new = "    if (lcp < kMinReuseTokens) return p;\n    p.lcp = lcp;"
+assert s.count(old) == 1, "桩⑧：没找到 lcp 赋值与门槛的先后关系"
+open(p, 'w', encoding='utf-8').write(s.replace(old, new, 1))
+EOF
+must_red "桩⑧（lcp 记在门槛之后 = 未命中时恒为 0）" "lcp 在两道闸"
+reset_src
+
+# ── 9. 桩⑨：describe 不再打公共前缀（可观测面存了但不用）──────────────────
+"$PY" - "$HDR" <<'EOF'
+import sys
+p = sys.argv[1]; s = open(p, encoding='utf-8').read()
+# 把整段"公共前缀 "标签删掉，只留 lcp 的数值占位（模拟"存了 lcp 但日志不显示它"）。
+old = '未命中（公共前缀 '
+assert old in s, "桩⑨：没找到 describe 未命中支的公共前缀标签"
+open(p, 'w', encoding='utf-8').write(s.replace(old, '未命中（', 1))
+EOF
+must_red "桩⑨（未命中支不再打公共前缀）" "describe 在**未命中**时也打公共前缀"
+reset_src
+
+# ── 10. 桩⑩：/health 少报 kv_lcp_tokens（回归里静默失效就看不出来了）───────
+"$PY" - "$HTTP" <<'EOF'
+import sys
+p = sys.argv[1]; s = open(p, encoding='utf-8').read()
+assert s.count('"kv_lcp_tokens":$kvLcp') == 1, "桩⑩：没找到 kv_lcp_tokens 字段"
+open(p, 'w', encoding='utf-8').write(s.replace('"kv_lcp_tokens":$kvLcp', '"kv_yy":0', 1))
+EOF
+must_red "桩⑩（/health 少报 kv_lcp_tokens）" "HttpApi /health 报 kv_lcp_tokens"
+reset_src
+
+# ── 11. 收尾：还原后必须恢复全绿 ─────────────────────────────────────────────
 if run_guard; then ck "收尾：还原源码后守卫恢复全绿" 1
 else ck "收尾：还原源码后守卫恢复全绿（实际红了 -> 有桩没还原干净）" 0
      sed -n '1,80p' "$TMP/guard.out"; fi

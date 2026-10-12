@@ -53,10 +53,17 @@ c "HttpApi 不自行折叠 response_format（判据只在 JsonSchemaFormat）" \
 # ── 2) ① 默认不变：schema 为 null 时不得挂采样器 ────────────────────────
 # 判据锚定在调用点：必须**先判 gbnf 非空**才挂。写成无条件 attach 就等于
 # "没给 schema 也加一个空 grammar 采样器"，那会改变所有既有请求的输出分布。
-c "调用点先判 gbnf 非空才挂采样器（空 / 失败一律不挂）" \
-  "grep -q 'if (!sg.gbnf.empty())$' \$JNI && \
-   grep -q 'attach_grammar_sampler(ch, sg.gbnf.c_str(), sg.prefill.c_str(), gp,' \$JNI && \
-   grep -q 'sg.pegLiteral.c_str());' \$JNI"
+# ⚠ 判据从「**调用点**写着 `if (!sg.gbnf.empty())`」改成「**空 GBNF 在某一层被拒**」：
+#   原来那一版锚的是调用点的条件式写法，而 f8d11e7 / e63d4fb 之后那个条件被
+#   **收进 attach_grammar_sampler 自身**（`if (!chain || !gbnf || !*gbnf) return false;`）
+#   —— 语义没变（空 GBNF 仍然一个采样器都不挂），但调用点的字面式没了，
+#   于是这条断言**零命中**（`run_assertion_anchor_guard.py` 的判据②正是逮这个：
+#   "锚在措辞上的断言会随重写而静默失效"）。
+#   现在锚**关系**：调用点必须传 `sg.gbnf`（而不是别的串），且被调方必须拒空。
+c "空 / 失败的 GBNF 一律不挂采样器（调用点传 sg.gbnf + 被调方自己拒空，双保险）" \
+  "grep -q 'attach_grammar_sampler(ch, sg.gbnf.c_str(), sg.prefill.c_str(), gp,' \$JNI && \
+   grep -q 'sg.pegLiteral.c_str());' \$JNI && \
+   grep -q 'if (!chain || !gbnf || !\*gbnf) return false;' \$JNI"
 c "attach_grammar_sampler 自身也拒绝空 GBNF（双保险）" \
   "grep -q 'if (!chain || !gbnf || !\*gbnf) return false;' \$JNI"
 c "gbnf_from_json_schema 只在给了 schema 时被调用" \
@@ -187,9 +194,14 @@ c "宿主回落路径也带上生成后缀（渲染失败时不能退回 null）
 c "回传格式的长度段宽度两端一致（C++ kRenderedPromptSuffixHexLen == Kotlin SUFFIX_HEX_LEN == 8）" \
   "grep -q 'kRenderedPromptSuffixHexLen = 8' \$JNI && \
    grep -q 'SUFFIX_HEX_LEN = 8' \$SRC/RenderedPrompt.kt"
+# 这一条原写成 `grep 'snprintf(... "%08zx", genSuffix.size())' && grep 'padStart' || grep 'hex.toIntOrNull(16)'`。
+# 而 `genSuffix.size()` 那支正是下面第 3 条判据明令**不许出现**的旧写法
+# （长度单位改成 UTF-16 之后它就恒不命中），`padStart` 也早已从 RenderedPrompt 里删掉 ——
+# 于是整条判据只剩 `|| hex.toIntOrNull(16)` 一个死撑着的活支（甲-1 判据② 抓到）。
+# 现在锚在**当前真源**上：C++ 侧 `%08zx` + `utf16_len(genSuffix)`，Kotlin 侧 `hex.toIntOrNull(16)`。
 c "长度段按固定宽度十六进制拼（不是分隔符：后缀自己就含换行）" \
-  "grep -q 'snprintf(hex, sizeof(hex), \"%08zx\", genSuffix.size())' \$JNI && \
-   grep -q 'padStart' \$SRC/RenderedPrompt.kt || grep -q \"hex.toIntOrNull(16)\" \$SRC/RenderedPrompt.kt"
+  "grep -q 'snprintf(hex, sizeof(hex), \"%08zx\", utf16_len(genSuffix))' \$JNI && \
+   grep -q 'hex.toIntOrNull(16)' \$SRC/RenderedPrompt.kt"
 # 长度单位：必须是 UTF-16 code unit（宿主 substring 的口径），不是 UTF-8 字节。
 # ASCII 后缀下两者相等，所以单位错了在常见模型上一点症状都没有 ——
 # 换一个含汉字 / emoji 的生成后缀才会错位。这类"只在部分模型上错"的静默故障
@@ -497,8 +509,12 @@ c "对齐的纯函数进了抽取单元的语法检查（改坏了宿主侧就�
 # `0.9.97` 那轮 `llama_jni.cpp` 真编不过（`strlen(gbnfFinal)`，而它是 `std::string`），
 # 而整条流水线**一处都不会红** —— 因为覆盖它的 run_jni_schema_syntax.sh 是以
 # `REQUIRED=0` 调的，缺 g++ 就 SKIP。判据：对齐相关的那一跳**不得**再走 REQUIRED=0。
+# ⚠ 查的是 **CI 的调用清单**，不只是 `.cnb.yml`：2026-10-10 之后 stage 正文
+#   在 `scripts/ci-apk-stage.sh`（`.cnb.yml` 里 170 KB 内联会让 CNB runner 的
+#   fork/exec 报 `argument list too long`，脚本一行都不跑）。
+#   两处任一命中即算 —— 判据问的是"这一步真的在流水线里"，不是"入口文件长什么样"。
 c "JNI 语法检查在 CI 里是 REQUIRED=1（缺 g++ 拦下，不再 SKIP 掉真编译错）" \
-  "grep -q 'REQUIRED=1 sh tools/run_jni_schema_syntax.sh' \$CI"
+  "grep -q 'REQUIRED=1 sh tools/run_jni_schema_syntax.sh' \$CI scripts/ci-apk-stage.sh"
 c "日志报的是 gbnfFinal.size()（写 strlen(gbnfFinal) = 编不过，且宿主侧拦得住）" \
   "grep -q 'gbnfFinal.size(), n_prefill' \$JNI && \
    ! grep -q 'strlen(gbnfFinal)' \$JNI"
@@ -516,22 +532,26 @@ c "mark 行也报 gbnfFinal（报原件 gbnf = 同一轮两个 GBNF 数字，读
 # 真机上 JVM 按**短符号名**回退解析，多出来的实参被 ABI 忽略，
 # 于是 C++ 永远收不到 thinkingOn、静默按默认值跑（正是本轮真根因）。
 # 所以必须**把两端参数字面串放在一起比**，外加一条 C++ 调用点真的把实参传下去的断言。
-c "C++ 入口接收 jschema / jgenPrompt / jtmpl / thinkingOn 四个尾参" \
+# ⚠ 判据落在"**顺序**"上而不是"结尾是不是 thinkingOn"：`0.9.145` 之后
+# thinkingOn 后面又长了两个形参（`logit_bias` 的平行数组）。写"末尾就是
+# thinkingOn"会让每一次往后追加形参都误红一次，而那种红是**判据过窄**、
+# 不是真问题 —— 真问题（静默断链）由下面那条"个数相等 + 逐个顺序"拦。
+c "C++ 入口接收 jschema / jgenPrompt / jtmpl / thinkingOn 四个参数（顺序如此）" \
   "grep -q 'jobjectArray jstops, jstring jschema, jstring jgenPrompt, jstring jtmpl,' \$JNI && \
-   grep -q 'jboolean jthinkingOn) {' \$JNI"
-c "Kotlin nativeNewSampler 声明的尾参逐字一致（含 thinkingOn）" \
-  "awk '/fun nativeNewSampler\(/,/\): Boolean/' \$KT | grep -q 'stops: Array<String>?, schema: String?, genPrompt: String?, tmpl: String?, thinkingOn: Boolean): Boolean'"
+   grep -q 'jboolean jthinkingOn,' \$JNI"
+c "Kotlin nativeNewSampler 声明的这些参数逐字一致（含 thinkingOn）" \
+  "awk '/fun nativeNewSampler\(/,/\): Boolean/' \$KT | grep -q 'stops: Array<String>?, schema: String?, genPrompt: String?, tmpl: String?, thinkingOn: Boolean,'"
 # ⚠ 交叉断言（本轮新增，正是漏掉的那一格）：两端的**尾参个数**必须相等。
 # Kotlin 侧数 "," 分隔的形参数，C++ 侧数 JNI 入口的形参数，两者不等 = 断链。
 # Kotlin 侧：形参都有 `名字: 类型` 的形状（返回类型在 `)` 之后，用 `\)` 排掉）。
 # C++ 侧：JNI 入口形参都有 `j*` 前缀类型（`JNIEnv *` / `jclass` 显式排除）。
 c "Kotlin 与 C++ 的 nativeNewSampler 形参**个数相等**（不等 = 静默断链，本轮真根因）" \
-  "[ \$(awk '/fun nativeNewSampler\(/,/\): Boolean/' \$KT | tr ',' '\n' | grep -cE '[A-Za-z]+: (Float|Int|Long|Boolean|String|Array<[A-Za-z]+>)\\??') -eq \
-    \$(awk '/Java_com_xiaowan_localinference_LlmEngine_nativeNewSampler/,/jboolean jthinkingOn\) \{/' \$JNI | tr ',' '\n' | grep -cE '\\b(jfloat|jint|jlong|jboolean|jstring|jobjectArray)\\b') ]"
-c "Kotlin 与 C++ 的 nativeNewSampler **末两个形参**顺序一致（tmpl 在 thinkingOn 之前）" \
-  "awk '/fun nativeNewSampler\(/,/\): Boolean/' \$KT | grep -q 'tmpl: String?, thinkingOn: Boolean): Boolean' && \
-   awk '/Java_com_xiaowan_localinference_LlmEngine_nativeNewSampler/,/jboolean jthinkingOn\) \{/' \$JNI | grep -q 'jstring jtmpl,' && \
-   awk '/Java_com_xiaowan_localinference_LlmEngine_nativeNewSampler/,/jboolean jthinkingOn\) \{/' \$JNI | grep -q 'jboolean jthinkingOn) {'"
+  "[ \$(awk '/fun nativeNewSampler\(/,/\): Boolean/' \$KT | tr ',' '\n' | grep -cE '[A-Za-z]+: (Float|Int|Long|Boolean|String|Array<[A-Za-z]+>|IntArray|FloatArray)\\??') -eq \
+    \$(awk '/Java_com_xiaowan_localinference_LlmEngine_nativeNewSampler/,/jfloatArray jbiasVals\) \{/' \$JNI | tr ',' '\n' | grep -cE '\\b(jfloat|jint|jlong|jboolean|jstring|jobjectArray|jintArray|jfloatArray)\\b') ]"
+c "两端「思考开关在模板之后」这条顺序一致（tmpl 在 thinkingOn 之前）" \
+  "awk '/fun nativeNewSampler\(/,/\): Boolean/' \$KT | grep -q 'tmpl: String?, thinkingOn: Boolean,' && \
+   awk '/Java_com_xiaowan_localinference_LlmEngine_nativeNewSampler/,/jfloatArray jbiasVals\) \{/' \$JNI | grep -q 'jstring jtmpl,' && \
+   awk '/Java_com_xiaowan_localinference_LlmEngine_nativeNewSampler/,/jfloatArray jbiasVals\) \{/' \$JNI | grep -q 'jboolean jthinkingOn,'"
 c "C++ 调用点把渲染侧那份思考开关真的传给了 gbnf_from_json_schema" \
   "grep -q 'gbnf_from_json_schema(sc, tm, gp, jthinkingOn == JNI_TRUE)' \$JNI"
 c "gbnf_from_json_schema 把思考开关写进 templates_inputs（不透传 = 库按默认 true 重算 PEG）" \
@@ -659,6 +679,63 @@ c "剥离动作落一行日志（服务端改了模型输出必须留痕）"   "
 c "HttpApi 不自行判'有没有围栏'（判据只在 JsonSchemaFormat）"   "! grep -q 'stripCodeFence' \$HTTP"
 c "剥离有独立单测（含真机那例、剥后非 JSON 退回、同一实例三条）"   "grep -q 'stripFenceForDelivery' tools/json_schema/JsonSchemaFormatTest.kt && \
    grep -q 'describeDeliveryStrip' tools/json_schema/JsonSchemaFormatTest.kt"
+
+# ── 10) 自测桩自己不许漂移：**每一条桩都要真的被执行到** ────────────────
+# 这一节钉的是甲-1 顺手发现、本轮修掉的那件事。
+# 自测脚本 `run_schema_sampler_guard_tests.sh` 是 `set -e` 的：任何一条桩的
+# `assert s.count(old) == 1` 失败，脚本就**整份中止**，只留一个 Traceback ——
+# 而 `run_ci_wiring_guard.sh` 只问"这脚本在不在 CI 里"、`suite-counts.json`
+# 只问"总数对不对"，**没有任何一件东西问过"桩⑦ 之后还有没有跑"**。
+# 于是 `0.9.141`~`0.9.147` 之间：桩⑦ 锚的那条声明尾巴被追加形参改掉之后，
+# 桩⑧ 往后**一条都没执行过**，而 CI 一直绿。
+# 这是甲-1 要防的"没被执行"的形态，只是发生在**自测桩**这一层，比判据那层更靠上。
+#
+# 判据分两层：**静态形状**（桩数与末行）与**实跑**（桩到底跑完没有）。
+# 后者只有真跑一次才知道 —— 静态 grep 判不了"执行路径走到哪一步断了"。
+c "自测有 PASS/FAIL 总账末行（中途 assert 失败 = set -e 让末行根本不出现）" \
+  "grep -q '=== 结构化输出守卫自测：PASS ' tools/run_schema_sampler_guard_tests.sh"
+c "自测桩数不低于地板（整段删桩会立刻显形）" \
+  "[ \$(grep -c '^must_red ' tools/run_schema_sampler_guard_tests.sh) -ge 60 ]"
+# 自测自身会还原打桩过的源码：没有这句的话，任何一次被强杀都会把打桩过的
+# 源码留在工作区 —— 正是模块 J 那轮脏工作区的机制。
+c "自测自身用 trap 还原打桩过的源码（强杀也不给下一次留脏基线）" \
+  "grep -q 'trap restore EXIT' tools/run_schema_sampler_guard_tests.sh"
+# 落点：**真跑一次**。自测是"就地改真源码 + trap 还原"，跑完工作区必须干净 ——
+# 脏工作区正是模块 J 那轮的机制（被强杀 = 打桩过的源码进下一次基线）。
+# ⚠ 这一跳会**反过来跑本守卫**，递归由 `SKIP_STUB_SELFTEST=1` 切断：
+#   自测的 run_guard 里已经设好它，本守卫被自测调用时直接跳过实跑。
+if [ "${SKIP_STUB_SELFTEST:-0}" = "1" ]; then
+    c "自测桩全部执行完（由自测发起，跳过实跑防递归）" "true"
+else
+    STUB_OUT=$(mktemp)
+    set +e
+    sh tools/run_schema_sampler_guard_tests.sh > "$STUB_OUT" 2>&1
+    STUB_RC=$?
+    set -e
+    LAST=$(grep '=== 结构化输出守卫自测：' "$STUB_OUT" | tail -1)
+    if [ "$STUB_RC" = "0" ] && [ -n "$LAST" ]; then
+        c "自测桩全部执行完（末行：$LAST）" "true"
+    else
+        c "自测桩全部执行完（rc=$STUB_RC，末行：${LAST:-<没有末行 = 中途断了>}）" "false"
+        sed -n '1,25p' "$STUB_OUT" >&2
+    fi
+    # **自洽**：末行自报的条数必须与桩数对得上（每条桩两次 ck + 基线 + 收尾）。
+    # 这一条与上面那条不同：上面判"末行在不在"，这里判"末行里的数字**对不对**" ——
+    # 有人把桩的 ck 减成一条、或中途 `exit 0` 提前收摊，都会在这里显形。
+    STUB_REPORTED=$(echo "$LAST" | sed -n 's/.*PASS \([0-9]*\) \/ FAIL .*/\1/p')
+    STUB_STUBS=$(grep -c '^must_red ' tools/run_schema_sampler_guard_tests.sh)
+    if [ -n "$STUB_REPORTED" ] && [ "$STUB_REPORTED" -ge $((STUB_STUBS * 2)) ]; then
+        c "自测自报条数（$STUB_REPORTED）与桩数（$STUB_STUBS，每桩 2 条）自洽" "true"
+    else
+        c "自测自报条数（${STUB_REPORTED:-无}）与桩数（$STUB_STUBS，每桩 2 条）自洽" "false"
+    fi
+    if git diff --quiet -- app/ 2>/dev/null; then
+        c "自测跑完 app/ 无残留 diff（强杀会留下打桩过的源码）" "true"
+    else
+        c "自测跑完 app/ 无残留 diff（有残留：上一次没还原干净）" "false"
+    fi
+    rm -f "$STUB_OUT"
+fi
 
 echo ""
 if [ "$bad" = "0" ]; then echo "=== 结构化输出守卫：PASS $ok / FAIL 0 ==="; exit 0; fi

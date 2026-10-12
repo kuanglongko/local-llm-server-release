@@ -20,6 +20,7 @@
 # 运行：sh tools/run_cors_guard_tests.sh
 set -e
 cd "$(dirname "$0")/.."
+. "$(dirname "$0")/with_worktree_lock.sh"   # 工作区独占锁：见该文件顶部说明
 
 PY=${PYTHON:-python3}
 GUARD=tools/run_cors_guard.sh
@@ -43,7 +44,13 @@ restore() {
     cp "$TMP/act.bak" "$ACT"; cp "$TMP/svc.bak" "$SVC"; cp "$TMP/readme.bak" "$README"
     rm -rf "$TMP"
 }
-trap restore EXIT
+# 退出即还原：EXIT / INT / TERM / HUP 都走同一个还原 ——
+# 只 trap EXIT 时，CI 的 kill（默认 TERM）不会触发 EXIT trap，
+# 打桩源码就会留在工作区（正是 #126 那轮脏工作区的机制）。
+# 就地打桩前先抢工作区独占锁：本脚本会改真源码再 trap 还原，
+# 与其他同套路自测并行时会互相盖桩（假红/漏桩）。见 tools/with_worktree_lock.sh。
+worktree_lock_acquire "$0"
+trap restore EXIT INT TERM HUP
 
 run_guard() {
     set +e

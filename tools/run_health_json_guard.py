@@ -52,7 +52,8 @@ def kotlin_raw_segment(line):
     Kotlin 词法：`\"\"\"` 开启原始字符串，扫描到下一个 `\"\"\"` 结束；
     若结束处引号多于 3 个，**最后 3 个**才是结束符，前面的都算内容。
     """
-    # 去掉行尾的 `+`（拼接符）与其后空白
+    # 段是从 `\"\"\"` 开头切出来的，可能带行尾 `+`（排版产物）——去掉它
+    line = line.rstrip()
     line = re.sub(r"\s*\+\s*$", "", line)
     m = re.match(r'^\s*"""', line)
     assert m, f"不是以 \"\"\" 开头：{line!r}"
@@ -66,39 +67,61 @@ def kotlin_raw_segment(line):
     return body + '"' * content_quotes
 
 
-def extract_health_json_expr(src):
-    """从源码里切出 `healthJson()` 里那段 `return`/`val json =` 的字符串拼接表达式。"""
+def extract_health_json_segments(src):
+    """从源码里切出 `healthJson()` 的**字符串段**（按 Kotlin 词法，含定界符原样返回）。
+
+    为什么不能靠"行尾有没有 `+`"来分段：那是**排版**，而这段守卫要守的是**词法**。
+    Kotlin 原始字符串的结束符是「连续引号里**最后 3 个**」，前面多出来的引号属于
+    内容 —— 所以扫描必须按引号配对走。全仓库就 `healthJson()` 这一处手拼响应体，
+    这里切错等于整份守卫失效，所以宁可多写几行也要按词法走。
+    """
     start = src.index("private fun healthJson()")
     end = src.index("private fun modelsJson()", start)
     body = src[start:end]
-    # 定位拼接表达式：从第一个 `"""` 起，到第一个行尾 `"`（非 `+` 结尾）为止
-    lines = body.splitlines()
+    # 从拼接表达式的前缀 `val json = ` 之后开始扫：函数体上方那段注释是**散文**，
+    # 里面为了讲清「结尾该写几个引号」自己就写了 `\"\"\"` 甚至 `\"\"\"\"` ——
+    # 按词法扫时它们是"合法的段"，会把段落数与还原结果一起带歪。
+    anchor = body.index('val json = ')
     segs = []
-    collecting = False
-    for ln in lines:
-        if not collecting and '"""' in ln and ("val json" in ln or "return \"\"\"" in ln):
-            collecting = True
-        if collecting and '"""' in ln:
-            # 只保留 `"""` 之后的表达式部分（丢掉 `val json = ` / `return ` 前缀）
-            segs.append(ln[ln.index('"""'):])
-            if not ln.rstrip().endswith("+"):
-                break
+    i = anchor
+    while True:
+        i = body.find('"""', i)
+        if i < 0:
+            break
+        k = body.find('"""', i + 3)
+        if k < 0:
+            raise AssertionError("原始字符串未闭合：%r" % body[i:i + 60])
+        n = k
+        while n < len(body) and body[n] == '"':
+            n += 1
+        content_quotes = n - k - 3      # 最后 3 个才是结束符，其余属于内容
+        segs.append(body[i:k] + '"' * content_quotes + '"""')
+        i = n
     assert segs, "没找到 healthJson() 的字符串拼接表达式"
     return segs
 
 
 src = HTTP.read_text(encoding="utf-8")
-seg_lines = extract_health_json_expr(src)
+seg_lines = extract_health_json_segments(src)
 
-# ── 1) 结构：必须是 4 段拼接（前 3 段带 +，末段不带）────────────────────────
-check("healthJson() 的拼接表达式有 4 段", len(seg_lines) == 4,
-      f"实际 {len(seg_lines)} 段：{seg_lines}")
-check("前 3 段以 `+` 结尾、末段不带 `+`",
-      all(l.rstrip().endswith("+") for l in seg_lines[:3])
-      and not seg_lines[-1].rstrip().endswith("+"))
+# ── 1) 结构：段数下限 4，不许并得更少 ───────────────────────────────────────
+#
+# 这条判据改过（`0.9.143`），原因值得留一句：它原来写「**恰好** 4 段」，
+# 理由是"加字段时多拆一段会立刻变红，逼你把字段并进现有段"。方向是对的，
+# 但它把判据挂在了**排版**上（几段是上一轮手工折行的结果），而不是 JSON 本身。
+# 于是"想拆得更细给人读"这种无害改动会撞红，而真正要命的东西（拼出来是不是合法
+# JSON、字段有没有少）反而在它下面。现在改成**段数 >= 4**，如实报出实际段数；
+# 护栏全部压到第 2、3 步：**每段按 Kotlin 词法还原 → 拼出来必须是合法 JSON →
+# 每个已知字段都在**。
+check("healthJson() 的拼接表达式至少 4 段（并成更少才是退化）",
+      len(seg_lines) >= 4, f"实际 {len(seg_lines)} 段：{seg_lines}")
+check("末段不带 `+`（拼接必须收口）",
+      not seg_lines[-1].rstrip().endswith("+"))
 
 # ── 2) 逐段按 Kotlin 词法还原，再拼出真实 JSON ─────────────────────────────
+# 段的切法见 extract_health_json_segments（按 `\"\"\"` 配对扫，不看行尾）。
 restored = "".join(kotlin_raw_segment(l) for l in seg_lines)
+
 # 把 Kotlin 插值 `${...}` / `$x` 换成**类型正确的常量**（只为让 JSON 能解析，
 # 不改变它在 JSON 里的位置与引号结构）：
 #   $desc 是 `toJsonStr()` 的产物，本身就是一段带引号的 JSON 串；
@@ -125,7 +148,17 @@ if isinstance(obj, dict):
     for key in ("status", "model_loaded", "ctx_used", "ctx_size",
                 "busy", "port", "generating", "cancelled",
                 "kv_cache_valid", "kv_reuse_tokens", "kv_prefill_tokens",
-                "kv_rounds"):
+                "kv_rounds",
+                # Issue #159（后台保活）：冻结痕迹三个字段 + 欠重启标记。
+                # 少了它们，「A2 到底有没有生效」就没有可读的证据 ——
+                # 被冻期间探活不失败、连接不断，解冻后读数与"从没被冻过"完全一样。
+                "frozen_ms", "frozen_count", "frozen_total_ms",
+                "restart_pending",
+                # RAG 阶段 2 补口：嵌入模型（双常驻）的可观测字段。
+                # 少了它们，「嵌入到底装上没有」在探活里完全看不见 ——
+                # 而"嵌入没加载（检索必然全空）"与"检索没命中（正常）"
+                # 在客户端看来是完全一样的：都是"回答里没有知识库内容"。
+                "embed_loaded", "embed_model", "embed_dim"):
         check(f"字段 {key} 存在且拼写正确", key in obj)
     check('status 恒为 "ok"', obj.get("status") == "ok")
 

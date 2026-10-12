@@ -130,8 +130,15 @@ data class SamplingParams(
          *
          * 只认「显式给出」的字段做范围校验；字段缺失一律取默认值。
          * 每个字段独立判断是否存在，因此 `top_p: 0` 会被拦下，而 `top_p` 缺失不会。
+         *
+         * [aliasMaxTokens] 是 `max_completion_tokens` 的解析结果（[ProtocolFields] 给），
+         * 传 null = 调用方没给这个别名、或给了 `max_tokens` 与它取值相同。
+         * 为什么由调用方在外面先解一次而不是在这里再读一遍 `j`：
+         * "两个字段名指向同一个量、同时给出且不同要报 400"这条判据需要**同时**
+         * 看到两个字段，而本函数的逐字段结构刻意是"只看自己那一格"的。
+         * 让 [ProtocolFields] 当那一处唯一的对照点，这里只消费结果。
          */
-        fun fromRequest(j: JSONObject): Pair<SamplingParams?, String?> {
+        fun fromRequest(j: JSONObject, aliasMaxTokens: Int? = null): Pair<SamplingParams?, String?> {
             // 注意：每个字段都要在这里就地校验，不能只依赖 `check()`。
             // `check()` 看到的是「解析后的值」，而缺省字段会填默认值——默认值永远合法，
             // 于是任何「能被 readFloat 读出来但超出语义范围」的输入都成了漏网之鱼
@@ -165,8 +172,15 @@ data class SamplingParams(
 
             // max_tokens 此前是 coerceIn(1,8192) 静默钳制：传 0 或 99999 会悄悄变成 1/8192。
             // 现在显式报错，让调用方知道自己的取值没被采纳。
-            val maxTok = readInt(j, "max_tokens", DEF_MAX_TOKENS) ?: return null to errMaxTokens
-            if (!maxTokensOk(maxTok)) return null to errMaxTokens
+            //
+            // 别名 `max_completion_tokens`（新版 OpenAI SDK 的默认字段名）在
+            // [ProtocolFields] 里先解析成**同一个量**，这里取它的结果 —— 两个名字
+            // 必须共用这一份上限与这一句 400 文案，各自一份必然分叉。所以那一步
+            // 必须在 `fromRequest` **之前**跑（调用方顺序见 HttpApi.handleChat）。
+            val maxTokRaw = if (aliasMaxTokens != null) aliasMaxTokens
+                            else (readInt(j, "max_tokens", DEF_MAX_TOKENS) ?: return null to errMaxTokens)
+            if (!maxTokensOk(maxTokRaw)) return null to errMaxTokens
+            val maxTok = maxTokRaw
 
             // seed 走与其它 9 个字段**同一条**读取路径（read()）。
             // 旧实现自己另写了一套判据，把 errSeed 的条件写成「字符串且非空」，于是

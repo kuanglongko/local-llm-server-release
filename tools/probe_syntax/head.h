@@ -19,8 +19,7 @@ typedef unsigned char jboolean;
 typedef int jclass;
 #define JNI_TRUE 1
 #define JNI_FALSE 0
-#define LOGI(...) probe_fmt(__VA_ARGS__)
-#define LOGE(...) probe_fmt(__VA_ARGS__)
+static void probe_fmt(const char * fmt, ...);
 #define TAG "probe-syntax-unit"
 #define JNIEXPORT
 #define JNICALL
@@ -28,6 +27,14 @@ static int g_probe_fd = -1;
 static bool g_probe_on = false;
 static void probe_raw(const char * s, size_t n) { (void) s; (void) n; }
 static void probe_fmt(const char * fmt, ...) { (void) fmt; }
+// 日志宏**从 llama_jni.cpp 逐字抽来**（见 extract.py 的 log_macros），桩头只提供
+// probe_fmt 这个宿主替身。此前桩头自己抄了一份 LOGI/LOGE —— 于是"源码里用了
+// 未定义的日志宏"在本单元里永远编得过。现在宏体就是源码那一行，只有
+// __android_log_print 被换名，**宏的名字集合**完全来自源码。
+#define __android_log_print(lvl, tag, ...) probe_fmt(__VA_ARGS__)
+#define ANDROID_LOG_INFO 4
+#define ANDROID_LOG_ERROR 6
+#include "log_macros.h"
 static void jp(const char * fmt, ...) { (void) fmt; }
 static void mark_jni_entry(const char *) {}
 // 信号 handler 那一节的桩：真源码里它们用的是 g_probe_fd / jp / LOGE。

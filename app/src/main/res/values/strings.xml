@@ -1,4 +1,10 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
-    <string name="app_name">LocalLLM Server</string>
+    <!-- 「后台保活」无障碍服务在系统无障碍列表里的说明。
+         必须**当场说清用途与代价**：用户是在系统设置里看到这句话才决定开不开的，
+         而这一段文字同时也是"这个权限为什么被申请"的唯一解释（README 里也引用它）。
+         措辞刻意不提"更流畅"这种空话，只讲它到底做什么、以及**不做什么**。 -->
+    <string name="keepalive_accessibility_desc">用途只有一个：让系统把本应用当作更需要存活的应用，减少切后台后被冻结（表现为另一台设备调用一直挂着、切回前台即恢复）。
+本服务不订阅任何界面事件、不读取窗口内容，也不代替你做任何操作。</string>
+    <string name="keepalive_accessibility_summary">仅为「后台保活」，不读屏幕内容</string>
 </resources>

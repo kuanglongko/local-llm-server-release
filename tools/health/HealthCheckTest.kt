@@ -236,16 +236,163 @@ fun main() {
     // 反例：正文没超上限时**不得**出现"已截断"，那是纯噪音，还会让人以为响应残缺。
     ck("短文正文不得误报截断",
         !HealthCheck.format(HealthCheck.parse(resp(HEALTH_OK), 1), "127.0.0.1", 8080).contains("已截断"))
-    // 【已随实现更新】此前这里断言「存活报告不回显正文」。
-    // 现行实现改成**任何**有正文的响应都回显（并标注它与判定一致），理由是
-    // 「全绿」也要能独立复核：用户点存活探测就是想拿一份可复制的证据，
-    // 全绿时省掉原文，等于把"凭什么说它活着"这句藏起来。
-    // 所以这条改为钉住新语义，而不是删除——免得回显又被顺手改回"只在非全绿时给"。
+    // 【已随实现更新：方案 1】此前这里断言「（全绿也）回显响应原文」——理由是
+    // 用户点存活探测想拿一份可复制的证据。方案 1 改了这件事，理由也换了：
+    // 真机那份 /health 正文 1249 字符 / 51 个字段，**根本没到 [BODY_PREVIEW_CHARS]
+    // 的截断线**，于是整份原件一字不落灌进了报告 —— 用户看到的"信息太乱"就是它。
+    // 现在的口径是：**全绿时不再复述原件**（那一坨字段对"接下来该做什么"没有任何
+    // 指向），改成一句"完整响应去哪儿看"；**异常时照旧回显**（那时原文就是
+    // "到底哪里不对"的唯一证据）。
+    // 判据因此钉的是**这两面**：全绿 -> 不复述、且点明去哪儿看；异常 -> 照旧回显。
     val aliveBodyReport = HealthCheck.format(HealthCheck.parse(resp(HEALTH_OK), 1), "127.0.0.1", 8080)
-    ck("存活报告也回显正文（全绿同样要给可复核的证据）",
-        aliveBodyReport.contains("响应原文") && aliveBodyReport.contains(HEALTH_OK))
-    ck("存活报告的回显要标注与判定一致（不能孤立地贴一段原文）",
-        aliveBodyReport.contains("与判定一致"))
+    ck("全绿的存活报告不再复述整份响应原文（那 51 个字段就是信息太乱的来源）",
+        !aliveBodyReport.contains("响应原文"))
+    ck("全绿的存活报告要说清完整响应去哪儿看（不是简单删掉原文）",
+        aliveBodyReport.contains("完整响应不在此复述") && aliveBodyReport.contains("/health"))
+    ck("全绿时不再回显 body 原件",
+        !aliveBodyReport.contains(HEALTH_OK))
+    // 反例：**异常**（非 JSON / 降级）时必须照旧回显原文，否则用户拿着
+    // "不可达"三个字没法问 —— 这也是"证据必须能被独立复核"的落点。
+    val portalBody = HealthCheck.format(HealthCheck.parse(resp("<html>portal</html>"), 1), "127.0.0.1", 8080)
+    ck("异常（非 JSON）时**照旧**回显原文（证据必须能被独立复核）",
+        portalBody.contains("响应原文") && portalBody.contains("portal"))
+
+    // ---- Issue #159：冻结痕迹（/health 的四个新字段）----
+    //
+    // 这四条的现场价值：后台被冻过时**连接不断、写不抛异常、日志不写**，
+    // 解冻后"探活成功"与"从没被冻过"读数完全一样。若解析侧把它们吃掉，
+    // "后台到底有没有被限制"就又只能靠体感描述 —— 这正是本轮要终结的那种处境。
+    val frozen = HealthCheck.parse(
+        resp("""{"status":"ok","model_loaded":true,"model":"m","ctx_used":1,"ctx_size":4096,""" +
+            """"busy":false,"port":8080,"frozen_ms":63000,"frozen_count":3,""" +
+            """"frozen_total_ms":185000,"restart_pending":true}"""), 5)
+    ck("解析出 frozen_ms", frozen.frozenMs == 63000L)
+    ck("解析出 frozen_count", frozen.frozenCount == 3)
+    ck("解析出 frozen_total_ms", frozen.frozenTotalMs == 185000L)
+    ck("解析出 restart_pending", frozen.restartPending == true)
+    val frozenReport = HealthCheck.format(frozen, "127.0.0.1", 8080)
+    ck("报告回显「上次被冻 N 秒」", frozenReport.contains("上次 63s"))
+    ck("报告回显累计冻结次数", frozenReport.contains("累计 3 次"))
+    ck("重启欠账必须说清楚（否则与「重启判据没生效」同形）",
+        frozenReport.contains("欠一次重启"))
+    // 反例：没检出过冻结时**不得**多挂一行（每次探测都多一行无信息的字 = 噪音）。
+    val cleanReport = HealthCheck.format(HealthCheck.parse(resp(HEALTH_OK), 1), "127.0.0.1", 8080)
+    ck("没被冻过时不回显冻结行（避免噪音）", !cleanReport.contains("后台冻结"))
+    ck("没重启欠账时不回显该行", !cleanReport.contains("欠一次重启"))
+    // 老服务端没有这四个字段时必须是 null（不能默认成 0 —— 那是"报了一个假的没发生"）。
+    val legacy = HealthCheck.parse(resp(HEALTH_OK), 1)
+    ck("缺字段时报 null（不伪造成 0）",
+        legacy.frozenMs == null && legacy.frozenCount == null &&
+            legacy.frozenTotalMs == null && legacy.restartPending == null)
+
+    // ---- 15. 逐位比对那行必须**按取样的组换措辞** ----
+    // 两组样本回答**两个不同的问题**、方向相反：等长组按构造必然稳，
+    // 长短悬殊组才是"换批大小会不会改答案"要问的那组。同一句
+    // "整批逐位相同，批大小是纯加速旋钮"跟在两组后面时**字面一样、含义相反**
+    // —— 而真机现场（PR #301）正是拿等长组那句去答长短悬殊那组的问题。
+    val lsOk = HealthCheck.parse(resp(
+        """{"status":"ok","model_loaded":true,"embed_parity_rows":4,"embed_parity_identical":4,""" +
+            """"embed_parity_different":0,"embed_parity_verdict":"identical",""" +
+            """"embed_parity_group":"长短悬殊"}"""), 1)
+    // ⚠ 这几条问的是**措辞本身**，所以显式打开原始读数（0.9.231 起它们
+    //   默认不进报告正文 —— 见「16.」那一段；措辞逻辑没搬走，只是默认不展示）。
+    val lsRep = HealthCheck.format(lsOk, "127.0.0.1", 8080, showRawEmbedProbe = true)
+    ck("长短悬殊组全同 -> 说「纯加速旋钮」", lsRep.contains("纯加速"))
+    ck("报告写明读数取自哪一组（长短悬殊）", lsRep.contains("取自长短悬殊"))
+
+    val slOk = HealthCheck.parse(resp(
+        """{"status":"ok","model_loaded":true,"embed_parity_rows":4,"embed_parity_identical":4,""" +
+            """"embed_parity_different":0,"embed_parity_verdict":"identical",""" +
+            """"embed_parity_group":"等长"}"""), 1)
+    val slRep = HealthCheck.format(slOk, "127.0.0.1", 8080, showRawEmbedProbe = true)
+    // 等长组全同时**不许**说"批大小是纯加速旋钮"（那会被读成长短悬殊也稳）——
+    // 它只说明批布局本身不改语义，答不了"换批大小会不会改答案"。
+    ck("等长组全同 -> **不说**「纯加速旋钮」", !slRep.contains("纯加速"))
+    ck("等长组全同 -> 点明它答不了那句（要长短悬殊那组）", slRep.contains("答不了"))
+
+    val noGroup = HealthCheck.parse(resp(
+        """{"status":"ok","model_loaded":true,"embed_parity_rows":4,"embed_parity_identical":4,""" +
+            """"embed_parity_different":0,"embed_parity_verdict":"identical"}"""), 1)
+    val ngRep = HealthCheck.format(noGroup, "127.0.0.1", 8080, showRawEmbedProbe = true)
+    // 旧服务端没这个字段时**不猜**：给最弱的一句，不承诺"纯加速旋钮"。
+    ck("缺 group 字段 -> 不承诺「纯加速旋钮」", !ngRep.contains("纯加速"))
+    ck("缺 group 字段 -> 说清不能外推", ngRep.contains("不能据此推出"))
+
+    // ---- 16. 那十几格原始读数**不进报告正文**，但**完整落进日志** ----
+    // 用户的原话是"信息太乱了，对用户也没实际用处"。要分开的**不是"报不报"**，
+    // 是"报给谁看"：报告正文（用户）只留能直接决定下一步的结论；日志（排查者）
+    // 一格不少；/health 响应体一个字段没动。所以这里两个方向都要钉：
+    //   · 默认报告里**看不见** embed_parity_* / embed_retrieve_* 那几行；
+    //   · 同样这份 Result，rawEmbedProbeLines() **落得出**那些读数（"完整信息不丢"）。
+    val rawR = HealthCheck.parse(resp(
+        """{"status":"ok","model_loaded":true,""" +
+            """"embed_parity_rows":4,"embed_parity_identical":3,"embed_parity_different":1,""" +
+            """"embed_parity_verdict":"different","embed_parity_group":"长短悬殊",""" +
+            """"embed_parity_repeat_measured":true,"embed_parity_repeat_not_identical":0,""" +
+            """"embed_parity_repeat_batched_measured":true,""" +
+            """"embed_parity_repeat_batched_not_identical":0,""" +
+            """"embed_retrieve_measured":true,"embed_retrieve_queries":3,""" +
+            """"embed_retrieve_answer_changed":0,"embed_retrieve_order_changed":0,""" +
+            """"embed_retrieve_batch_base":8,"embed_retrieve_batch_other":4,""" +
+            """"embed_retrieve_topk":3}"""), 1)
+    val rawRep = HealthCheck.format(rawR, "127.0.0.1", 8080)
+    ck("日常探活报告里**不出现**「逐位比对」那行", !rawRep.contains("向量逐位比对"))
+    ck("日常探活报告里**不出现**「检索对照」那行", !rawRep.contains("检索对照"))
+    ck("日常探活报告里**不出现**「真的不同 1 条」那类原始格", !rawRep.contains("真的不同"))
+    // 但"能直接指导下一步"的那几格必须留着（它们是搬走的理由的反面）——
+    // 库认的批大小不同就整库不可用，这条是报告里最该看见的一句。
+    val idxR = HealthCheck.parse(resp(
+        """{"status":"ok","model_loaded":true,"embed_batch_size":4,""" +
+            """"embed_batch_size_index":1,"embed_batch_size_index_kb":"ceshi2"}"""), 1)
+    ck("可指导下一步的「建索引时用的批大小」仍在报告里（搬走的是原始读数，不是结论）",
+        HealthCheck.format(idxR, "127.0.0.1", 8080).contains("建索引时用的批大小"))
+    // 完整读数**必须有个落点**：日志那三行要真的落得出上面那些数
+    // （只从报告里删干净、却没落地 = "算出来没人读"，比铺在报告里更坏）。
+    val rawLines = HealthCheck.rawEmbedProbeLines(rawR).joinToString("\n")
+    ck("完整读数落进日志：逐位比对的条数/取自哪一组", rawLines.contains("embed_parity") &&
+        rawLines.contains("真的不同=1") && rawLines.contains("取自=长短悬殊"))
+    ck("完整读数落进日志：「测没测」与「几条不同」分开", rawLines.contains("做没做=true") &&
+        rawLines.contains("不是逐位相同=0"))
+    ck("完整读数落进日志：检索对照的查询数/集合变没变/两侧批大小",
+        rawLines.contains("embed_retrieve") && rawLines.contains("查询=3") &&
+            rawLines.contains("集合变了=0") && rawLines.contains("批大小=8 vs 4"))
+    // 没跑过时**不落**"没跑过"这种噪音行（噪音会被跳过，同其它几格的口径）。
+    ck("没跑过对照时不落噪音行", HealthCheck.rawEmbedProbeLines(
+        HealthCheck.parse(resp(HEALTH_OK), 1)).isEmpty())
+
+    // ---- 17. A 档新增：**向量模型**那一格（用户点名要加） ----
+    // 对话模型加载与否由「模型已加载」那行回答，可**嵌入模型是另一份**：
+    // 双常驻的四种组合（只有对话 / 只有嵌入 / 都有 / 都没有）在 `model_loaded`
+    // 上**长得一模一样**。而缺嵌入模型时检索必然全空 —— 用户看到"一条都搜不到"
+    // 时，`model_loaded=true` 会把他引去查知识库，其实是嵌入那份没加载。
+    val embOk = HealthCheck.parse(resp(
+        """{"status":"ok","model_loaded":true,"model":"qwen3 4B","embed_loaded":true,""" +
+            """"embed_model":"Qwen3-Embedding-0.6B","embed_dim":1024}"""), 1)
+    ck("解析出 embed_loaded", embOk.embedLoaded == true)
+    ck("解析出 embed_model", embOk.embedModelDesc == "Qwen3-Embedding-0.6B")
+    ck("解析出 embed_dim", embOk.embedDim == 1024)
+    val embRep = HealthCheck.format(embOk, "127.0.0.1", 8080)
+    ck("报告里出现「向量模型」这一行（用户点名要加的那格）", embRep.contains("向量模型"))
+    ck("向量模型那行报名字", embRep.contains("Qwen3-Embedding-0.6B"))
+    ck("向量模型那行报维度（维度是索引指纹的一部分）", embRep.contains("dim=1024"))
+    // ⚠ 它与对话模型是**两份**：报告里两个字面都要在，别让人以为是一个。
+    ck("向量模型与对话模型分行报（不是同一份）",
+        embRep.contains("模型已加载：qwen3 4B") && embRep.contains("向量模型已加载"))
+
+    // 缺嵌入模型（检索必然全空）时必须**说清后果**，而不是只报一个"未加载"。
+    val embMissing = HealthCheck.parse(resp(
+        """{"status":"ok","model_loaded":true,"model":"qwen3 4B","embed_loaded":false,""" +
+            """"embed_model":"","embed_dim":0}"""), 1)
+    val embMissingRep = HealthCheck.format(embMissing, "127.0.0.1", 8080)
+    ck("向量模型未加载 -> 明说检索必然全空", embMissingRep.contains("检索必然全空"))
+    ck("向量模型未加载 -> 给出后果（/v1/embeddings 503）",
+        embMissingRep.contains("503"))
+    // 反例：旧服务端**没报**这三个字段时**不得**多挂一行（null = 没报，不是 false；
+    // 挂一行"向量模型：未报"是噪音，而噪音会被跳过 —— 与冻结那几格同一条口径）。
+    ck("旧服务端没报这三个字段时不回显该行（避免噪音）",
+        !HealthCheck.format(legacy, "127.0.0.1", 8080).contains("向量模型"))
+    ck("缺字段时报 null（不伪造成未加载）",
+        legacy.embedLoaded == null && legacy.embedModelDesc == null && legacy.embedDim == null)
 
     println()
     println(if (fail == 0) "=== HealthCheckTest 全部通过 ===" else "=== HealthCheckTest 失败 $fail 项 ===")

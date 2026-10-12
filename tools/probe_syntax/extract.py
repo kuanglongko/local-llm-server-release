@@ -20,12 +20,27 @@ def main(src_path: str, out_path: str) -> None:
         j = src.index("\n}\n", i) + 3
         return src[i:j]
 
+    # 日志宏**从真源码逐字带过来**，不在桩头里另写一份。
+    # 桩头此前手抄了 `#define LOGI/LOGE`，于是「源码里用了没定义的宏」这件事
+    # 在本单元里永远编得过 —— ccf0557 的 `LOGW` 正是这样：真机 GCC 报
+    # `'LOGW' was not declared`，而全部守卫与语法检查一路全绿（LOGW 只出现在
+    # 源码第 313 行，桩头没有它，两边各自"自洽"）。判据漂移的经典形态。
+    log_macros = "\n".join(
+        l for l in src.splitlines() if l.startswith("#define LOG")
+    )
+    if not log_macros:
+        sys.exit("抽取失败：源码里找不到任何 `#define LOG*` 日志宏"
+                 "（宏改名/挪走了？本脚本与源码形状绑定，请一起更新）")
+
     parts = [
         grab("static bool probe_getprop("),
         grab("static bool probe_prop_has("),
         grab("static void probe_boot_note("),
         grab("static void probe_bootstrap_flush()"),
         grab("static void probe_bootstrap_recall()"),
+        # R-1 的探针文件重置。此前**不在**抽取单元里，于是它用了一个不存在的
+        # 日志宏、真机编不过，而本单元照样绿 —— "抽取范围之外"等于"没人管"。
+        grab("static void probe_rotate_prev("),
         grab("static bool probe_bootstrap()"),
         grab("JNIEXPORT jboolean JNICALL\n"
              "Java_com_xiaowan_localinference_LlmEngine_nativeProbeInit("),
@@ -36,6 +51,9 @@ def main(src_path: str, out_path: str) -> None:
         grab("static void probe_install_signals()"),
     ]
     open(out_path, "w", encoding="utf-8").write("\n\n".join(parts))
+    # 供 head.h include：桩头只给"宏的名字从哪来"，不再自己抄一份。
+    if len(sys.argv) > 3:
+        open(sys.argv[3], "w", encoding="utf-8").write(log_macros + "\n")
 
 
 if __name__ == "__main__":

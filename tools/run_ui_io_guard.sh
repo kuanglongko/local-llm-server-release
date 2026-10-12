@@ -133,11 +133,15 @@ c "I-5: 其余重 IO 路径仍走 ioExecutor（confirmDelete / probe / import �
 # 判据不是"有 stopRequested = false 这一行"，而是那行**在哪儿**：
 #   · 必须在 `synchronized(genLock)` **之内**（锁外清零会与主线程点停止交错）；
 #   · 必须在 `startCompletion` **之前**（反过来写的那段窗口恰好是整段 prefill）；
-#   · 且 `doGenerate` 里**恰好一次**（说明它在"每轮开跑"这条路径上，不是散在收尾处）。
+#   · 且 `startGeneration` 里**恰好一次**（说明它在"每轮开跑"这条路径上，不是散在收尾处）。
 # 三条一起才等价于"生命周期=一轮"。少任何一条，表现都是 Issue #154：
 # 按过一次停止之后，本轮循环第一判就走 false —— 零 token、无异常、无日志。
-GENBODY=$(body 'private fun doGenerate\(\)' "$ACT")
-c "I-6: doGenerate() 存在（锚点未漂）" "[ -n \"\$GENBODY\" ]"
+#
+# 锚点为何是 startGeneration 而不是 doGenerate：生成循环的唯一归属是前者
+# （doGenerate 只做"落盘这一句 + 交给它"，「重新生成」也走同一个入口）。
+# 锚在 doGenerate 上会变成"钉一个没有循环也没有锁的函数"—— 清零挪去哪儿都判不出来。
+GENBODY=$(body 'private fun startGeneration\(messages: List<Pair<String, String>>\)' "$ACT")
+c "I-6: startGeneration() 存在（锚点未漂）" "[ -n \"\$GENBODY\" ]"
 c "I-6: 每轮开跑时把上一轮的停止意图清零（stopRequested = false）" \
   "printf '%s' \"\$GENBODY\" | grep -q 'stopRequested = false'"
 c "I-6: 清零是**每轮一次**（恰好一处，不是散在收尾的多条 return 分支上）" \

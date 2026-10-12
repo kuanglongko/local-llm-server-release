@@ -121,8 +121,11 @@ c "can_continue_fast 取续接字节用 withheld.size() 下标" \
 JNI=app/src/main/cpp/llama_jni.cpp
 c "llama_jni.cpp 写明 split_release_withhold 与 emitted 的耦合" \
   "grep -q 'split_release_withhold' \$JNI"
+# 锚点必须落在**源码现文**上：这条原写成 `grep -q '回退不得越过' || grep -q '已下发.界线'`，
+# 而源码里从没有过"回退不得越过"这五个字连写 —— 第一支**恒不命中**，
+# 整条判据一直靠第二支的 `||` 兜底（甲-1 判据② 抓到的正是这类"死支"）。
 c "llama_jni.cpp 写明回退不得越过已下发界线" \
-  "grep -q '回退不得越过' \$JNI || grep -q '已下发.界线' \$JNI"
+  "grep -q '若回退越过' \$JNI && grep -q '已下发.界线' \$JNI"
 c "llama_jni.cpp 保持 emitted 钳制（异常兜底）" \
   "grep -q 'if (c->emitted > g.size()) c->emitted = g.size();' \$JNI"
 c "契约里指到了钉它的行为测（run_stop_match_tests.sh）" \

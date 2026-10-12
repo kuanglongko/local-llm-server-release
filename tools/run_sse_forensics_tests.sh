@@ -168,5 +168,9 @@ ck "默认 prompt 不含任何裸标签（默认用法不自污染）" \
     "$(grep -q '^HITS=$' "$TMP/default.txt" && echo 1 || echo 0)"
 
 echo
-echo "== sse 取证脚本自测：$ok 通过，$bad 失败 =="
+# 收尾用 `PASS n / FAIL m` 这一形状（认它的不只是人）：
+# `tools/count_suite_totals.py` 拿这份读数去对账 `suite-counts.json`，
+# 它只认带条数的汇总行 —— 写成"$ok 通过，$bad 失败"会让清单记成 None，
+# 对账时报一条**假漂移**（清单有值、实测 None）。
+echo "== sse 取证脚本自测：PASS $ok / FAIL $bad =="
 [ "$bad" = "0" ] || exit 1

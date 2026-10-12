@@ -91,6 +91,32 @@ c "重启时把 desired 补回来（stop() 会清它；不补则"只死一次"�
   "awk '/private fun restartListenerIfDesired/{f=NR} f&&/desired.set\(true\)/{print \"OK\"; exit}' \$HTTP | grep -q OK"
 c "watchdog 与重启入口是同一处判据（不许内联第二份）" \
   "grep -q 'if (restartListenerIfDesired(' \$HTTP"
+# ── 2b) Issue #159：探活不许直接重启，必须经 restartPending 延后到空闲 ────────
+# 失效形态是"每一句读起来都对"：探活失败→立刻重启，看着最自然，
+# 而 stop() 会 close() 掉**所有在途连接**，包括那条正在续传的 SSE。
+# 判据锚**结构关系**（重启的调用点被"空闲 + 消费登记"包住），不锚存在性。
+c "watchdog 在探活失败处不直接重启（必须先登记 restartPending）" \
+  "! guard_fn startWatchdog | grep -q 'restartListenerIfDesired'"
+c "看门狗登记「欠一次重启」" \
+  "guard_fn startWatchdog | grep -q 'restartPending.set(true)'"
+c "只有 consumeRestartPendingIfIdle 能消费该登记" \
+  "grep -q 'private fun consumeRestartPendingIfIdle(): Boolean' \$HTTP"
+c "消费登记前先查「此刻是否空闲」（第二次判据，动手前再拦一道）" \
+  "awk '/private fun consumeRestartPendingIfIdle/{f=NR} f && /if \(isGenerating\) return false/ { print (NR<=f+8) ? \"OK\" : \"\"; exit }' \$HTTP | grep -q OK"
+c "消费登记只在「确实想跑」时才重启" \
+  "awk '/private fun consumeRestartPendingIfIdle/{f=NR} f && /if \(!desired.get\(\)\)/ { print \"OK\"; exit }' \$HTTP | grep -q OK"
+c "看门狗在生成期为真时不碰 socket（只做内存态检查）" \
+  "awk '/if \(isGenerating\) \{ failStreak = 0; continue \}/ { print \"OK\"; exit }' \$HTTP | grep -q OK"
+c "看门狗的生成期闸门排在探活之前（否则探活照样打进来）" \
+  "awk '/private fun startWatchdog/{f=NR} f&&/if \(isGenerating\) \{ failStreak = 0; continue \}/{g=NR} f&&/if \(probeHealthy\(\)\)/{p=NR} END{ print (g>0 && p>0 && g<p) ? \"OK\" : \"\" }' \$HTTP | grep -q OK"
+c "探活周期是两档具名常量（不许散落魔数）" \
+  "grep -q 'private const val WATCHDOG_IDLE_MS = 5_000L' \$HTTP && grep -q 'private const val WATCHDOG_BUSY_MS = 30_000L' \$HTTP"
+c "探活超时是具名常量且 ≥3s（后台被冻时 2s 会自造失败）" \
+  "grep -q 'private const val PROBE_TIMEOUT_MS = 3_000' \$HTTP"
+c "冻结痕迹在睡眠之后由唯一一处记账（忘了记账 = 痕迹永远为 0）" \
+  "guard_fn startWatchdog | grep -q 'recordWatchdogSleep(plannedMs'"
+c "冻结记账判据只有一处（不许在循环里内联第二份）" \
+  "grep -c 'private fun recordWatchdogSleep' \$HTTP | grep -q '^1$'"
 
 # ── 3) A-3：503 的**两条**判据分开，回滚只回滚自己那份 ───────────────────────
 # 判据锚定结构：CAS 失败那条分支里**不许**出现 busy.set(false)（它在清别人的占位）。
@@ -143,8 +169,17 @@ c "计数不许停在负数（负值会让上限失真）" \
 # 上限的**前提**：连接有读超时。没有它，64 条"连上就不发数据"的连接会永久占满
 # 容量 —— 那时上限就从"保护"变成"拒绝服务面"（合法客户端也进不来）。
 # 这条断言不是"soTimeout 存在"（那种恒真），而是"它非零且是个具体上限"。
+# Issue #159 起读超时改由**具名常量**给出（空闲 5s / 生成期 15s 两档），
+# 所以判据从"写着一个非零字面量"放宽成"赋的是一个非零的超时值"：
+# 允许 `= 15_000` 与 `= headTimeoutMs`（后者由具名常量算出，见下一条）。
 c "在途连接上限的前提：handleConn 有非零读超时（否则满员容量不会自愈）" \
-  "awk '/private fun handleConn/{f=NR} f && /s.soTimeout = [1-9][0-9_]*/ { print \"OK\"; exit }' \$HTTP | grep -q OK"
+  "awk '/private fun handleConn/{f=NR} f && /s.soTimeout = (headTimeoutMs|[1-9][0-9_]*)/ { print \"OK\"; exit }' \$HTTP | grep -q OK"
+c "首字节等待上限是具名常量且非零（两档：空闲 / 生成期）" \
+  "grep -q 'private const val HEAD_TIMEOUT_MS = 5_000' \$HTTP && grep -q 'private const val HEAD_TIMEOUT_BUSY_MS = 15_000' \$HTTP"
+c "首字节超时必须回**可读的 503**（静默断连与"服务崩了"同形）" \
+  "guard_fn handleConn | grep -q 'request head not received within'"
+c "首字节 503 的判据只在空闲时收紧（生成期仍用原窗口）" \
+  "awk '/private fun handleConn/{f=NR} f && /val headTimeoutMs = if \(isGenerating\) HEAD_TIMEOUT_BUSY_MS else HEAD_TIMEOUT_MS/ { print \"OK\"; exit }' \$HTTP | grep -q OK"
 c "读超时不许被改成 0 / 无（0 = 永不超时 = 满员后永久拒绝服务）" \
   "! awk '/private fun handleConn/{f=NR} f && /s.soTimeout = 0/ { print \"BAD\"; exit }' \$HTTP | grep -q BAD"
 c "stop() 递增代际（让在途 listener 的 finally 自动作废）" \

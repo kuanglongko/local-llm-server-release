@@ -18,6 +18,7 @@
 # 不需要工具链，只要 sh + python3。运行：sh tools/run_llama_jni_abort_guard_tests.sh
 set -e
 cd "$(dirname "$0")/.."
+. "$(dirname "$0")/with_worktree_lock.sh"   # 工作区独占锁：见该文件顶部说明
 
 PY=${PYTHON:-python3}
 GUARD=tools/run_llama_jni_abort_guard.sh
@@ -37,7 +38,14 @@ cp "$JNI" "$TMP/jni.bak"; cp "$ENG" "$TMP/eng.bak"
 cp "$HTTP" "$TMP/http.bak"; cp "$RC" "$TMP/rc.bak"
 restore() { cp "$TMP/jni.bak" "$JNI"; cp "$TMP/eng.bak" "$ENG"
             cp "$TMP/http.bak" "$HTTP"; cp "$TMP/rc.bak" "$RC"; rm -rf "$TMP"; }
-trap restore EXIT
+# 退出即还原：EXIT / INT / TERM / HUP 都走同一个还原 ——
+# 只 trap EXIT 时，CI 的 kill（默认 TERM）不会触发 EXIT trap，
+# 打桩源码就会留在工作区（正是 #126 那轮脏工作区的机制）。
+# 就地打桩前先抢工作区独占锁：本脚本会改真源码再 trap 还原，
+# 与其他同套路自测并行时会互相盖桩（假红/漏桩）。见 tools/with_worktree_lock.sh。
+worktree_lock_acquire "$0"
+trap restore EXIT INT TERM HUP
+
 reset_src() { cp "$TMP/jni.bak" "$JNI"; cp "$TMP/eng.bak" "$ENG"
               cp "$TMP/http.bak" "$HTTP"; cp "$TMP/rc.bak" "$RC"; }
 
@@ -132,12 +140,11 @@ reset_src
 "$PY" - "$JNI" <<'PYEOF'
 import sys
 p=sys.argv[1]; s=open(p,encoding='utf-8').read()
-old='''    S.last_reuse = 0;
-    S.last_prefill_tokens = 0;
-    // 注意：**不动** S.kv_rounds'''
-new='''    S.last_reuse = 0;
-    S.last_prefill_tokens = 0;
-    S.kv_rounds = 0;
+# 锚点只取紧邻注释的那一行赋值，不整段照抄 —— kv_invalidate 里每加一个读数
+# （last_lcp 就是这么进来的）旧锚点就会失配，而失配报的是"本自测要一起更新"，
+# 与"代码坏了"不同形，容易被当成噪音跳过（本仓库称之为桩漂移）。
+old='''    // 注意：**不动** S.kv_rounds'''
+new='''    S.kv_rounds = 0;
     // 注意：**不动** S.kv_rounds'''
 assert s.count(old)==1, "stub6: anchor not found"
 open(p,'w',encoding='utf-8').write(s.replace(old,new,1))
@@ -149,12 +156,29 @@ reset_src
 "$PY" - "$JNI" <<'PYEOF'
 import sys
 p=sys.argv[1]; s=open(p,encoding='utf-8').read()
-old='    jintArray a = env->NewIntArray(3);'
-new='    jintArray a = env->NewIntArray(2);'
+# 拿真实容量来构造"退回两元"：写死数字会在**合法追加**（3 -> 4）后失配。
+import re as _re
+m=_re.search(r'jintArray a = env->NewIntArray\((\d+)\);', s)
+assert m, "stub7: 找不到 NewIntArray 容量"
+_cap=int(m.group(1))
+old=m.group(0)
+# 容量与写入长度必须一起退 —— 只缩容量会留下"声明 2、写 4"的不自洽形状，
+# 那种源码在真机上直接越界写，不是"退回两元"的语义。
+_r=_re.search(r'env->SetIntArrayRegion\(a, 0, \d+, v\)', s)
+assert _r, "stub7: 找不到 SetIntArrayRegion"
+_old_region=_r.group(0)
+new=old.replace(str(_cap), '2')
 assert s.count(old)==1, "stub7: anchor not found"
-open(p,'w',encoding='utf-8').write(s.replace(old,new,1))
+s = s.replace(old, new, 1)
+s = s.replace(_old_region, 'env->SetIntArrayRegion(a, 0, 2, v)', 1)
+# 真正让判据红的是"kv_rounds **不在**初始化列表里"（E-5 分辨率丢失），
+# 所以还要把它从列表里摘掉 —— 只缩容量等于留下一个越界写的坏形状，
+# 而那是另一件事（真机上直接踩内存），不该被当成"字段丢了"来测。
+s = s.replace('(jint) S.kv_rounds,', '', 1)
+s = s.replace('(jint) S.kv_rounds }', ' (jint) 0 }', 1)
+open(p,'w',encoding='utf-8').write(s)
 PYEOF
-must_red "桩⑦（stats 退回两元）" "stats 出口带上第三个读数"
+must_red "桩⑦（stats 退回两元）" "stats 出口带上 kv_rounds 读数"
 reset_src
 
 # ── 桩⑧（Kotlin 侧绑定归属被删 —— 归属止步于 JNI 门口）───────────────
@@ -183,8 +207,10 @@ reset_src
 "$PY" - "$HTTP" <<'PYEOF'
 import sys
 p=sys.argv[1]; s=open(p,encoding='utf-8').read()
-old='"kv_prefill_tokens":$kvPrefill,"kv_rounds":$kvRounds}'
-new='"kv_prefill_tokens":$kvPrefill}'
+# 只锚 kv_rounds 这一节本身，不把邻居字段（kv_lcp_tokens / frozen_ms 都是后加的）
+# 一起写进锚点 —— 邻字段一改，桩就失配（桩漂移）。
+old='"kv_rounds":$kvRounds,'
+new=''
 assert s.count(old)==1, "stub10: anchor not found"
 open(p,'w',encoding='utf-8').write(s.replace(old,new,1))
 PYEOF

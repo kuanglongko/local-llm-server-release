@@ -32,6 +32,7 @@
 用法：python3 tools/run_http_scope_order.py <kt 文件> [更多文件...]
 退出码：0 = 无 read-before-declare；1 = 有（打印文件:行:名字）
 """
+import os
 import re
 import sys
 
@@ -161,12 +162,24 @@ def check(path):
     return bad
 
 
+# 不给参数时检查的默认目标 —— 与 `scripts/ci-apk-stage.sh` 里那一行**同一个文件**。
+# 为什么要给默认值：这条检查被 `tools/count_suite_totals.py` 以 `sh run_*.py` 的方式
+# 调起来数条数（那是它摸到套件的唯一方式），而无参时旧代码只打印"用法"就 exit 2 ——
+# 于是清单里这份套件永远是 `实测=None`，与记录的条数对不上，CI 判成一条**假漂移**
+# （看起来像"这份套件跑不动"，其实只是没给参数）。CI 与快检走同一条默认值，
+# 也就不会再分家。
+DEFAULT_TARGETS = ("app/src/main/java/com/xiaowan/localinference/HttpApi.kt",)
+
+
 def main(argv):
-    if len(argv) < 2:
+    targets = argv[1:] or list(DEFAULT_TARGETS)
+    missing = [p for p in targets if not os.path.exists(p)]
+    if missing:
         print("用法: python3 tools/run_http_scope_order.py <kt 文件> [...]")
+        print("找不到: %s" % ", ".join(missing))
         return 2
     allbad = []
-    for p in argv[1:]:
+    for p in targets:
         allbad += check(p)
     if allbad:
         for p, rl, name, dl in allbad:
@@ -174,7 +187,9 @@ def main(argv):
                   % (p, rl, name, dl))
         print("== 局部变量顺序检查：FAIL %d ==" % len(allbad))
         return 1
-    print("== 局部变量顺序检查：PASS（无 read-before-declare）==")
+    # 汇总行必须带**被查的文件数**：`totals_from()` 只认带条数的收尾，
+    # 不带数字的"PASS"在清单那边读成 None —— 与上面那条假漂移同一族。
+    print("== 局部变量顺序检查：PASS（%d 份文件，无 read-before-declare）==" % len(targets))
     return 0
 
 

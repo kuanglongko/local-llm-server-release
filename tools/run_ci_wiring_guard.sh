@@ -29,6 +29,16 @@ set -e
 cd "$(dirname "$0")/.."
 
 CI=.cnb.yml
+# 调用清单已经不止 `CI` 这一个文件：`.cnb.yml` 里那个 stage 的内联脚本
+# 原本有 170 KB，CNB runner 把它当命令行参数交给 `/bin/bash` 时直接
+# `fork/exec: argument list too long`（脚本一行都没跑，构建就红了）。
+# 正文因此挪到了 `scripts/ci-apk-stage.sh`，`.cnb.yml` 里只剩一句调用。
+#
+# ⚠ 若只扫 `CI` 一个文件：本守卫的**全部**判据会静默翻面 —— `called` 空 ->
+# 判据①③ 报"一个都没接"，判据④⑥⑦⑨ 因为集合为空而恒绿。也就是说
+# "挪个文件"这件事会把守卫从"太严"直接变成"全假绿"。所以扫描面必须跟着
+# 调用实际所在的位置走，且**由脚本自己断言扫到的东西非空**（下面几处 [ -s ]）。
+SCRIPTS_DIR=scripts
 README=README.md
 STATUS=HTP-STATUS.md
 SUMMARY=docs/REVIEW-110-SUMMARY.md
@@ -42,11 +52,23 @@ c() { if eval "$2"; then echo "PASS  $1"; ok=$((ok+1)); else echo "FAIL  $1"; ba
 # 而"漏掉的那部分"恰恰就是本次要抓的对象。
 TMP=$(mktemp -d)
 trap 'rm -rf "$TMP"' EXIT
-python3 - "$CI" "$README" "$STATUS" "$SUMMARY" > "$TMP/report.txt" <<'PY'
+python3 - "$CI" "$SCRIPTS_DIR" "$README" "$STATUS" "$SUMMARY" > "$TMP/report.txt" <<'PY'
 import json, os, re, sys, glob
 
-ci_path, readme_path, status_path, summary_path = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4]
-ci = open(ci_path, encoding='utf-8').read()
+ci_path, scripts_dir, readme_path, status_path, summary_path = sys.argv[1:6]
+
+def read(p):
+    try:
+        return open(p, encoding='utf-8').read()
+    except OSError:
+        return ''
+
+# 「CI 到底调了哪些脚本」由**两处**合起来回答：`.cnb.yml` 本身，以及它引用的
+# stage 脚本（`scripts/ci-*.sh`）。两处任一为空都要在下面报出来（不静默）。
+ci = read(ci_path)
+stage_files = sorted(glob.glob(os.path.join(scripts_dir, 'ci-*.sh')))
+ci += '\n' + '\n'.join(read(p) for p in stage_files)
+print("CI_SOURCES", len(ci.splitlines()), *stage_files)
 
 # 1) CI 里被调用的脚本集合。调用形式统一为 `sh tools/run_*.sh` /
 #    `bash tools/run_*.sh` / `python3 tools/run_*.py`（含 REQUIRED=0 前缀）。
@@ -55,13 +77,22 @@ called = set(re.findall(r'(?:^|\s)(?:sh|bash|python3)\s+(tools/run_[A-Za-z0-9_]+
 # 2) 磁盘上真实存在的脚本集合。
 on_disk = set(p[2:] if p.startswith('./') else p for p in glob.glob('tools/run_*.sh') + glob.glob('tools/run_*.py'))
 
-# 3) 文档里被**宣称**的脚本集合（README + HTP-STATUS + 审查收口小结）。
-#    SUMMARY 也纳入：本文件是 Issue #110 的唯一索引，会把套件名字与条数
-#    当成证据引用；不纳入的话它就是下一个"手抄漂移"源（J-1 同族）。
+# 3) 文档里被**宣称**的脚本集合（README + HTP-STATUS + docs/ 下全部收口文档）。
+#    SUMMARY 与 docs/*.md 都纳入：它们会把套件名字与条数当成证据引用；
+#    不纳入的话就是下一个"手抄漂移"源（J-1 同族）。
+#
+#    为什么从"只扫 SUMMARY 一份"改成"扫 docs/ 全量"：Issue #174 起每轮自检都会
+#    在 docs/ 下落一份收口文档（乙-1、乙-2……）。若扫描面仍是写死的一份，
+#    新文档就是**下一份"看着像证据、实则无人核对"的文档** —— 正是本守卫要防的形态。
+#    改成 glob 后，任何新收口文档一落地就自动进判据①③⑤ 的扫描面。
 SCRIPT_RE = re.compile(r'(tools/run_[A-Za-z0-9_]+\.(?:sh|py))')
+doc_files = [readme_path, status_path, summary_path] + sorted(glob.glob('docs/*.md'))
 docs = set()
-for p in (readme_path, status_path, summary_path):
-    docs |= set(SCRIPT_RE.findall(open(p, encoding='utf-8').read()))
+for p in doc_files:
+    try:
+        docs |= set(SCRIPT_RE.findall(open(p, encoding='utf-8').read()))
+    except OSError:
+        pass
 # 判据⑦ 用：小结里**经 SCRIPT_RE 命中**的脚本数（与 docs 集合同一把正则）。
 # 不在文件里 grep 一遍（那是存在性断言），而是复用"真的进了集合"的那条通路。
 summary_scripts = len(set(SCRIPT_RE.findall(open(summary_path, encoding='utf-8').read())))
@@ -107,12 +138,15 @@ called_sh = sorted(p for p in called if p.endswith(".sh"))
 print("CALLED_SH", len(called_sh), *called_sh)
 
 manifest_path = os.path.join(os.path.dirname(ci_path) or ".", "tools", "suite-counts.json")
-mb = {}
+manifest = {}
 if os.path.exists(manifest_path):
     try:
-        mb = json.load(open(manifest_path, encoding="utf-8")).get("totals", {})
+        manifest = json.load(open(manifest_path, encoding="utf-8"))
     except (OSError, ValueError):
-        mb = {}
+        manifest = {}
+# 逐套件条数取自 totals（判据⑤）；总数取自 suite_total（判据⑧）。
+# 同一份清单、同一把尺子 —— 两处各读一份近似就是判据漂移的起点。
+mb = manifest.get("totals", {}) if isinstance(manifest, dict) else {}
 
 
 # ── 判据⑤：文档里写的「N 条」必须等于清单里该脚本的条数 ────────────────────
@@ -135,8 +169,12 @@ if os.path.exists(manifest_path):
 # 那一步守住（它跑在「全部套件本来就要跑」的那一节里，不额外添成本）。
 DOC_ROW = re.compile(r"^\|\s*`tools/(run_[A-Za-z0-9_]+\.(?:sh|py))`\s*\|[^|]*?\*\*(\d+) 条")
 declared = {}
-for p in (readme_path, status_path, summary_path):
-    for line in open(p, encoding="utf-8"):
+for p in doc_files:
+    try:
+        lines = open(p, encoding="utf-8")
+    except OSError:
+        continue
+    for line in lines:
         m = DOC_ROW.search(line)
         if m:
             declared.setdefault("tools/" + m.group(1), set()).add(int(m.group(2)))
@@ -153,6 +191,40 @@ for script, vals in sorted(declared.items()):
             drift.append(f"{script}:文档写{v}/清单{want}")
 print("DOC_COUNT_DRIFT", len(drift), *drift)
 print("DOC_COUNT_CHECKED", checked)
+
+# ── 判据⑧：文档里写的「N 个套件」（**总数**口径）必须等于清单里的 suite_total ──
+# 判据⑤ 管的是**逐套件**的「N 条」（表格里写成 `| \`tools/run_x.sh\` | **N 条`）。
+# 而文档里还有另一种数字：**总数** ——「83 个套件」「42 → 81 个」。
+# DOC_ROW 正则匹配不到它们，于是**「N 条」有尺子、「N 个套件」没有**：
+# 同一族的漂移在总数这一维上原样复现（帐目① 实测：§5.2 写 83、实际 124）。
+#
+# 尺子与「N 条」**同一把**：都取自 tools/suite-counts.json —— 逐套件条数来自
+# `totals`，总数来自 `suite_total`（由 count_suite_totals.py --write 一起生成，
+# 由 `--check-total` 守住它与磁盘一致）。判据这里只做**静态比对**，不扫盘。
+#
+# 只认**标了「当前」的口径**：`**现 124 个**`。历史叙述（「42 → 81 个」
+# 「落盘当刻 81」）**不核** —— 它们标的是过去某一刻的真值，随代码演进本来
+# 就该保持不变；把历史数也拿去对当前总数，等于要求文档不能记历史。
+TOTAL_ROW = re.compile(r"\*\*现\s*(\d+)\s*个\*\*")
+wanted_total = manifest.get("suite_total") if isinstance(manifest, dict) else None
+total_declared = set()
+for p in doc_files:
+    try:
+        txt = open(p, encoding="utf-8").read()
+    except OSError:
+        continue
+    total_declared |= {int(x) for x in TOTAL_ROW.findall(txt)}
+total_drift = []
+if wanted_total is None:
+    total_drift.append("清单里没有 suite_total（跑 --write 生成）")
+else:
+    for v in sorted(total_declared):
+        if v != wanted_total:
+            total_drift.append(f"文档写{v}/清单{wanted_total}")
+print("SUITE_TOTAL_DRIFT", len(total_drift), *total_drift)
+print("SUITE_TOTAL_CHECKED", len(total_declared))
+print("SUITE_TOTAL_WANT", wanted_total if wanted_total is not None else -1)
+print("DISK_SUITES", len(on_disk))
 PY
 
 # 输出的行是 `<名字> <条数> <脚本1> <脚本2> ...`（`<名字> <条数>` 恒在，
@@ -163,8 +235,13 @@ PHANTOM=$(field PHANTOM)
 DOC_UNWIRED=$(field DOC_UNWIRED)
 REQ0_IGNORED=$(field REQ0_IGNORED)
 CALLED_SH=$(field CALLED_SH)
+STAGE_FILES=$(field CI_SOURCES)
 DOC_COUNT_DRIFT=$(field DOC_COUNT_DRIFT)
 DOC_COUNT_CHECKED=$(awk '$1=="DOC_COUNT_CHECKED" {print $2}' "$TMP/report.txt")
+SUITE_TOTAL_DRIFT=$(field SUITE_TOTAL_DRIFT)
+SUITE_TOTAL_CHECKED=$(awk '$1=="SUITE_TOTAL_CHECKED" {print $2}' "$TMP/report.txt")
+SUITE_TOTAL_WANT=$(awk '$1=="SUITE_TOTAL_WANT" {print $2}' "$TMP/report.txt")
+DISK_SUITES=$(awk '$1=="DISK_SUITES" {print $2}' "$TMP/report.txt")
 
 # ── 1) 磁盘上的每个离线测试都已经接进 CI ───────────────────────────────────
 # 失败时点出**是哪几个**（不只是一句"有没接的"）：只有指出名字，这个守卫
@@ -189,10 +266,22 @@ c "被 README/HTP-STATUS 当证据的脚本都在 CI 里跑（宣称却没跑：
 # 所以必须另钉"集合本身是算出来的、且非空"。
 c "磁盘上确实扫到了离线测试脚本（防上面几条恒真）" \
   "[ \"\$(ls tools/run_*.sh tools/run_*.py 2>/dev/null | wc -l)\" -gt 20 ]"
-c "CI 里确实扫到了被调用的脚本（防解析正则写死成恒真）" \
-  "grep -qE '(sh|bash|python3) tools/run_[A-Za-z0-9_]+\\.(sh|py)' \$CI"
+# 「CI 源非空」是**其余所有判据**的前提，也是这次真出过事的那一格：
+# 扫描面从 `.cnb.yml` 挪到 `scripts/ci-*.sh` 时，若某一处没跟着改，
+# `called` 会变空 —— 判据①③ 报"一个都没接"（红得莫名其妙），
+# 判据④⑥⑦⑨ 的集合为空则**恒绿**（静默）。所以这条要按**两个来源分别断言**：
+#   · `.cnb.yml` 里至少还留着调用（不是把 script 搬走就完事）；
+#   · 被引用的 stage 脚本真的存在且被读到了。
+# 两个来源**分开判**，且判的是"这一来源里真的有调用"，不是"文件里有字"：
+#   · `.cnb.yml` —— 搬走正文之后它应当**恰好**剩一句 `sh scripts/ci-*.sh`
+#     （所以这里不查它有没有 `tools/run_*`；那样写会把这次正确的改动判红）；
+#   · stage 脚本 —— 被 `.cnb.yml` 引用、且在磁盘上真的存在，且里面真的有调用。
+c "CI 调用清单的两个来源都非空（.cnb.yml 引用 stage 脚本 + scripts/ci-*.sh 有调用）" \
+  "grep -qE '^[[:space:]]+(sh|bash) scripts/ci-[A-Za-z0-9_-]+\\.sh[[:space:]]*\$' \$CI && [ -n \"\$STAGE_FILES\" ] && grep -qhE '(sh|bash|python3) tools/run_[A-Za-z0-9_]+\\.(sh|py)' \$STAGE_FILES"
+c "stage 脚本本体存在且被读取（${STAGE_FILES:-无}）" \
+  "[ -n \"\$STAGE_FILES\" ] && [ -s \"\$(printf '%s\\n' \$STAGE_FILES | head -1)\" ]"
 c "本次修复的两个脚本都在 CI 调用清单里（防有人把这两行删回去）" \
-  "grep -q 'REQUIRED=0 sh tools/run_cors_live_tests.sh' \$CI && grep -q 'sh tools/run_chat_buffer_tests.sh' \$CI"
+  "grep -qh 'REQUIRED=0 sh tools/run_cors_live_tests.sh' \$CI \$STAGE_FILES && grep -qh 'sh tools/run_chat_buffer_tests.sh' \$CI \$STAGE_FILES"
 
 # ── 4b) 每个判据都必须能**真的被执行到**：脚本本体先过 `sh -n` ────────────────
 # 上面几条判据（以及仓库里全部离线守卫）成立的前提，是**脚本本体能跑起来**。
@@ -284,6 +373,25 @@ c "文档写的「N 条」都等于清单条数（漂移：${DOC_COUNT_DRIFT:-�
 c "确实核对过至少 30 份脚本的文档条数（防判据⑤ 恒真）" \
   "[ \"\${DOC_COUNT_CHECKED:-0}\" -ge 30 ]"
 
+# ── 4d2) 文档里写的「N 个套件」（**总数**）必须等于清单里的 suite_total（判据⑧）──
+# 判据⑤ 管**逐套件**的「N 条」；这一条管**总数**。两者是同一族的漂移，只是
+# 落在不同的写法上：`| \`tools/run_x.sh\` | **N 条` 能被 DOC_ROW 抓到，
+# 而「83 个套件」「42 → 81 个」抓不到 —— 于是**「N 条」有尺子、「N 个套件」没有**，
+# 帐目① 实测 §5.2 写着 83、磁盘实际 124，判据⑤ 全绿。
+#
+# 尺子与「N 条」**同一把**：都取 tools/suite-counts.json（总数 = `suite_total`，
+# 由 count_suite_totals.py --write 一起生成、由 `--check-total` 守住与磁盘一致）。
+# 只核**标了「当前」的口径**（`**现 N 个**`）：历史叙述（「42 → 81 个」…
+# 「落盘当刻 81」）不核 —— 它标的是过去某一刻的真值，本就该保持不变。
+c "文档写的「现 N 个套件」都等于清单总数（漂移：${SUITE_TOTAL_DRIFT:-无}）" \
+  "[ -z \"\$SUITE_TOTAL_DRIFT\" ]"
+# 防判据⑧ 恒真：文档里一个「现 N 个」都没写 / 清单缺 suite_total -> 空集恒绿。
+c "确实核对了文档里的套件总数、且清单有 suite_total（防判据⑧ 恒真，核到 ${SUITE_TOTAL_CHECKED:-0} 处）" \
+  "[ \"\${SUITE_TOTAL_CHECKED:-0}\" -ge 1 ] && [ \"\${SUITE_TOTAL_WANT:-0}\" -ge 20 ]"
+# 防判据⑧ 与判据⑤ 用两把尺子：清单的 suite_total 必须等于 CI/磁盘上真实的套件数。
+c "清单 suite_total 等于磁盘上的套件个数（总数口径只此一把尺子，实测 ${DISK_SUITES:-0}）" \
+  "[ \"\${SUITE_TOTAL_WANT:-0}\" = \"\${DISK_SUITES:-0}\" ]"
+
 # ── 4e) 审查收口小结必须真的在"被扫描"的那一份名单里（判据⑦）────────────
 # `docs/REVIEW-110-SUMMARY.md` 是 Issue #110 的**唯一索引**：它引用各套件的
 # 名字与条数作为证据。若它不在判据①③⑤ 的扫描面里，就会重演 J-1 ——
@@ -305,7 +413,7 @@ c "CI 以 REQUIRED=0 调用的脚本都真的读 REQUIRED（写着却没读：${
   "[ -z \"\$REQ0_IGNORED\" ]"
 # 防上面那条恒真：maven 那批确实是以 REQUIRED=0 调的，数量>0 才说明正则没写歪。
 c "确实扫到了 REQUIRED=0 的调用（防上一条恒真）" \
-  "[ \$(grep -cE 'REQUIRED=0[[:space:]]+(sh|bash)[[:space:]]+tools/run_[A-Za-z0-9_]+\.sh' \$CI) -ge 5 ]"
+  "[ \$(grep -chE 'REQUIRED=0[[:space:]]+(sh|bash)[[:space:]]+tools/run_[A-Za-z0-9_]+\.sh' \$CI \$STAGE_FILES 2>/dev/null | awk '{s+=\$1} END{print s+0}') -ge 5 ]"
 
 echo ""
 if [ "$bad" = "0" ]; then echo "=== CI 接线守卫：PASS $ok / FAIL 0 ==="; exit 0; fi

@@ -39,6 +39,7 @@ typedef _jobject * jclass;
 typedef _jobject * jarray;
 typedef _jobject * jobjectArray;
 typedef _jobject * jintArray;
+typedef _jobject * jfloatArray;
 typedef _jobject * jthrowable;
 struct _jmethodID;
 typedef _jmethodID * jmethodID;
@@ -87,6 +88,13 @@ struct JNIEnv {
     jobject GetObjectArrayElement(jobjectArray, jsize) { return nullptr; }
     jintArray NewIntArray(jsize) { return nullptr; }
     void  SetIntArrayRegion(jintArray, jsize, jsize, const jint *) {}
+    void  GetIntArrayRegion(jintArray, jsize, jsize, jint *) {}
+    // ⚠ 面积是**契约**：嵌入路径（nativeEmbed）用到了 jfloatArray 的建数组与写区间，
+    //   少一个则 llama_jni.cpp 编不过（0.9.148 那轮就是这个形态栽的）。
+    //   check_stub_surface.py 会先扫真源码、再逐项要求这里有 —— 不需要编译器也能拦。
+    jfloatArray NewFloatArray(jsize) { return nullptr; }
+    void  SetFloatArrayRegion(jfloatArray, jsize, jsize, const jfloat *) {}
+    void  GetFloatArrayRegion(jfloatArray, jsize, jsize, jfloat *) {}
     jsize GetArrayLength(jarray) { return 0; }
     const char * GetStringUTFChars(jstring, jboolean *) { return ""; }
     void  ReleaseStringUTFChars(jstring, const char *) {}

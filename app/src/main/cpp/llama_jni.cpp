@@ -21,15 +21,15 @@
 #include <cerrno>
 #include <unistd.h>
 #include <fcntl.h>
-#include <sys/syscall.h>   // SYS_gettid ｜ __NR_madvise（见 nativeReclaimReleasedHeap）
-#include <cstdint>         // uintptr_t：/proc/self/maps 解析出的地址转指针
+#include <sys/syscall.h>   // SYS_gettid
 #include <sys/types.h>
 #include <sys/wait.h>      // waitpid（探针自举读系统属性）
 #include <sys/mman.h>      // mmap/madvise：归还库 MAP_POPULATE 预填充的权重页（见 release_populated_pages）
-// malloc_trim：把**已经 free、但还没归还内核**的匿名页交还（见 nativeReclaimReleasedHeap）。
-// 只在 glibc 上叫这个名；Android(bionic) 不带 —— 那边用自身的系统调用兜底，
-// 所以这里用 `__GLIBC__` 判，缺了就只走 syscall 那条路（不是"少一半功能"，
-// 而是"这套 libc 没有那个 C 接口"）。
+#include <sys/stat.h>      // fstat：GGUF 预读前的前置检查（见 gguf_header_precheck）
+// malloc_trim：让**分配器自己**把已 free、但还没归还内核的匿名页交还
+// （见 nativeReclaimReleasedHeap）。只在 glibc 上叫这个名；Android(bionic)
+// 没有等价接口 —— 那边就**什么都不做**（理由见本函数上方 ISSUE #274 那段：
+// 绕过分配器去猜哪段匿名内存是空闲的，会抹掉活对象）。
 #if defined(__GLIBC__)
 #include <malloc.h>
 #endif
@@ -40,6 +40,11 @@
 #include "utf8_safe.h"
 #include "stop_sequences.h"   // stop / stop_sequences 匹配语义（纯函数，宿主侧有单测）
 #include "kv_prefix.h"        // KV 前缀复用的切分语义（纯函数，宿主侧有单测）
+#include "embed_text.h"      // 向量嵌入的归一化/池化/检索语义（纯函数，宿主侧有单测）
+#include "rag_index.h"       // 知识库索引的切块/指纹/头布局（纯函数，宿主侧有单测）
+                             // 阶段 1 的**判定**部分放在这里，是为了让"索引与模型不匹配"
+                             // 这类**不崩不报错**的失效能被宿主侧单测钉住；
+                             // 落盘/读盘在 Kotlin 侧（RagIndexStore.kt）。
 // chat_abi.h 是**唯一**允许 include vendor chat.h 的地方：它在编译期钉住
 // STL ABI（libc++）、json 版本（3.12.0）与结构体逐字段偏移，
 // 任何一条不成立都会在这里编不过，而不是等真机 SIGSEGV。
@@ -123,6 +128,8 @@ static void jp(const char * fmt, ...) {
 // 留在本文件里就只能靠 review 肉眼保证（本文件在宿主上编不过：jni.h / llama.h /
 // chat.h 都是 NDK 与真机的）。拆出去之后真机与单测共用同一份实现。
 #include "probe_util.h"
+// GGUF 预读前的文件头判据（纯逻辑，宿主单测跑的是同一份）：见 gguf_precheck.h
+#include "gguf_precheck.h"
 // 探针开关判据（显式关闭 / 自举缓冲只记不写）：纯逻辑，宿主可编，
 // 与真机编进去的是同一份 —— 见该头文件开头的理由。
 #include "probe_flag.h"
@@ -243,7 +250,10 @@ static void probe_boot_note(const char * fmt, ...) {
 // 判据本体在 probe_flag.h 的 probe_bootstrap_write()，宿主可真编真跑。
 static void probe_bootstrap_flush() {
     if (!g_probe_attempted) return;
-    const size_t n = probe_bootstrap_write(g_boot_log, g_boot_log_len, &g_boot_flush_tries, 1);
+    // 交付字节数的**唯一口径**是 probe_bootstrap_write（宿主可真编真跑的那份判据）：
+    // 它另外承担「同一段现场只交代一次」—— 旧写法无条件下发，节流靠调用方自觉，
+    // 而调用方（nativeProbeInit）在进程里可以被调到不止一次。
+    size_t n = probe_bootstrap_write(g_boot_log, g_boot_log_len, &g_boot_flush_tries, 1);
     if (n > 0) probe_raw(g_boot_log, n);
 }
 
@@ -275,6 +285,32 @@ static void probe_bootstrap_recall() {
         if (n > 0) LOGE("probe boot: %s", line);
         off += n;
         if (off < g_boot_log_len && g_boot_log[off] == '\n') off++;
+    }
+}
+
+// ── 探针文件的重置：本会话一份、上一会话一份 ────────────────────────────────
+//
+// 为什么必须重置：探针 fd 用的是 O_APPEND，文件从 App 装好到卸载**只有一个**，
+// 既没有重置也没有上限 —— 它不是"日志"，是 native 全量输出 + stderr 遗言 +
+// 逐 token 原始流三样一起往里灌。一次长回答就是上万行，几百 MB 是迟早的事。
+//
+// 为什么是 rename 而不是 unlink：崩前那几行恰恰在**前面**。整份删掉等于把上一次
+// 现场（用户最可能想导出的那一份）扔掉，所以本代变更成 `probe-native.prev.log`，
+// 下一代再把它覆盖掉 —— 只留两代，但一代都不白丢。
+//
+// 为什么在这里（nativeProbeInit 开文件前）：那是全进程唯一打开探针文件的点，
+// 重置跟着它走 = 每个进程生命周期恰好一次，不需要任何额外的"启动"信号。
+//
+// 失败**不阻断**取证：rename 失败（目标被占/文件系统不配合）只是留着上一代，
+// 也留一行痕迹 —— 绝不因为重置不了就不开探针。
+static void probe_rotate_prev(const char * path) {
+    std::string prev = std::string(path) + ".prev";
+    if (rename(path, prev.c_str()) != 0) {
+        // ENOENT = 上一代不存在（首次启动/已重置），是正常态，不打日志免得刷屏。
+        // 其它 errno 才说明"这次没重置成"，必须留痕。
+        if (errno != ENOENT)
+            LOGE("probe: 上代会话文件未能滚动（%s → %s，errno=%d %s）；"
+                 "本会话照常开，但上一段现场仍在当前文件里", path, prev.c_str(), errno, strerror(errno));
     }
 }
 
@@ -462,7 +498,20 @@ static JavaVM * g_vm = nullptr;
 static jobject   g_log_cb   = nullptr; // 全局引用：LlmLogBridge 实例
 static jmethodID g_log_mid  = nullptr;
 
-static void probe_log_sink(enum lm_ggml_log_level, const char *, void *) {}
+// 探针开启时 llama.cpp 的日志出口。
+//
+// 此前它是个空函数 —— 理由是"探针模式下 log sink 换成空操作，两条路径下处理代码
+// 完全一致，只有最终写出点不同"，但"丢弃"这个写出点让**探针恰恰丢掉了最值钱的东西**：
+// 从 backendInit 起，凡走 llama 日志系统的输出（GGUF header 解析、tensor 装载、
+// 采样告警…）整段归零，而这些正是崩前最常出现的内容。用户开探针是为了取证，
+// 结果反而不如不开（不开至少走 JVM 回调落进会话文件）。
+//
+// 现在改成落盘：只经 jp()（异步信号安全的那套），不经 JVM —— 保留"旁路 JVM 回调"
+// 这个防观测者效应的本意，只是不再丢内容。级别前缀保留，便于区分 error 与 info。
+static void probe_log_sink(enum lm_ggml_log_level level, const char * text, void *) {
+    if (!text || !*text) return;
+    jp("[llama/%d] %s", (int) level, text);
+}
 
 static void jni_log_cb(enum lm_ggml_log_level level, const char * text, void * /*user_data*/) {
     if (!g_vm || !g_log_cb || !g_log_mid || !text) return;
@@ -749,7 +798,11 @@ static int release_populated_pages(const char * path, int * n_ranges, long * byt
 //   为避免"先用后定义"，这里把它与下方那段一起声明。C++ 里 static 函数
 //   不声明就用会被判"未声明"直接编不过（0.9.120 之后这一族真编不过过，
 //   而 CI 只跑静态守卫、不编 native，所以没被拦住）。
-static void unloadModelInternal();
+// ⚠ `Session` 本身在下方才定义（与它的字段注释放在一起）；这里只需它的**名字**，
+//   所以先做一个不完整类型的前置声明 —— 不能直接写 `Session & s` 而不声明它，
+//   否则是"未知类型名"（本守卫 ① 正是逮这个）。
+struct Session;
+static void unloadModelInternal(Session & s);
 #define LM_RSS_PEAK_RESET (-1)   // 复位值：-1 = 还没量到过（见 g_rss_peak_kb）
 
 // 本仓库此前只有 `[mmap释放]` 一处 RSS 探针，它打在 `loadModel` 里 ——
@@ -1169,10 +1222,110 @@ struct Session {
     // 上一轮命中复用的 token 数 / 上一轮 prefill 的 token 数，供 /health 与日志用。
     int    last_reuse = 0;
     int    last_prefill_tokens = 0;
-};
-static Session S;
+    // 上一轮的**逐 token 最长公共前缀**长度（不设门槛，见 kvprefix::Plan::lcp）。
+    // 与 last_reuse 成对读才能区分"差一点没命中"与"两轮 prompt 真的不一样"：
+    // 只报 reuse=0 时这两种在日志/health 上完全同形。
+    int    last_lcp = 0;
 
-static void unloadModelInternal(); // 释放采样器/上下文/模型（定义见文件尾）
+    // ── 角色标记：这一份 Session 承载的是**对话**还是**嵌入** ──────────────
+    // 双常驻（chat + embed）之后进程里同时存在两份 Session，而它们的加载参数
+    // 约束是**相反**的：
+    //   · 对话:  embeddings=false，KV 要被复用（n_ctx 按对话长度给）；
+    //   · 嵌入:  embeddings=true，KV 是纯冗余（不做自回归），n_ctx 只按
+    //            最长单条文本给，否则白占一份大 KV。
+    // 若这个标记丢了，`unloadEmbedInternal` 之类按角色派发的路径就会去拆错那一份，
+    // 而症状是"聊到一半模型没了"（不崩、只是下一次加载），极难归因。
+    // 默认 false = 对话，与引入本特性前的唯一那份 Session 同义（向后兼容）。
+    bool  embedding = false;
+
+    // ── 嵌入这一份的池化类型（`llama_pooling_type(ctx)` 的原值）────────────
+    // 句向量取哪一行**由模型自己声明**，不是我们能定的：BGE 系在 GGUF 里写 CLS
+    // （取第 0 个 token），生成式 decoder 写 NONE（取最后一个）。
+    // 取错的表现是"向量算出来了、语义完全无关"，而且**不报错** ——
+    // BGE 上更是 100% 表现为"零范数"，因为非 CLS 位置没有过 LayerNorm，
+    // 范数量级不可控，float32 一平方就下溢成 0。
+    // 加载时读一次存下来（-1 = 库没报出来，按 last-token 处理，见 plan_pooling）。
+    int   pool_type = -1;
+
+    // ── 嵌入这一份的**合批容量**（= 建 ctx 时写进 `n_seq_max` 的那个数）──────
+    // 为什么把它记在 Session 上而不是直接读 `kEmbedBatchRows`：
+    // 合批能不能跑，取决于**这一份 ctx 实际**容得下几个 seq，而那是建 ctx 时
+    // 定下的。将来若有人按设备内存调 `n_seq_max`（低端机给小值），
+    // 写死的常量就会与 ctx 实际容量分岔 —— 于是 `seq_id` 越界、向量不对、接口 200。
+    // 所以这里存**实际**落值，nativeEmbedBatch 只信它。
+    int   seq_max = 0;
+
+    // ── 嵌入这一份的**每条**文本可用位置数（= 库的 `n_ctx_seq` = `n_ctx/n_seq_max`）
+    // 与 `n_ctx`（**总量**）不是一个数，本轮真踩到过：把 `n_seq_max` 提到 8
+    // 而 `n_ctx` 仍是 512 时，每条的预算掉到 64，而"截断到 n_ctx"这条判据
+    // 还在按 512 截 —— 于是 65~512 token 的文本会带着越界的 `pos` 上库
+    //（`sequence positions are not continuous` / 静默算错）。
+    // 截断与"每条能不能装下"只信这个数；`n_ctx` 仅用于日志里报总量。
+    int   n_ctx_seq = 0;
+
+    // ── 嵌入这一份的**两道门**（= 建 ctx 时显式设的 `n_batch` / `n_ubatch`）──
+    // 0.9.212 起 `nativeLoadEmbedModel` 会把这两个数**显式设**成 `kEmbedGate`（4096）——
+    // 在此之前它俩是**库默认**（`n_batch=2048`，`n_ubatch=min(n_batch,512)`），
+    // 于是两扇门都只有"名义上够用"，真机上是这么崩的：
+    //   · bge-large-zh-v1.5（BERT，非因果 → 库走 `llama_encode`）在一次提交
+    //     token 和 > 512 时撞 `:1426` 的 `n_ubatch >= n_tokens`，**abort**；
+    //   · Qwen3-Embedding（因果 → `llama_decode`）在 > 2048 时撞 `:1711`。
+    // 这两个数记在 Session 上而不是直接读常量：将来若有人按设备内存调它，
+    // 写死的常量就会与 ctx 实际落值分岔 —— 而那正是本仓库反复吃过的一族。
+    // 读数是**库的实数**（`llama_n_batch` / `llama_n_ubatch`），不是我们传的值。
+    int   n_batch  = 0;
+    int   n_ubatch = 0;
+};
+static Session S;   // 对话（chat）—— 生成路径全部走它，与引入本功能前逐字节相同
+// ── 嵌入（embed）用的第二份 Session ────────────────────────────────────────
+// 为什么是**独立的一份**而不是给 S 加 slot 维度：生成路径有 120+ 处 `S.` 引用，
+// 把它们整体改成"按 slot 取"是一次高风险重构（改错的成本是段错误 = 进程级闪退）。
+// 而双常驻真正需要的只有"两个模型同时在内存里"这一件事 —— 嵌入路径是一条**全新**的
+// 码路，它自己持一份 Session 即可，与本仓库 stop_sequences.h / kv_prefix.h
+// "把新逻辑隔离成独立单元"的做法同源。
+//
+// ⚠ 两份 Session 各自的**生命周期**必须彼此独立：加载 embed 不许碰 S，
+// 卸载 chat 不许碰 E。这一点由 tools/run_dual_model_guard.sh 正面钉住
+// （"加载 embed 的路径里不得出现卸载 S 的调用"）。
+static Session E;   // 嵌入（embed），embedding=true
+
+// ── 最近一次嵌入失败的**可归因**详情（方案 C）──────────────────────────────
+// 为什么要有它，而不是把详情只写进日志：
+//   · 用户看不到 logcat。他看到的只有 UI 上那句"检查嵌入模型与内存" —— 而那句
+//     话在**两个不同的根因**下都成立，等于没有排查方向；
+//   · 100 条里坏 3 条时，"哪 3 条"在日志里根本没有记录，只能二分重试；
+//   · 而失败详情（范数 / token 数 / 维度 / 池化类型）在**失败当场**才有，
+//     事后拿不回来。
+// 所以每次 nativeEmbed 开头复位、失败时写入，Kotlin 侧失败后立刻取走。
+// ⚠ 不是线程安全容器：嵌入路径本身由 Kotlin 的 embedLock 串行化
+//（与同一份 E Session 的约束同源 —— 并发读它本来就不允许）。
+static embedtext::EmbedFailure g_embed_fail;
+
+// 上一次 `nativeEmbedBatch` 里**失败的那几条**（原下标）。
+// 与 `g_embed_fail` 同一套"失败详情在失败当场取走"的模式，但承载的东西不同：
+//   · `g_embed_fail` 是**一条**的归因（范数/维度/token 数）；
+//   · 这里是**一批里哪几条**坏了 —— 合批时失败是**部分**的，而这个下标集合
+//     是调用方唯一能据以"把这几条的正文标出来"的东西（返回数组里那一段是全零，
+//     而全零与"真的零向量"同形，没有区分能力）。
+// ⚠ 同样不是线程安全容器：与 `g_embed_fail` 同源，嵌入路径由 Kotlin 的
+// embedLock 串行化。每次 nativeEmbedBatch 开头清空。
+static std::vector<int> g_embed_batch_failed;
+
+static void embed_failure_reset() {
+    g_embed_fail = embedtext::EmbedFailure();
+    g_embed_batch_failed.clear();
+}
+
+static void embed_failure_set(int reason, int nTok, int nEmbd, int nEmbdOut, int pooling, double norm) {
+    g_embed_fail.reason = reason;
+    g_embed_fail.n_tokens = nTok;
+    g_embed_fail.n_embd = nEmbd;
+    g_embed_fail.n_embd_out = nEmbdOut;
+    g_embed_fail.pooling = pooling;
+    g_embed_fail.norm = norm;
+}
+
+static void unloadModelInternal(Session & s); // 释放采样器/上下文/模型（定义见文件尾）
 
 // ---------- UTF-8 完整序列切分：只下发完整字符，尾部留到下一 token ----------
 static std::string take_complete_utf8(std::string & buf) {
@@ -1250,7 +1403,8 @@ JNIEXPORT jint JNICALL JNI_OnLoad(JavaVM * vm, void *) {
 }
 
 // 探针初始化：Kotlin 传入可写目录，native 侧自己开文件直写，绝不依赖 JVM。
-// 正常模式（on=false）下把 jni_log_cb 换成空操作：探针接管后代码路径保持一致，
+// 探针关着时走 jni_log_cb（进 JVM ring + 会话文件）、开着时走 probe_log_sink（直写探针文件）：
+// 两条路径下 llama.cpp 的输出处理代码完全一致，只有最终写出点不同，
 // 不会出现「开了探针就换了一条执行路径」的观测者效应。
 //
 // 这一次调用同时是「认领自举」的时机：自举阶段已开的 fd 被接管，
@@ -1291,6 +1445,7 @@ Java_com_xiaowan_localinference_LlmEngine_nativeProbeInit(JNIEnv * env, jclass, 
     if (!dir) { g_bootstrapped = true; g_probe_attempted = true; return JNI_FALSE; }
     std::string path = std::string(dir) + "/probe-native.log";
     env->ReleaseStringUTFChars(jdir, dir);
+    probe_rotate_prev(path.c_str());
     g_probe_fd = open(path.c_str(), O_WRONLY | O_CREAT | O_APPEND | O_CLOEXEC, 0600);
     if (g_probe_fd < 0) {
         // 打不开就**不静默**：errno + 尝试过的路径都记进自举缓冲，
@@ -1332,11 +1487,12 @@ Java_com_xiaowan_localinference_LlmEngine_backendInit(JNIEnv * env, jclass, jobj
     jclass cls = env->GetObjectClass(g_log_cb);
     g_log_mid  = env->GetMethodID(cls, "onNativeLog", "(ILjava/lang/String;)V");
     env->DeleteLocalRef(cls);
-    // 探针开启时换成空操作 sink：两条路径下 llama.cpp 的输出处理代码完全一致，
-    // 只有最终写出点不同（JVM 回调 vs 丢弃），保证「开探针」不改变线程/锁行为。
+    // 探针开启时走 probe_log_sink（直写探针文件，不再丢弃）：两条路径下 llama.cpp
+    // 的输出处理代码完全一致，只有最终写出点不同（JVM 回调 vs 探针 fd），
+    // 保证「开探针」不改变线程/锁行为。
     // g_probe_on 在这里是**结果**而不是猜测：它只由 nativeProbeInit（用户意图）置位，
     // 自举不再预先把它打开 —— 此前"用户没开探针但 native 已自举开文件"会让这行
-    // 把原生日志整段丢进空 sink，用户既看不到日志、也不知道探针在写盘（D-1）。
+    // 把原生日志整段丢进 sink，用户既看不到日志、也不知道探针在写盘（D-1）。
     llama_log_set(g_probe_on ? probe_log_sink : jni_log_cb, nullptr);
     llama_backend_init();
     LOGI("llama backend init (hexagon/opencl/cpu) probe=%d", g_probe_on ? 1 : 0);
@@ -1348,6 +1504,46 @@ Java_com_xiaowan_localinference_LlmEngine_backendInit(JNIEnv * env, jclass, jobj
         if (err && *err) { jp("[abi] !! 自检失败: %s\n", err); LOGE("chat ABI self-check failed: %s", err); }
         else             { jp("[abi] 自检通过（libc++ ABI v1，inputs=168B）\n"); }
     }
+}
+
+// 预读之前的前置守卫：**只读文件头**，判 GGUF 魔数与版本，绝不进 `lm_gguf_init_from_file`。
+//
+// 为什么要有这一层（Issue #238）：
+//   `lm_gguf_init_from_file(no_alloc=true)` 并不只是"读 header" —— 它会把**整份元数据**
+//   分配出来，含 tokenizer 的 151936 条词表字符串，走几十万次 malloc/free。
+//   而这一次 malloc 风暴发生在 `nativeProbeGguf`（一个**纯装饰性**的量化预读）里，
+//   调用它的是 `EngineActivity.doLoad` 里 `Thread { ... }.start()` 的裸 Java 线程 ——
+//   native 段错误没有任何 Java 层 try/catch 接得住，进程直接没。
+//
+//   真机现场（tombstone_03）：
+//     #00 libc arena_run_heap_remove+888        ← arena 元数据链被解引用
+//     #05 libc je_malloc → #06 operator new
+//     #10 librnllama lm_gguf_init_from_file_ptr+228
+//     #12 libllmjni  Java_..._nativeProbeGguf+172
+//   寄存器里 151936（=0x25180，Qwen3 词表）出现两次 —— 正是那轮词表 malloc。
+//
+// 本守卫的取舍：**宁可预读失败，也不让预读有机会把进程带走**。
+// 判据只用 O_RDONLY 读前 8 字节 + stat 尺寸，不解析、不分配、不碰堆。
+// 魔数/尺寸不对时返回原因串，Kotlin 侧按"读不出"处理（回退按文件名判量化），
+// 而不是让库去解析一个它没准备好的文件。注意：**它不能证明文件一定合法**
+// （合法 GGUF 也可能被截断），只是把"明显不是 GGUF / 明显不完整"这一档挡在外面。
+
+// 真机侧：读文件头 + 交判据（判据本身在 gguf_precheck.h，宿主可单测）。
+// ⚠ 这个函数**不解析 GGUF**、不分配堆内存 —— 它存在的唯一目的就是不把
+//   明显读不了的文件交给 lm_gguf_init_from_file（见头文件注释）。
+static bool gguf_header_precheck(const char * path, std::string * why) {
+    int fd = open(path, O_RDONLY | O_CLOEXEC);
+    if (fd < 0) {
+        if (why) *why = std::string("打不开文件（errno=") + std::to_string(errno) + "）";
+        return false;
+    }
+    unsigned char hdr[24];
+    ssize_t got = pread(fd, hdr, sizeof(hdr), 0);
+    struct stat st;
+    const long long size = (fstat(fd, &st) == 0) ? (long long) st.st_size : -1;
+    close(fd);
+    if (got < 0) got = 0;
+    return gguf_header_check(hdr, (long long) got, size, why);
 }
 
 // 加载**前**只读 GGUF header（no_alloc=true，不 mmap 权重、不占内存、毫秒级），
@@ -1374,6 +1570,25 @@ Java_com_xiaowan_localinference_LlmEngine_nativeProbeGguf(JNIEnv * env, jclass, 
 
     const char *cpath = env->GetStringUTFChars(jpath, nullptr);
     if (!cpath) return mk("", "-1", "", "路径为空");
+
+    // 先过一道**不分配、不解析**的文件头检查（见 gguf_header_precheck）。
+    // 这一步存在的唯一理由：把"明显不能读"的文件挡在 lm_gguf_init_from_file 之外 ——
+    // 后者会为整份元数据（含十几万条词表）打一场 malloc 风暴，而它跑在一个
+    // 没有 Java 层兜底的裸线程上，一旦在那场风暴里出问题就是进程级 SIGSEGV。
+    // 预读失败不再是"静默回退"：原因要能被 Kotlin 日志读到（`[HTP判定] 预读不可用`）。
+    {
+        std::string why;
+        if (!gguf_header_precheck(cpath, &why)) {
+            // 先把返回串拼进具名变量再调 mk()：mk 的形参是 const char*，
+            // 直接传临时 std::string 的 c_str() 也能活，但那活着的理由
+            // （"临时对象活到全表达式结束"）太细，不该让下一个人去推。
+            const std::string msg = "文件头检查未通过：" + why;
+            env->ReleaseStringUTFChars(jpath, cpath);
+            LOGI("gguf probe: 前置检查未通过 -> %s", why.c_str());
+            return mk("", "-1", "", msg.c_str());
+        }
+    }
+
     struct lm_gguf_init_params params;
     params.no_alloc = true;
     params.ctx = nullptr;
@@ -1517,7 +1732,7 @@ Java_com_xiaowan_localinference_LlmEngine_nativeLoadModel(
     std::string modelPath(path);
     env->ReleaseStringUTFChars(jpath, path);
 
-    unloadModelInternal(); // 定义在下方
+    unloadModelInternal(S); // 定义在下方；只拆对话那份，**不碰** E（双常驻）
     llama_model_params mp = llama_model_default_params();
     mp.n_gpu_layers = (int) nGpuLayers;
     // NPU 配额档。npuQuotaPct<0 = 自动（tensor_split 保持 NULL，与本功能引入前逐字节相同）
@@ -1719,6 +1934,1349 @@ Java_com_xiaowan_localinference_LlmEngine_nativeLoadModel(
     return JNI_TRUE;
 }
 
+// ══════════════════════════════════════════════════════════════════════════
+//  嵌入（embedding）模型：加载 / 卸载 / 前向
+// ══════════════════════════════════════════════════════════════════════════
+//
+// 为什么单独一条加载路径，而不是给 nativeLoadModel 加个 role 参数：
+// 两者的**加载约束是相反的**，混在一条函数里迟早会有一条分支写错：
+//   · 对话:  `embeddings=false`，KV 要留给前缀复用（n_ctx 按对话长度给）；
+//   · 嵌入:  `embeddings=true`，KV **是纯冗余**（嵌入不做自回归，没有可复用的 KV），
+//             `n_ctx` 只按最长单条文本给（512 足够），否则白占一份大 KV ——
+//             而这一份是**不可协商**的内存（见下）。
+// 混在一起还会让"加载嵌入模型时误拆对话模型"变成可能（unload 的第一行），
+// 而症状是"聊到一半模型没了"，极难归因。
+//
+// ⚠ `embeddings=true` 会在 ctx 里**常驻一份 output buffer**（每层的输出都要留下来
+// 供 `llama_get_embeddings_*` 取），所以 n_ctx 给多大，这份就按多大分配。
+// 嵌入模型不需要长上下文（检索是逐条的、每条就一两句），n_ctx 给小值
+// 是"既省内存、又不影响功能"的**唯一**正确档位。默认 512。
+
+/** 嵌入模型的**每条**文本可用上下文（默认）。它直接决定常驻 output buffer 的大小。 */
+static const int kEmbedDefaultCtx = 512;
+/** 嵌入 ctx 的**总量**上限（所有序列加起来的 KV 格数）。超过它一律钳到上限：
+ *  **不报错**（嵌入模型的长文本应先分块，而不是让整个 ctx 跟着涨）。放开的代价是
+ *  一份在手机上吃不下的大 KV —— 后者会让加载直接失败，用户看到"加载失败"
+ *  却不知道是 ctx 给大了。 */
+static const int kEmbedMaxCtx = 4096;
+
+/**
+ * 一次合批最多塞几条（= 合批用掉的 seq 数上限）。
+ *
+ * ⚠ **这个数与 `n_ctx` 是同一个数的两面，必须一起算**（本轮真踩到过）：
+ * 库里 `n_ctx_seq = n_ctx / n_seq_max` 是**每个序列**能用的位置数
+ *（vendor 文案原文：`%s: n_ctx_seq = %u`，且 `n_ctx is not divisible by
+ * n_seq_max - rounding down to %u`）。于是：
+ *   · 把 `n_seq_max` 提到 8 而 `n_ctx` 仍是 512 时，`n_ctx_seq` 掉到 **64** ——
+ *     单条路径里一条 300 token 的文本，`pos` 从 0 排到 299，**越过了 64**，
+ *     库报 `sequence %d positions are not continuous` 或直接算错；
+ *   · 也就是说"给合批开 8 个 seq"这件事，**必须同时把 `n_ctx` 放大 8 倍**，
+ *     否则它把**单条**路径一起弄坏（而单条路径此前是对的）。
+ * 所以下面 `n_ctx = 每条预算 × kEmbedBatchRows`（再按 `kEmbedMaxCtx` 钳），
+ * 而 `n_seq_max = kEmbedBatchRows` —— 两处由同一个数推出。
+ *
+ * 取 8 的理由：合批的收益来自"摊薄每次 decode 的固定开销"，而这个开销按
+ * **整批 token 数**算；一条 400 字 ≈ 300 token，8 条约 2400 token —— 已经超过
+ * `n_batch` 默认的 2048，会触发库内部按 ubatch 再切。再往上加只是把切分
+ * 次数堆上去，固定开销省不动了，而内存峰值（整批 output buffer）线性涨。
+ * 另外 8 与嵌入线程数（2~8）同量级：条数远超核数时，同一批判里也只有一个
+ * 前向在跑，塞更多条目只是排更长的队。
+ */
+static const int kEmbedBatchRows = 8;
+
+/**
+ * 嵌入 ctx 的**两道门**（`n_batch` / `n_ubatch`）显式设成的值（0.9.212）。
+ *
+ * ═══════════════════════════════════════════════════════════════════════
+ * 为什么必须显式设：它们是**两道独立的门**，而此前一个都没传
+ * ═══════════════════════════════════════════════════════════════════════
+ * 嵌入这条加载路径此前 `cp.n_batch` / `cp.n_ubatch` **一个都没传**（只有内联的
+ * 对话模型 `nativeLoadModel` 有 `batchSize` / `ubatchSize` 两个入参），于是两个
+ * 都是库默认值，用户与日志里都看不出来。两道门各管一支：
+ *
+ *   · `n_batch`  —— 因果模型（Qwen3-Embedding → `llama_decode`）那条
+ *     `llama-context.cpp:1711` 的 `LM_GGML_ASSERT(n_tokens_all <= cparams.n_batch)`；
+ *   · `n_ubatch` —— 非因果模型（BERT 系 bge-large → 库改走 `llama_encode`）那条
+ *     `:1426` 的 `LM_GGML_ASSERT(cparams.n_ubatch >= n_tokens && "encoder requires
+ *     n_ubatch >= n_tokens")`。
+ *
+ * 真机上正是后者把用户挡死的：**bge-large-zh-v1.5 合批 8 → 4 → 2 全崩、只有 1 不崩**。
+ * 原因不是"批太大"，而是批大小（`n_seq_max`）拧的是**另一个旋钮** —— 一条 430 token
+ * 的块，2 条一合就 > 512，无论把批调到几，门都还是那扇 512 的门；只有 1 条时
+ * `n_seqs == 1`，那道门退化成恒真，所以"只有 1 不崩"。
+ *
+ * ⚠ release（NDK 默认 `-DNDEBUG`）里断言失败 = `abort()`：不是"这一批失败"，
+ * 是整个进程当场消失 —— 用户看到的是"建索引闪退"，日志最后一行只有知识库进度。
+ *
+ * ═══════════════════════════════════════════════════════════════════════
+ * 为什么是 `n_ctx`（4096）而不是"够用就好"
+ * ═══════════════════════════════════════════════════════════════════════
+ * 8 条满长（8 × 511 = 4088）必须一次装得下，否则每一批都要切段（多一次 decode），
+ * 而"满长"不是理论值：bge-large 在中文语料上条条压在 511 的截断点上（真机读数）。
+ *
+ * ⚠ 内存代价**没有白付**：`embeddings=true` 时库按 `n_ctx` 分配 KV 与 output
+ * buffer（那份本来就是 4096 的量级），`n_batch` / `n_ubatch` 只决定"内部缓冲与
+ * 计算图按多大切" —— 真机上表现为多出来的 compute buffer。装出来后要看
+ * `[embed内存]` 那一行的 RSS 增量（0.9.212 补的读数），不够就往下调这一档。
+ *
+ * ⚠ `n_batch % n_ubatch == 0` 是库自己断言过的（除不尽时 `ubatch` 那一路会
+ * 报 `n_batch is not divisible by n_ubatch`）—— 所以这两个数**只能一起改**，
+ * 而它们的值必须 ≤ `kEmbedMaxCtx`（= n_ctx 上限），否则请求一个比自己上下文
+ * 还大的批，库当场拒绝建 ctx（症状是"嵌入模型加载失败"，而用户看不懂为什么）。
+ */
+static const int kEmbedGate = 4096;
+
+JNIEXPORT jboolean JNICALL
+Java_com_xiaowan_localinference_LlmEngine_nativeLoadEmbedModel(
+        JNIEnv * env, jclass, jstring jpath, jint nCtx, jint nThreads, jboolean useMmap) {
+    JNI_SPAN("loadEmbedModel");
+    const char * path = env->GetStringUTFChars(jpath, nullptr);
+    if (!path) return JNI_FALSE;
+    std::string modelPath(path);
+    env->ReleaseStringUTFChars(jpath, path);
+
+    // ⚠ 只拆 **E**，绝不碰 `S`（对话那份）。这一行是"双常驻"的契约本身：
+    // 写成 `unloadModelInternal(S)` 会让"在 App 里选一个嵌入模型"顺手把正在用的
+    // 对话模型拆掉 —— 不崩、只是下一次生成变成"没加载模型"。守卫正面钉这一条。
+    unloadModelInternal(E);
+
+    // mmap 与对话模型同一口径：显式写两支，不靠库默认（见 nativeLoadModel 的
+    // `load_mode` 那段 —— "开关只落一半"是本仓库吃过亏的地方）。
+    llama_model_params mp = llama_model_default_params();
+    mp.n_gpu_layers = 0;                 // 嵌入走 CPU：HTP/OpenCL 的 output buffer 语义未验，先不冒险
+    mp.load_mode = useMmap == JNI_TRUE ? LLAMA_LOAD_MODE_MMAP : LLAMA_LOAD_MODE_NONE;
+    mp.use_extra_bufts = model_use_extra_bufts();
+    mp.devices = nullptr;
+    E.model = llama_model_load_from_file(modelPath.c_str(), mp);
+    if (!E.model) { LOGE("embed model load failed: %s", modelPath.c_str()); return JNI_FALSE; }
+    E.vocab = llama_model_get_vocab(E.model);
+
+    llama_context_params cp = llama_context_default_params();
+    // ── 容量收口：`kEmbedBatchRows × 每条预算 ≤ 两道门` ─────────────────────
+    // ⚠ 这一节是 0.9.213 的**唯一**一处把"条数"与"每条预算"绑起来的地方。
+    // 此前它们是两个各写一处的数（`kEmbedBatchRows` 8 + 调用方给的 perSeq），
+    // 而"8 条满长能不能一次装下"这件事**没有任何一处代码在管** —— 它只活在
+    // 两个常量的巧合里：`kEmbedMaxCtx`(4096) 恰好等于 `kEmbedGate`(4096)，
+    // 于是 `ctx ≤ gate`，于是 `rows × perSeqCtx ≤ ctx ≤ gate`。
+    // **改任一个常量都会破**，而破的形态不是报错，是 `abort()`：
+    // 若哪天 `kEmbedMaxCtx` 提到 8192 而 `kEmbedGate` 仍是 4096，则
+    // `perSeqCtx = 8192/8 = 1024`，8 条满长 = 8 × 1023 = 8184 > 4096 = 门 →
+    // 提交那一刻进程消失。所以这里不再靠巧合，改成**算一次、且由构造保证**：
+    //   ① 两道门的**绝对**上限先定（`gatesAbs`）；
+    //   ② 每条的预算由它**除**出来（`perSeqMax`）—— 不是"先取预算再乘条数"；
+    //   ③ 调用方给的 perSeq 一律钳进 `[1, perSeqMax]`。
+    // 于是 `kEmbedBatchRows × perSeqCtx ≤ ctx ≤ gatesAbs` 是**恒真**的，
+    // 与两个常量各是多少无关。
+    //
+    // 两道门取哪个数：`n_batch`(因果/Qwen3 那扇 `:1711`) 与 `n_ubatch`
+    // (非因果/BERT 系 bge 那扇 `:1426`) 必须**同源**，所以这一节根本不让它们
+    // 分开算 —— 只算一个 `gate`，两处各赋一次（见下）。
+    const int gatesAbs = kEmbedGate < kEmbedMaxCtx ? kEmbedGate : kEmbedMaxCtx;
+    // 每条预算的上限：由门**除**条数得出，而不是"先取预算再乘条数再钳总量"。
+    // 后者看着等价，但它把"装不装得下"变成了一个**事后**结论（`ctx ≤ gate` 靠
+    // 两个常量相等），而这里它是**构造性**的。
+    int perSeqMax = gatesAbs / kEmbedBatchRows;
+    if (perSeqMax < 1) perSeqMax = 1;         // 门比条数还小时兜底（不崩，只是每条 1 格）
+    // ── `n_ctx` 与 `n_seq_max` 必须一起算（见 kEmbedBatchRows 那段推导）──────
+    // `nCtx` 的语义是**每条文本**的预算（调用方/默认值都是这个意思），
+    // 而库里 `n_ctx_seq = n_ctx / n_seq_max`。合批要占用 `kEmbedBatchRows` 个
+    // seq，所以总量必须是"每条预算 × 条数"。
+    //
+    // ⚠ 顺序不能反：先把"每条预算"钳到上限、再乘条数 —— 那样总量会变成
+    // `kEmbedMaxCtx × 8`，一份手机吃不下的大 KV（症状是"加载失败"，而用户
+    // 看到的原因与"上下文给大了"毫无关系）。先乘、再钳总量才是对的那一支。
+    int perSeq = nCtx > 0 ? (int) nCtx : kEmbedDefaultCtx;
+    if (perSeq < 1) perSeq = kEmbedDefaultCtx;
+    // ⚠ 钳的是"每条预算"（不是总量）：这一下就是上面那条恒等式的**来源**。
+    // 用户把这一格填到 4096 时，他实际拿到的是 512 —— 而那一格现在会拿到这条
+    // 收口的读数（`[embed内存]` / `embed model ready`），不再静默失效。
+    if (perSeq > perSeqMax) perSeq = perSeqMax;
+    long long total = (long long) perSeq * (long long) kEmbedBatchRows;
+    if (total > (long long) kEmbedMaxCtx) total = kEmbedMaxCtx;
+    // `n_ctx` 不能小于条数（否则每条连 1 个位置都没有 —— 除法会把每条的预算
+    // 抹成 0，库直接拒绝加载）。钳一个下限，宁可少批几条也不许加载失败。
+    if (total < (long long) kEmbedBatchRows) total = kEmbedBatchRows;
+    // ⚠ 必须是 `kEmbedBatchRows` 的**整数倍**：库对除不尽的 `n_ctx / n_seq_max`
+    // 会"rounding down"（vendor 文案原文），而那一下**不报错** —— 每条的预算
+    // 悄悄少一格，最后一条文本恰好撞到就失败。向下取整到条数的整数倍，
+    // 让"我们以为的每条预算"与"库给的"逐格相等。
+    total = (total / kEmbedBatchRows) * kEmbedBatchRows;
+    const int ctx = (int) total;
+    cp.n_ctx = (uint32_t) ctx;
+    // 每条的预算（= 库会算出的 `n_ctx_seq`）—— 单条路径的截断判据用它，
+    // 合批的每条也一样。**不**直接用调用方给的字面值：总量被钳之后，
+    // 每条的预算跟着变了，用旧值截断会让"截断点"与"库的位置上限"分岔。
+    const int perSeqCtx = ctx / kEmbedBatchRows;
+    // 嵌入不做自回归 —— KV 是纯冗余，但**不支持"不分配"**：llama.cpp 在
+    // embeddings=true 时照样按 n_ctx 分配 KV。既然要占，就用最省的一档（F16 默认）；
+    // 量化 KV 只会引入一条"精度损失 + 需要 flash attn"的分支，对嵌入毫无收益。
+    int nt = nThreads > 0 ? nThreads : 4;
+    cp.n_threads = nt; cp.n_threads_batch = nt;
+    // ⚠ `n_seq_max` 必须 ≥ 合批条数：合批靠 `seq_id` 隔离条目（见 embed_text.h 的
+    // `plan_batch`），而 `seq_id >= n_seq_max` 时库的行为是**未定义**的
+    // （不是崩，是那几条的 KV 落进不存在的序列 —— 向量不对、接口 200）。
+    // 两处只有这一个数（`kEmbedBatchRows`），不各写一个字面量。
+    cp.n_seq_max = (uint32_t) kEmbedBatchRows;
+    // ── 两道门：**显式设**，不留库默认（0.9.212 修的真机 abort）─────────────
+    // 见 `kEmbedGate` 那段：`n_batch` 管因果模型那扇（`:1711`），`n_ubatch` 管
+    // 非因果模型那扇（`:1426`）。两条断言都在 `llama_decode` / `llama_encode`
+    // 的**正常路径**上、且在库自己按 ubatch 切分**之前** —— 所以"库会替我切"
+    // 救不了，release 里就是 `abort()`。
+    //
+    // ⚠ 钳到 `ctx`：请求一个比自己上下文还大的批，库当场拒绝建 ctx
+    //（症状是"嵌入模型加载失败"，而用户完全看不出是批参数给大了）。
+    // `kEmbedGate` 与 `kEmbedMaxCtx` 同值只是**当下**的事实，钳这一下是防
+    // 将来只改一处 —— 两处由 `min` 收口，改任一处都不会请求到越界的批。
+    //
+    // ⚠ 但**只钳到 ctx 是不够的**（0.9.213 收口的那一条，见上面 `gatesAbs` 那段）：
+    // `gate` 必须同时 ≤ `perSeqMax × kEmbedBatchRows`，否则"8 条满长一次装不装得下"
+    // 会重新变成巧合。这里两个上界一起取 `min`，而 `perSeqMax` 正是从 `gatesAbs`
+    // 除出来的 —— 于是这条恒等式在**两个常量各是多少**之外成立。
+    const int gate = kEmbedGate < ctx ? kEmbedGate : ctx;
+    cp.n_batch  = (uint32_t) gate;
+    cp.n_ubatch = (uint32_t) gate;
+    // ⚠ 这里**不再**量"建 ctx 前后的 RSS 差"（0.9.212 那一版量过，量错了，见下面
+    // `[embed内存]` 那一节）：基线取在模型加载**之后**时，那 892 MB 里已经含了
+    // 模型自己 mmap 的页，于是量出来的是"建 ctx 时恰好被 touch 的几页"（真机 +3 MB），
+    // 而一份 4096 的 ctx 光 output buffer 就不止 3 MB。一个量不准却像量准了的数，
+    // 比没有读数更坏。要真量差值，基线得挪到加载模型**之前** —— 那是另一件事。
+    E.ctx = llama_init_from_model(E.model, cp);
+    // 记下**实际**落值（见 Session::seq_max 的说明）：合批只信这个数。
+    E.seq_max = kEmbedBatchRows;
+    if (!E.ctx) {
+        LOGE("embed ctx create failed (n_ctx=%d)", ctx);
+        llama_model_free(E.model); E.model = nullptr; E.vocab = nullptr;
+        return JNI_FALSE;
+    }
+    E.n_ctx = (int) llama_n_ctx(E.ctx);
+    // ⚠ 取库自己算出来的每条预算（`llama_n_ctx_seq`），**不是**我们自己除的那个。
+    // 两者若有分岔（例如库对 n_ctx 做了别的钳制），截断点必须跟库走 ——
+    // 用我们算的那个数就是在赌"库的钳制与我们的一致"，而赌输的表现是
+    // 某几条静默算出错误向量。库不给（返回 0）时回落到我们算的值。
+    const uint32_t nCtxSeqLib = llama_n_ctx_seq(E.ctx);
+    E.n_ctx_seq = nCtxSeqLib > 0 ? (int) nCtxSeqLib : perSeqCtx;
+    // ⚠ 两道门也读**库的实数**（`llama_n_batch` / `llama_n_ubatch`），不是 `cp` 的值。
+    // 两者分岔时（库对 `n_batch` 有别的钳制、或将来有人改回"不传"）必须能一眼看出：
+    // 打 `cp` 的值等于担保"库收了我们给的那个数"，而那正是本仓库被推翻过两轮的假设。
+    E.n_batch  = (int) llama_n_batch(E.ctx);
+    E.n_ubatch = (int) llama_n_ubatch(E.ctx);
+    // ── 容量读数：这一档**最多能一次编几条满长**（0.9.213 收口）──────────────
+    // 见 `batch_full_rows_fit` 那段：这个数此前只能靠"拿两个常量去推"，而本仓库
+    // 正是靠推在 PR #285 里错了两轮。现在它由**库的实数**算出来、写进日志。
+    //
+    // ⚠ 两道门取**较小**的那个：因果模型（Qwen3）看 `n_batch`，非因果（bge）
+    // 看 `n_ubatch` —— 同一个进程里也可能两份模型同时驻留，而"这一批能不能提交"
+    // 由**实际走的那一扇**决定。取 `min` 是保守且正确的：装得下就意味着两扇都过。
+    // 两扇分岔时（库有自己的钳制）这一行的值会**小于** `kEmbedBatchRows`,
+    // 那就是"满长那批会被切段"的先兆 —— 看得见，而不是等某天 abort。
+    const int gateMin = E.n_batch < E.n_ubatch ? E.n_batch : E.n_ubatch;
+    const int fullRowsFit = embedtext::batch_full_rows_fit(gateMin, E.n_ctx_seq);
+    if (fullRowsFit > 0 && fullRowsFit < kEmbedBatchRows) {
+        jlog("[embed] ⚠ 容量余量不足：两道门取小 = %d，每条满长 = %d tok → 一次只装得下 %d 条满长"
+             "（合批上限 %d 条）。满长的那几批会**按条目边界切段**（安全，但多 decode 几次）；"
+             "要一次装下就调小「嵌入每批上下文」或改用词表更省的模型",
+             gateMin, E.n_ctx_seq - 1, fullRowsFit, kEmbedBatchRows);
+    }
+    {
+        // ── 这一档的内存账单：报**理论量**，不报"建 ctx 造成的 RSS 差"─────────
+        // ⚠ 0.9.212 那一版报的是"建 ctx 前后 RSS 的差"，而它**量错了东西**：
+        // 基线取在**模型加载之后**，那 892 MB 里已经含了模型自己 mmap 进来的页
+        //（bge-large-zh-v1.5-q8_0 本身体量就在那个量级）—— 于是"建 ctx 时恰好
+        // 被 touch 的那几页"被当成了"这一档 ctx 自己吃的"，真机读数是 `+3 MB`，
+        // 而一份 4096 的 ctx 光 output buffer 就不止 3 MB。**一个量不准却看起来
+        // 像量准了的数**，比没有读数更坏（本仓库吃过这一类亏）。
+        //
+        // 所以这一版只报**算得准的**：几份按 `n_ctx` / `n_batch` 分配的 buffer 的
+        // 理论字节数（`n_ctx × 每元素字节`，元素数就在手上，不涉及任何猜测），
+        // 外加**进程 RSS 的绝对值**（标成"含模型 mmap"，不许当增量读）。
+        // 差值哪天真要量，得把基线挪到**加载模型之前**，那是另一件事。
+        //
+        // 三份 buffer 按 `embeddings=true` 的实际分配口径列（llama.cpp）：
+        //   · KV    = n_ctx × n_layer × 2(K/V) × n_embd_kv × 2B（F16 默认）
+        //   · out   = n_ctx × n_embd_out × 4B（F32 —— 池化结果要保精度）
+        //   · compute = 按 n_batch/n_ubatch 切的那份，**只有真机量得出来**，不报数
+        // 前两份是上界（部分模型 K/V 维度与 n_embd 不等，这里按 n_embd 估并
+        // **标注为估算**）；它们的用处是"哪个量级"—— 调小这一格时它跟着降，
+        // 而"降多少"是线性的、可预期的。
+        const long rss_after_ctx_kb = proc_rss_kb();
+        const long long nEmbd   = (long long) llama_model_n_embd(E.model);
+        const long long nEmbdOut= (long long) llama_model_n_embd_out(E.model);
+        const long long nLayer  = (long long) llama_model_n_layer(E.model);
+        // KV：每层每位置 2 个张量（K/V）各 n_embd 个 F16（2 B）
+        const long long kv_mb   = (long long) E.n_ctx * nLayer * 2 * nEmbd * 2 / (1024 * 1024);
+        // output：每位置 n_embd_out 个 F32（4 B）
+        const long long out_mb  = (long long) E.n_ctx * nEmbdOut * 4 / (1024 * 1024);
+        jlog("[embed内存] n_ctx=%d n_batch=%d n_ubatch=%d（每条预算 %d tok，一次最多 %d 条满长）"
+             "估算 KV≈%lld MB + output≈%lld MB（按 n_layer=%lld/n_embd=%lld/n_embd_out=%lld 估，"
+             "不含按 n_batch 切的 compute buffer）｜ 进程 RSS %ld MB（**含模型 mmap**，别当增量读）。"
+             "内存高就调小「嵌入每批上下文」—— 上面两个估算值会跟着线性降；批大小那格不影响这里",
+             E.n_ctx, E.n_batch, E.n_ubatch, E.n_ctx_seq, fullRowsFit,
+             kv_mb, out_mb, nLayer, nEmbd, nEmbdOut, rss_after_ctx_kb / 1024);
+    }
+    // ⚠ `llama_set_embeddings(ctx, true)` 是**必调**的一跳：不调时
+    // `llama_get_embeddings*` 取到的是 nullptr 或未初始化的 output buffer
+    // （取决于库版本），而症状是**静默返回零向量** —— 检索全空，接口 200。
+    // 放在 ctx 建好之后立刻调，与"ctx 在则 embeddings 在"这个不变式绑定。
+    llama_set_embeddings(E.ctx, true);
+    E.embedding = true;      // 角色标记：卸载日志、守卫、以及"这是嵌入那份"的判据都读它
+    // 池化类型**必须**在这里读：它由 ctx 持有（`llama_pooling_type(ctx)`），
+    // 而 nativeEmbed 只有 ctx 可用。放在与 `embeddings=true` 同一段落里，
+    // 让"与嵌入相关的加载期取值"集中在同一处 —— 散开写迟早会漏一个。
+    E.pool_type = (int) llama_pooling_type(E.ctx);
+    E.n_used = 0; E.n_rem = 0;
+    E.pending.clear();
+    E.kv_rounds = 0;
+    embed_failure_reset();
+
+    // ── warm-up：用一次真实前向把 output buffer **写干净**（方案 B 的一条）────
+    // 这一段的**目的**就是它自己写的那句话：让 ctx 里那块 output buffer
+    // 从"未初始化"变成"被真实前向写过"。它的判据不是"跑没跑过前向"，
+    // 而是"**每一行**是不是都被写过"—— 这两件事早先被当成了一件，见下。
+    //
+    // ═══════════════════════════════════════════════════════════════════════
+    // ⚠⚠ 早先那版（BOS 单 token、只要一行输出）有三处必然的错
+    // ═══════════════════════════════════════════════════════════════════════
+    //  ① **CLS 上直接进程级崩溃**。库的门禁在 `llama_batch_allocr::init`
+    //     （vendor `.so` 里符号 `_ZN18llama_batch_allocr4initE…`），认的是
+    //     `llama_batch.logits[]` 覆盖了所有 input token 没有：
+    //       `pooled embedding requires that all tokens are output
+    //        (n_outputs_all = %d, n_tokens_all = %d)`
+    //     而 `init` 在 `llama_context::decode` 的**正常路径**上；
+    //     release（NDK 默认 `-DNDEBUG`）里 `ABORT` 就是 `abort()` →
+    //     BGE 系（`pooling=2`）**每次加载嵌入模型都崩**，连下面那句
+    //     "失败但不影响加载"都来不及打。
+    //  ② **"库会替我们补"补的是真实 input**。`llama_context::decode` 里那条
+    //     `embeddings required but some input tokens were not marked as
+    //     outputs -> overriding` 补的是 **input token** —— 而这里只有 BOS 一个，
+    //     "补"完还是只有第 0 行：**warm-up 想干的事根本没干成**，
+    //     只剩一条假绿日志。
+    //  ③ 于是"只要一个 output 就够"这条推理**每一步都错**：库对 NONE/LAST
+    //     确实只要一个，但"只要一个"的**代价**是剩下的行一个字节都没写 ——
+    //     而 output buffer 是整块分配的，"读一行"按 `n_embd` 走，与"写了哪几行"
+    //     无关。要它变干净只能**整段都进 output**。
+    //
+    // 所以现在的口径只有一条：**batch 与真实编码路径同形** —— 同一套
+    // `plan_pooling` 置位、同一个"给库的门禁"判据（`warmup_plan_usable`）。
+    // warm-up 与真实路径不再各写一套置位规则，也就不存在"两处契约不同"。
+    {
+        // 取一条**真实**的短文本（不是 BOS 单点）：BOS 只有一个 token，
+        // 而 `warmup_plan_usable` 的下限是 2 —— 它同时保证
+        // "LAST 档读的那一行"与"第 0 行"不是同一个位置。
+        static const char * kWarmupText = "warm up";
+        int need = llama_tokenize(E.vocab, kWarmupText, (int32_t) strlen(kWarmupText),
+                                  nullptr, 0, true, true);
+        if (need < 0) need = -need;
+        std::vector<llama_token> wtoks((size_t) (need > 0 ? need : 1));
+        const int got = llama_tokenize(E.vocab, kWarmupText, (int32_t) strlen(kWarmupText),
+                                       wtoks.data(), (int32_t) wtoks.size(), true, true);
+        if (got <= 0) {
+            // 取不到 token 就跳过：热身是"去掉不确定性"，不是功能前提。
+            // 但**必须留日志** —— 静默跳过就是又一条假绿。
+            jlog("[embed] warm-up 跳过：tokenize 失败（不影响加载；首条真实文本仍会尝试）");
+        } else {
+            wtoks.resize((size_t) got);
+            const int wtok = (int) wtoks.size();
+            // **同一个计划函数**：真实路径读哪个 pooling 就走哪一档，
+            // warm-up 不许另立一套（那正是上一版与库门禁分家的地方）。
+            const embedtext::PoolPlan wplan = embedtext::plan_pooling(E.pool_type, wtok);
+            if (!embedtext::warmup_plan_usable(wplan, E.pool_type, wtok)) {
+                // 走到这里说明"这一次热身连形状都不合法"（token 太少 / 池化方式不支持 /
+                // 整段进不了 output）。**不加载失败**，但要说清是哪一条不成立，
+                // 否则用户看到的是"加载好了、检索全空"。
+                jlog("[embed] warm-up 跳过：计划不可用（pooling=%d, n_tokens=%d, valid=%d）"
+                     "（不影响加载；首条真实文本仍会尝试）",
+                     E.pool_type, wtok, wplan.valid ? 1 : 0);
+            } else {
+                const bool all_rows = embedtext::warmup_wrote_all_rows(wplan, wtok);
+                llama_batch wb = llama_batch_init(wtok, 0, 1);
+                if (wb.token) {
+                    for (int i = 0; i < wtok; i++) {
+                        wb.token[i]     = wtoks[(size_t) i];
+                        wb.pos[i]       = (llama_pos) i;
+                        wb.n_seq_id[i]  = 1;
+                        wb.seq_id[i][0] = 0;
+                        // 逐位照计划置：这是与真实路径**同形**的唯一含义。
+                        wb.logits[i]    = wplan.want_logits[(size_t) i] ? 1 : 0;
+                    }
+                    wb.n_tokens = (int32_t) wtok;
+                    if (llama_decode(E.ctx, wb) != 0) {
+                        // warm-up 失败**不影响加载成功**：真前向失败多半是这条
+                        // 固定文本的问题，第一条真实文本仍可能成功。把它变成
+                        // "加载失败"等于用一次热身把整个功能判死，代价远大于收益。
+                        jlog("[embed] warm-up decode 失败（不影响加载；首条真实文本仍会尝试）");
+                    } else if (!all_rows) {
+                        // **如实**说明这一档只写了部分行：NONE/LAST 的库契约就是
+                        // "至少一个 output"，warm-up 写不满是库决定的，不是 bug。
+                        // 但不许假称"写干净了" —— 那会让下一个人以为未初始化
+                        // 内存这个不确定性已经消除（这正是上一版的假绿）。
+                        jlog("[embed] warm-up 只写了 %d/%d 行（pooling=%d 的库契约是"
+                             "「至少一个 output」，整段进不了 output；未初始化内存这个"
+                             "不确定性**未完全消除**）",
+                             wplan.output_count, wtok, E.pool_type);
+                    }
+                    llama_batch_free(wb);
+                } else {
+                    jlog("[embed] warm-up 跳过：batch_init 失败（不影响加载）");
+                }
+                llama_memory_seq_rm(llama_get_memory(E.ctx), 0, -1, -1);
+            }
+        }
+    }
+
+    char desc[256] = {0};
+    llama_model_desc(E.model, desc, sizeof(desc));
+    // 一并打出 pooling / n_embd_out：这三个数决定了"句向量取哪一行、按什么步长读"，
+    // 而它们**只有真机加载时才知道**（GGUF 元数据）。用户报"归一化失败"时，
+    // 这一行是唯一能立刻分辨"池化取错"还是"维度不匹配"的证据 ——
+    // 没有它就只能靠猜，或者让用户自己去看 GGUF 元数据。
+    // 一并打出 n_seq_max / n_ctx_seq / 每条预算：合批之后 `n_ctx`（总量）与
+    // `n_ctx_seq`（**每条**文本能用的位置数）不是同一个数（差 kEmbedBatchRows 倍），
+    // 而"某条文本被截断"这个现象只由后者决定。日志里少打前者时，读的人会拿
+    // 总量去解释截断点（方向错、且与真实原因差 8 倍）。
+    //
+    // ⚠ 再打 **`n_batch` 与 `n_ubatch`**（0.9.211 补）—— 这两个数是**两道独立的门**，
+    // 而这一行此前一个都没打：
+    //   · `n_batch`      —— 因果模型（Qwen3，走 `llama_decode`）那条 `:1711`
+    //                       `n_tokens_all <= n_batch` 的整批容量门；
+    //   · `n_ubatch`     —— 非因果模型（BERT 系 bge，走 `llama_encode`）那条 `:1426`
+    //                       `cparams.n_ubatch >= n_tokens` 的物理切分门。
+    // 0.9.211 之前嵌入这条加载路径 `cp.n_batch` / `cp.n_ubatch` **一个都没显式设**，
+    // 所以这两个数**全是库默认**（`n_batch=2048`，`n_ubatch=min(n_batch,512)`）——
+    // bge-large 那道 512 的门就是这么来的。0.9.212 起它们由 `kEmbedGate` 显式设。
+    // **必须读库的实数**（`llama_n_batch` / `llama_n_ubatch`，落在 `E.n_batch` /
+    // `E.n_ubatch`），不许打我们传给 `cp` 的那个值 —— 打 `cp` 等于担保"库收下了
+    // 我们给的数"，而那正是本仓库被打回来过两次的那种假设。
+    // ⚠ 再补 **`full_rows_fit`**（0.9.213）：这一档"最多一次装几条满长"。
+    // 它是"两道门 × 每条预算"那条不变式的**读数**（见 `batch_full_rows_fit`）——
+    // 有了它，读日志的人不必自己拿两个数去推（本仓库正是靠推在 PR #285 里错了两轮）。
+    // 值 < `kEmbedBatchRows` 时说明离切段只差一步，那一行会在上面额外预警。
+    LOGI("embed model ready: %s, n_ctx=%d, n_ctx_seq=%d, seq_max=%d, threads=%d, "
+         "n_embd=%d, n_embd_out=%d, pooling=%d, n_batch=%d, n_ubatch=%d, full_rows_fit=%d",
+         desc, E.n_ctx, E.n_ctx_seq, E.seq_max, nt, (int) llama_model_n_embd(E.model),
+         (int) llama_model_n_embd_out(E.model), E.pool_type, E.n_batch, E.n_ubatch,
+         fullRowsFit);
+    // ── 0.9.212 起这两个数**是我们设的**（`kEmbedGate`），所以再报一次"设进去的"
+    //    与"库收下的"是否一致 —— 分岔时（库有自己的钳制、或有人改回不传）
+    //    必须能一眼看出，而不是等到某天 abort 了再回头推。
+    if (E.n_batch != gate || E.n_ubatch != gate) {
+        jlog("[embed] ⚠ 两道门没按 kEmbedGate=%d 落值：n_batch=%d n_ubatch=%d（库有自己的钳制？）"
+             "—— 这会让满长的 %d 条一次装不下（切段仍安全，但那几批会多 decode 几次）",
+             kEmbedGate, E.n_batch, E.n_ubatch, kEmbedBatchRows);
+    }
+    return JNI_TRUE;
+}
+
+JNIEXPORT jboolean JNICALL
+Java_com_xiaowan_localinference_LlmEngine_nativeHasEmbedModel(JNIEnv *, jclass) {
+    return (E.model && E.ctx) ? JNI_TRUE : JNI_FALSE;
+}
+
+JNIEXPORT jint JNICALL
+Java_com_xiaowan_localinference_LlmEngine_nativeEmbedDim(JNIEnv *, jclass) {
+    if (!E.model) return 0;
+    return (jint) llama_model_n_embd(E.model);
+}
+
+/**
+ * 输出侧维度（`llama_model_n_embd_out`）—— 库据它分配 output buffer，
+ * 而 `llama_get_embeddings_ith` 按 `n_embd` 步长读。两者在部分模型上不等，
+ * 不等时读一行是未定义行为（见 nativeEmbed 顶部那段注释）。
+ * 暴露出来是为了让 `/health` 与日志能**同时报出**这两个数 ——
+ * 它们的差值就是"为什么某些条归一化失败"的直接答案。
+ */
+JNIEXPORT jint JNICALL
+Java_com_xiaowan_localinference_LlmEngine_nativeEmbedOutDim(JNIEnv *, jclass) {
+    if (!E.model) return 0;
+    return (jint) llama_model_n_embd_out(E.model);
+}
+
+/** 嵌入模型声明的池化类型原值（-1 = 取不到 / UNSPECIFIED）。 */
+JNIEXPORT jint JNICALL
+Java_com_xiaowan_localinference_LlmEngine_nativeEmbedPooling(JNIEnv *, jclass) {
+    if (!E.ctx) return -1;
+    return (jint) E.pool_type;
+}
+
+/**
+ * 最近一次嵌入失败的详情，编码成一个**固定字段顺序**的字符串：
+ * `reason|n_tokens|n_embd|n_embd_out|pooling|norm`
+ *
+ * 为什么用字符串而不是再开 6 个 JNI 出口：这些字段只在"失败之后立刻被读一次"
+ * 这一个场景里用，拆成 6 个方法就有 6 处返回值可能被写成常数（而它们都
+ * 不影响功能、只影响归因 —— 归因错了没人会发现）。一个方法一次取齐，
+ * 解析与拼装的两侧由守卫正面钉住（字段名/顺序/个数）。
+ * 没失败时返回空串（`reason` 为 none 时不该被展示为"失败详情"）。
+ */
+JNIEXPORT jstring JNICALL
+Java_com_xiaowan_localinference_LlmEngine_nativeEmbedLastFailure(JNIEnv * env, jclass) {
+    if (g_embed_fail.reason == embedtext::EmbedFailure::NONE) return env->NewStringUTF("");
+    char buf[256] = {0};
+    snprintf(buf, sizeof(buf), "%s|%d|%d|%d|%d|%.6g",
+             embedtext::failure_name(g_embed_fail.reason),
+             g_embed_fail.n_tokens, g_embed_fail.n_embd, g_embed_fail.n_embd_out,
+             g_embed_fail.pooling, g_embed_fail.norm);
+    return new_string_utf8_safe(env, buf);
+}
+
+/**
+ * 嵌入模型的短描述（`llama_model_desc`）。与 `nativeModelDesc` 同一口径，
+ * 但读的是 **E** —— 双常驻下两份 Session 各有各的模型，用 `nativeModelDesc`
+ * 去报嵌入模型只会拿到对话模型那一份，症状是 `/health` 里
+ * `model` 与 `embed_model` 永远是同一个字符串（看不出到底加载上没有）。
+ */
+JNIEXPORT jstring JNICALL
+Java_com_xiaowan_localinference_LlmEngine_nativeEmbedModelDesc(JNIEnv * env, jclass) {
+    if (!E.model) return env->NewStringUTF("");
+    char desc[256] = {0};
+    llama_model_desc(E.model, desc, sizeof(desc));
+    // 与 nativeModelDesc 同因：desc 按字节截断，中文名可能留下半个多字节序列
+    return new_string_utf8_safe(env, desc);
+}
+
+/**
+ * token id 数组 -> 文本（用**嵌入模型那一份** vocab）。
+ *
+ * ══════════════════════════════════════════════════════════════════════════
+ * 为什么需要它：`/v1/embeddings` 的 `input` 允许是预 tokenize 的 id 数组
+ * ══════════════════════════════════════════════════════════════════════════
+ * 此前本端点**明确拒绝** id 数组（`EmbeddingsApi.fromRequest` 的注释至今保留着
+ * 那份理由：不同模型的 token 语义不同，静默重编码等于换了个输入）。
+ * 用户拍板要求支持之后，做法只能是**诚实的**一条：把 id 用**我们自己的 vocab**
+ * 还原成文本，再走与字符串输入**完全相同**的那条路（tokenize -> 前向 -> 归一化）。
+ * 这样：
+ *   · 调用方给的 id 若本来就来自本模型（同一份 vocab），还原-再分词能往返，
+ *     编码的正是它以为的那段文本；
+ *   · id 若越界（不在 vocab 里）-> 返回空串，调用方报 400 并**说明是越界**，
+ *     而不是拿一个与输入无关的向量、还回 200。
+ *
+ * 不在这里做前向，是因为"id -> 文本"与"文本 -> 向量"是两件事：
+ * 前者只需要 vocab（不需要 ctx），后者才算。分开也让它可被宿主侧单测覆盖。
+ *
+ * `renderSpecial=true`（与生成侧 token_to_piece 同一口径）：special token
+ * 一并文本化，否则 id 里的 BOS/EOS 会被悄悄吞掉，"还原出来的文本"与输入
+ * 不再一一对应 —— 而调用方无从发现。
+ *
+ * 越界 id -> 整个函数返回**空串**（而不是跳过该 id 继续）：跳过会让
+ * "还原出来的文本"与 id 数组不再对应，向量指向一段调用方没给过的文本。
+ */
+JNIEXPORT jstring JNICALL
+Java_com_xiaowan_localinference_LlmEngine_nativeDetokenize(
+        JNIEnv * env, jclass, jintArray jids) {
+    JNI_SPAN("detokenize");
+    if (!jids) return env->NewStringUTF("");
+    if (!E.vocab) {
+        jlog("[detokenize] 无嵌入模型 vocab，返回空串");
+        return env->NewStringUTF("");
+    }
+    const jsize n = env->GetArrayLength(jids);
+    if (n <= 0) return env->NewStringUTF("");
+    std::vector<jint> ids((size_t) n);
+    env->GetIntArrayRegion(jids, 0, n, ids.data());
+    if (env->ExceptionCheck()) { env->ExceptionClear(); return env->NewStringUTF(""); }
+
+    const int32_t nVocab = llama_vocab_n_tokens(E.vocab);
+    std::string out;
+    for (jsize i = 0; i < n; ++i) {
+        const llama_token t = (llama_token) ids[(size_t) i];
+        // 越界就是越界：不 clamp、不跳过、不猜。调用方拿到空串会 400，
+        // 而那正是它需要的信号（"你给的 id 不属于我这份 vocab"）。
+        if (t < 0 || (int32_t) t >= nVocab) {
+            jlog("[detokenize] id[%d]=%d 越界（vocab=%d），整条拒绝", (int) i, (int) t, (int) nVocab);
+            return env->NewStringUTF("");
+        }
+        out += token_to_piece(t, /*renderSpecial=*/true);
+        // 防御性上界：一条 input 不可能有意义的超长文本（与 MAX_INPUT_CHARS 同量级
+        // 的上游判据在 Kotlin 侧）。这里只挡"病态 id 数组把内存吃光"。
+        if (out.size() > 1u << 20) {
+            jlog("[detokenize] id 数组还原文本超过 1MiB，整条拒绝");
+            return env->NewStringUTF("");
+        }
+    }
+    return new_string_utf8_safe(env, out.c_str());
+}
+
+// ── 前向：一条文本 -> 一个已归一化的向量 ────────────────────────────────────
+//
+// 返回 jfloatArray（长度 = n_embd），失败返回 null（**不抛** —— 异常穿过 JNI 帧是 UB）。
+// 调用方按 null 处理为"这一条没有可用向量"，而不是崩。
+//
+// 为什么手工填 batch 而不是用 `llama_batch_get_one`：后者把 `logits` 全置 true 且
+// 不区分序列，而我们只需要**最后一个 token** 的输出（last-token pooling），
+// 且 `llama_batch` 本身是导出结构体（token/embd/pos/n_seq_id/seq_id/logits 全可见），
+// 手工填是合法且唯一精确的做法。
+JNIEXPORT jfloatArray JNICALL
+Java_com_xiaowan_localinference_LlmEngine_nativeEmbed(
+        JNIEnv * env, jclass, jstring jtext) {
+    JNI_SPAN("embed");
+    embed_failure_reset();
+    if (!E.ctx || !E.model || !E.vocab) {
+        jlog("[embed] 无嵌入模型，返回 null");
+        embed_failure_set(embedtext::EmbedFailure::BAD_INPUT, 0, 0, 0, -1, 0.0);
+        return nullptr;
+    }
+    if (!jtext) return nullptr;
+    const char * t = env->GetStringUTFChars(jtext, nullptr);
+    if (!t) return nullptr;
+    std::string text(t);
+    env->ReleaseStringUTFChars(jtext, t);
+    if (text.empty()) {
+        jlog("[embed] 空文本，返回 null（不编造向量）");
+        embed_failure_set(embedtext::EmbedFailure::BAD_INPUT, 0, 0, 0, -1, 0.0);
+        return nullptr;
+    }
+
+    // ── 维度这一对照必须在**读向量之前**成立（方案 B 的核心）────────────────
+    // `llama_get_embeddings_ith` 按 **n_embd** 步长走（头文件 `output_ids[i]*n_embd`），
+    // 而库按 **n_embd_out** 分配 output buffer，两者在部分模型上不相等。
+    // 不等时"读一行"的行为是**未定义**的：n_embd_out 更小就跨进了别的 buffer
+    //（含未初始化的 NaN），表现为"某些条归一化失败"且**时好时坏** ——
+    // 因为失败取决于那块内存之前被谁写过。用户报的"改改词序某次成功之后
+    // 就再也不失败"正是这个机理：成功的那次把 buffer 写干净了。
+    // 所以这里**拒绝继续**，并把两个实数一起报出来（只报"失败"时，
+    // `n_embd != n_embd_out` 与"文本有问题"长得一模一样）。
+    const int nEmbd = (int) llama_model_n_embd(E.model);
+    const int nEmbdOut = (int) llama_model_n_embd_out(E.model);
+    const int poolType = E.pool_type;
+    if (!embedtext::output_dim_ok(nEmbd, nEmbdOut)) {
+        jlog("[embed] 输出维度不匹配：n_embd=%d, n_embd_out=%d（库按 n_embd_out 分配 output buffer，"
+             "按 n_embd 读会跨到别的 buffer）。这一条拒绝编码。", nEmbd, nEmbdOut);
+        embed_failure_set(embedtext::EmbedFailure::DIM_MISMATCH, 0, nEmbd, nEmbdOut, poolType, 0.0);
+        return nullptr;
+    }
+
+    // tokenize（带 BOS）。need<0 = 所需长度；0 = 空串（上面已挡）。
+    int need = llama_tokenize(E.vocab, text.c_str(), (int32_t) text.size(), nullptr, 0, true, true);
+    if (need == 0) {
+        embed_failure_set(embedtext::EmbedFailure::BAD_INPUT, 0, nEmbd, nEmbdOut, poolType, 0.0);
+        return nullptr;
+    }
+    if (need < 0) need = -need;
+    std::vector<llama_token> toks((size_t) need);
+    if (llama_tokenize(E.vocab, text.c_str(), (int32_t) text.size(),
+                       toks.data(), (int32_t) toks.size(), true, true) < 0) {
+        jlog("[embed] tokenize 第二趟失败");
+        embed_failure_set(embedtext::EmbedFailure::BAD_INPUT, 0, nEmbd, nEmbdOut, poolType, 0.0);
+        return nullptr;
+    }
+    // 超长：**截断到 ctx-1**，而不是失败。嵌入的输入是"一条要检索的短文本"，
+    // 超过 ctx 说明分块没做好 —— 但让整次检索失败比"用前 N 个 token 的语义"更糟
+    //（前者是功能不可用，后者只是这一条略差）。两条路都有日志可辨。
+    // ⚠ 截断点是**每条的预算**（`E.n_ctx_seq`），不是 ctx 总量 ——
+    // 合批引入 `n_seq_max>1` 之后这两个数差 `kEmbedBatchRows` 倍，
+    // 按总量截会让文本带着越界的 `pos` 上库（见 Session::n_ctx_seq 的说明）。
+    if ((int) toks.size() >= E.n_ctx_seq) {
+        jlog("[embed] 文本 %d tok 超过每条预算 %d，截断到 %d（分块策略应更小）",
+             (int) toks.size(), E.n_ctx_seq, E.n_ctx_seq - 1);
+        toks.resize((size_t) (E.n_ctx_seq - 1));
+    }
+    if (toks.empty()) {
+        embed_failure_set(embedtext::EmbedFailure::TRUNCATED_EMPTY, 0, nEmbd, nEmbdOut, poolType, 0.0);
+        return nullptr;
+    }
+
+    // 每轮前清 KV：嵌入是**无状态**的逐条前向，条目之间不能互相看见
+    //（复用上一条的 KV 会让这一条的向量混进上一条的语义 —— 检索全错，无声无息）。
+    llama_memory_seq_rm(llama_get_memory(E.ctx), 0, -1, -1);
+
+    // ── 池化要取哪个 token：由**模型自己声明的 pooling_type** 决定 ────────────
+    // 这一段是方案 A 的接口位。`pool_row_index` 是纯函数（宿主侧有单测钉住四种
+    // 类型的下标），native 只负责把"模型怎么说的"喂进去 —— 判据不在这一层，
+    // 免得真机上没法验的语义散在 JNI 里。
+    //
+    // ⚠ 下标语义与下面 `logits[]` 的置位方式**必须同时变**：只改一处就是
+    // "检索全空 / 接口 200"（见 embedtext::output_slot_index 的注释）。
+    const int nTok = (int) toks.size();
+    const embedtext::PoolPlan plan = embedtext::plan_pooling(poolType, nTok);
+    if (!plan.valid) {
+        // 模型声明的池化类型我们还不支持（RANK / 未知）。**不猜** ——
+        // 猜错的表现是"向量算出来了、语义全错"，比直接拒绝难查得多。
+        jlog("[embed] 池化类型 %d 不受支持（n_tokens=%d），这一条拒绝编码", poolType, nTok);
+        embed_failure_set(embedtext::EmbedFailure::BAD_INPUT, nTok, nEmbd, nEmbdOut, poolType, 0.0);
+        return nullptr;
+    }
+    // ── 计划自洽自检（在填 batch **之前**）────────────────────────────────
+    // 三个字段（`row` / `output_slot` / `want_logits`）必须互相支持。
+    // 判据是纯函数 `plan_is_coherent`（宿主侧有单测）：`row` 说"读最后一个
+    // token"，`output_slot` 就必须**真的**指到那一行。只改一处时的报应不是
+    // "这一条失败"，而是静默的"读的不是那一行" —— 真机上表现为
+    // BGE 零范数 / 生成式模型读到 BOS（`范数≈1e-30`），而接口照常 200。
+    if (!embedtext::plan_is_coherent(plan, nTok)) {
+        // ⚠ 这一行**不打印** `plan.batch_last_slot`：它是"读取点用了它"的判据位，
+        // 出现在一条日志里会让那条判据**恒真**（把读取点改回硬编码下标时，
+        // 日志那一行还在，守卫照样绿 —— 本仓库反复记录的那类自欺）。
+        jlog("[embed] 池化计划不自洽：pooling=%d row=%d output_slot=%d "
+             "（读的位置与语义不是同一行 —— 这是填充逻辑的 bug，不是模型问题）",
+             poolType, (int) plan.row, plan.output_slot);
+        embed_failure_set(embedtext::EmbedFailure::POOLING_CONTRACT, nTok, nEmbd, nEmbdOut, poolType, 0.0);
+        return nullptr;
+    }
+
+    llama_batch b = llama_batch_init(nTok, 0, 1);
+    if (!b.token) {
+        jlog("[embed] batch_init 失败");
+        embed_failure_set(embedtext::EmbedFailure::BAD_INPUT, nTok, nEmbd, nEmbdOut, poolType, 0.0);
+        return nullptr;
+    }
+    for (int i = 0; i < nTok; i++) {
+        b.token[i]     = toks[(size_t) i];
+        b.pos[i]       = (llama_pos) i;
+        b.n_seq_id[i]  = 1;
+        b.seq_id[i][0] = 0;
+        // 只要**参与池化的那些 token**的输出（见 plan_pooling）：
+        //   · NONE / LAST  -> 只要最后一个（output 数组恰好 1 个元素）；
+        //   · CLS / MEAN   -> **整段都要**（不是"只用第 0 行"）。
+        // ⚠ CLS 那一支是本轮才修对的：库对 CLS 要求"整段都在 output 里"
+        //（vendor 判据原文 `pooled embedding requires that all tokens are output`），
+        // 而早先的实现只给第 0 个 token 置 1 —— 于是 `llama_decode` 直接返回非 0，
+        // BGE 系**条条失败**，且失败被记成 `decode_failed`（读起来像内存问题）。
+        // 读取侧仍然只读下标 0（CLS 的语义），"多要几行"只多占常驻 output buffer。
+        b.logits[i]    = plan.want_logits[i] ? 1 : 0;
+    }
+    b.n_tokens = (int32_t) nTok;
+
+    // ── 提交给库**之前**先自检：我们填的 logits[] 满足库对该池化方式的前置要求吗 ──
+    // 为什么必须在 decode **之前**：违反这条约束时库的报应不是"这一条失败"，
+    // 而是 ①CLS/MEAN 的 decode 恒失败（`pooled embedding requires that all
+    // tokens are output`）或 ②NONE 的 `n_outputs >= 1` 断言失败（**进程崩溃**）。
+    // 两者在真机上都被读成"模型/内存有问题"，而真实的毛病只是"我们没把该要的行要上"。
+    // 判据是纯函数 `embedtext::logits_ok_for_library`（宿主侧有单测），
+    // 这里只负责把它变成一条**能归因**的失败记录。
+    if (!embedtext::logits_ok_for_library(poolType, plan.want_logits, nTok)) {
+        jlog("[embed] 池化契约不满足：pooling=%d 要求 %s 都在 output 里，实际只要了 %d/%d 个 token"
+             "（这是填充逻辑的 bug，不是模型问题）",
+             poolType, embedtext::library_computes_pooling(poolType) ? "整段" : "至少一个",
+             (int) std::count(plan.want_logits.begin(), plan.want_logits.end(), (char) 1), nTok);
+        llama_batch_free(b);
+        embed_failure_set(embedtext::EmbedFailure::POOLING_CONTRACT, nTok, nEmbd, nEmbdOut, poolType, 0.0);
+        return nullptr;
+    }
+
+    if (llama_decode(E.ctx, b) != 0) {
+        jlog("[embed] decode 失败（n_tokens=%d）", (int) b.n_tokens);
+        llama_batch_free(b);
+        // decode 失败后 KV 里是半截内容 —— 立刻清掉，否则下一条会读到它。
+        llama_memory_seq_rm(llama_get_memory(E.ctx), 0, -1, -1);
+        embed_failure_set(embedtext::EmbedFailure::DECODE_FAILED, nTok, nEmbd, nEmbdOut, poolType, 0.0);
+        return nullptr;
+    }
+    llama_batch_free(b);
+
+    // ── 取向量：按池化计划的**输出槽下标**读，再按池化方式合成 ───────────────
+    // `llama_get_embeddings_ith(ctx, i)` 的 `i` 是 **output 数组下标**，不是 batch 下标 ——
+    // 头文件原文：`llama_get_embeddings(ctx) + ctx->output_ids[i]*n_embd`，
+    // 而 `output_ids` 只收**那些 `llama_batch.logits[j] != 0` 的 token**，
+    // 按它们在 batch 里出现的顺序**连续排列**。
+    // 所以"第几个 output"由 plan_pooling 给出（NONE/LAST 恒为 0；CLS 为 0；
+    // MEAN 需要全部），写成 `n_tokens-1` 时只要文本超过 1 个 token 就取到无效下标，
+    // 表现为 `llama_get_embeddings_ith` 返回 null → 检索全空，**而接口 200**。
+    std::vector<float> vec((size_t) nEmbd, 0.0f);
+    // 读哪一路由 `read_from_seq` 判：**库把池化结果写进 `embd_seq` 的那三档
+    // （MEAN / CLS / LAST）读 seq**，只有 `NONE`（逐 token 写 `embd.data`）读 ith。
+    //
+    // ⚠ CLS 走 seq 是 `554fa67` 才对的，LAST 走 seq 是 `0.9.163` 才补的第三档。
+    // 早先只有 MEAN 走 seq，CLS / LAST 都走了 ith —— 而
+    // `ith` 的前提是 `get_embeddings(ctx)` 有效，那一支**只在 pooling==NONE 时成立**，
+    // CLS 下读的是逐 token 的输出区（池化结果在 `result_embd_pooled` 那个独立张量里），
+    // 拿到的是**全零**而不是 null，于是绕过 no_output 判据、直落 `范数=0`。
+    // 详见 `embedtext::read_from_seq` 上方的推导与用户日志的那一行对照。
+    //
+    // ⚠ 与 `plan.row` 的关系：`plan.row` 与 `read_from_seq` 读的是**同一条**
+    // 库前提（`library_gives_seq`），只是名字不同 —— 前者说"库给了 pooled buffer，
+    // 这一档该走 seq"，后者是那条路在读取侧的**调用入口**。两处都由它分岔。
+    if (embedtext::read_from_seq(poolType)) {
+        // **MEAN(1) / CLS(2) / LAST(3)：读库池化好的那一个**（`llama_get_embeddings_seq`）。
+        //
+        // ⚠ LAST 是 `0.9.163` 才补进来的第三档。前两档修完后 `pooling=3`
+        //（Qwen3-Embedding）**照样**条条失败，因为：
+        //   · MEAN/CLS/LAST 三档在库那一侧都把池化结果写进 `embd_seq`，
+        //     **`embd.data` 一个字节都不写**（只有 NONE 会写它）；
+        //   · 而早先 `read_from_seq` 只认 {1,2}（两档），`pooling=3` 落到 `ith` 支 ——
+        //     读一个"分配了但从未写入"的 buffer，拿到**全零**（不是 null，
+        //     所以绕过 no_output 判据），于是直落 `范数=0`。
+        // 症状之所以看着像"模型不行"：`pooling=2` 的 BGE 走 seq 照常能用，
+        // 只有生成式 decoder 嵌入模型（写 LAST）全败 —— 换模型恰好掩盖了它。
+        //
+        // 为什么 MEAN 不手工累加：库对 MEAN 的池化是它与图一起做的（含 padding
+        // 处理），我们按 output 行做算术平均只是**近似**它 ——
+        // 而"看起来正常的近似向量"正是本仓库最不想要的那类东西（分数像真的、
+        // 语义错、不报错）。我们不再有第二套平均实现，就不存在与库漂移的可能。
+        // 为什么 CLS / LAST 也走这里：池化结果在库的 `embd_seq` 里，
+        // `ith` 那条路（`embd.data`）对这两档根本没有数据。
+        float * pooled = llama_get_embeddings_seq(E.ctx, 0);
+        if (!pooled) {
+            jlog("[embed] get_embeddings_seq 返回 null（pooling=%d 应给出池化向量，n_tokens=%d, n_embd=%d）",
+                 poolType, nTok, nEmbd);
+            embed_failure_set(embedtext::EmbedFailure::NO_OUTPUT, nTok, nEmbd, nEmbdOut, poolType, 0.0);
+            return nullptr;
+        }
+        std::memcpy(vec.data(), pooled, sizeof(float) * (size_t) nEmbd);
+    } else {
+        // ── 从 output 数组里取目标那一项 ─────────────────────────────────
+        // 走到这里的**只有最后一档**：`plan.row == LAST_TOKEN`（= `pooling` 为
+        // `NONE(0)` / `UNSPECIFIED(-1)`，库把逐 token 输出写进 `embd.data`）。
+        // MEAN / CLS / LAST(3) 都被上面的 `read_from_seq` 带走了。
+        //
+        // `slot` **不是** `n_tokens-1`，而是"目标行在 output 数组里的**排位**"
+        // （`output_ids` 只收 `logits[j] != 0` 的 token，按出现顺序连续排列 ——
+        // 头文件原文）。现在只置了最后一个位置 → 它在 output 里排 0。
+        // 写成 `0` / `n_tokens-1` 都只在"恰好只置了一项"时能对上，
+        // 一旦库给的 output 更多就**静默读到别的行**（BOS → 范数 1e-30）。
+        const int slot = plan.row == embedtext::SeqRow::LAST_TOKEN
+                         ? plan.batch_last_slot : plan.output_slot;
+        float * raw = llama_get_embeddings_ith(E.ctx, slot);
+        if (!raw) {
+            // 取不到 = 库没把 output 留下来（embeddings 没设上 / 库版本不同）。
+            // 这是**静默返回零向量**的那条路，必须留日志，否则表现为"检索全空"。
+            jlog("[embed] get_embeddings_ith 返回 null（output_idx=%d, row=last_token=%d, n_tokens=%d, n_embd=%d）",
+                 slot, plan.row == embedtext::SeqRow::LAST_TOKEN ? 1 : 0, nTok, nEmbd);
+            embed_failure_set(embedtext::EmbedFailure::NO_OUTPUT, nTok, nEmbd, nEmbdOut, poolType, 0.0);
+            return nullptr;
+        }
+        std::memcpy(vec.data(), raw, sizeof(float) * (size_t) nEmbd);
+    }
+
+    // ── 归一化：**每一档都由我们做 L2**（库不做） ────────────────────────
+    // 判据是 `normalize_pooling(poolType)`（纯函数，宿主侧有单测）。
+    //
+    // ⚠ 0.9.160 曾让"库给 pooled buffer 的档"跳过归一化，理由是"库自己归过了"。
+    // 那是**错的**：`build_pooling`（vendor 的上游源码，与本仓库 vendor `.so` 里
+    // `result_embd_pooled` 张量名对得上）对 MEAN/CLS/LAST **不做 L2**；
+    // 做归一化的是 `cui-llama.rn` 的 RN 包装层（`common_embd_normalize`），
+    // 而本 App 直接调 C API `llama_get_embeddings_seq`，**不经过那一层**。
+    // 所以拿到的永远是原始池化向量，必须自己归一化（检索侧的 `cosine` 是纯点积，
+    // 前提就是两边都归一化过）。
+    //
+    // 归一化失败（零向量/NaN）时**丢弃**这条：塞进索引会让它与任何查询的余弦
+    // 都是 0/0 = NaN，排序未定义（见 embed_text.h 的 l2_normalize）。
+    // ⚠ 报出**实际范数**（而不是只说"失败"）：`norm=0`（真零向量）与
+    // `norm=1e-38`（下溢）指向完全不同的毛病，而只报"失败"时两者长得一样。
+    const double norm = embedtext::norm_of(vec.data(), vec.size());
+    const bool we_normalize = embedtext::normalize_pooling(poolType);
+    if (we_normalize && !embedtext::l2_normalize(vec.data(), vec.size())) {
+        // `取自=` 把"这一档的向量从哪个位置来"写进日志 —— 它既是给人看的，
+        // 也是**版本判据**：`0.9.162` 起 `pooling=3` 会走到 LIB_POOLED，
+        // 日志里再出现 `pooling=3 … 取自=最后一个 token 的行` 就说明包没换对。
+        jlog("[embed] 归一化失败（范数=%.3g，n_tokens=%d，pooling=%d，取自=%s，n_embd=%d，n_embd_out=%d），丢弃这一条",
+             norm, nTok, poolType,
+             plan.row == embedtext::SeqRow::LIB_POOLED ? "库池化的那一份（get_embeddings_seq）"
+                : plan.row == embedtext::SeqRow::LAST_TOKEN ? "最后一个 token 的行" : "output 数组首项",
+             nEmbd, nEmbdOut);
+        embed_failure_set(embedtext::EmbedFailure::ZERO_NORM, nTok, nEmbd, nEmbdOut, poolType, norm);
+        return nullptr;
+    }
+    // 万一将来某一档真的改由库归一化（`normalize_pooling` 归 false），
+    // 那一份也要有一次"有限性"检查 —— 不判失败标准（我们不是它的作者），
+    // 但 NaN/Inf 一旦进索引，余弦排序就未定义。丢弃比污染整库便宜。
+    if (!we_normalize && !std::isfinite(norm)) {
+        jlog("[embed] 库给的池化向量不是有限数（范数=%.3g，n_tokens=%d，pooling=%d），丢弃这一条",
+             norm, nTok, poolType);
+        embed_failure_set(embedtext::EmbedFailure::ZERO_NORM, nTok, nEmbd, nEmbdOut, poolType, norm);
+        return nullptr;
+    }
+    // ⚠ 分配长度与填充长度**必须是同一个数**（`nEmbd`）。
+    // 这里曾写成 `NewFloatArray(nEmbdOut)` + `SetFloatArrayRegion(out, 0, nEmbd, ...)`：
+    // 两个数不相等时，返回的数组比填进去的多出一截**静默的零尾**
+    //（`jfloatArray` 创建即全零），而调用方拿到的长度是 `nEmbdOut` ——
+    // `buildIndex` 用 `v.size != dim` 判、`EmbeddingsApi` 只用 `vec.isEmpty()` 判，
+    // 于是那截零尾要么让这一条被判失败（看起来像模型抽风），要么**直接进索引**
+    //（归一化后方向偏离，命中率凭空下降，接口 200）。
+    //
+    // 当前上游 `output_dim_ok` 要求 `nEmbd == nEmbdOut` 严格相等，所以两种长度
+    // 恰好相同、这处不爆 —— 但那是**另一道闸**在挡，它挡的是"值相不相等"，
+    // 从来没有保证"分配数 == 填充数"。闸一旦放宽（`embed_text.h` 里那段注释
+    // 正在讨论"输出维度更长时语义被截掉一截"），这里就会静默错。
+    // 所以两个数**只写一个**：分配也用 `nEmbd`。
+    // 判据落在 `tools/embed_robust/check_return_contract.py`（锚的是"同一个标识符"）。
+    jfloatArray out = env->NewFloatArray(nEmbd);
+    if (!out) return nullptr;
+    env->SetFloatArrayRegion(out, 0, nEmbd, vec.data());
+    return out;
+}
+
+
+// ── 合批前向：n 条文本 -> n 个已归一化向量（**一次** `llama_decode`）──────────
+//
+// ISSUE #269 的另一半：PR #273 把"线程数按本机核数"拿回来了（多核这一份），
+// 但流水线仍然是**一条一次前向**。每条一次 decode 的固定开销（建图 / 分配 /
+// 调度 / 同步）与 token 数无关，在 400 字这种小条目上占了大头。这里按
+// `embed_text.h` 的 `plan_batch` 把 n 条塞进同一个 `llama_batch`，
+// **一次** decode 算完。
+//
+// ═══════════════════════════════════════════════════════════════════════════
+// ⚠⚠ 隔离靠 `seq_id`，**不是**靠"反正以前也是清 KV"
+// ═══════════════════════════════════════════════════════════════════════════
+// 单条路径每轮开头 `llama_memory_seq_rm(seq 0, -1, -1)` —— 那是隔离的**做法**。
+// 合批时显然不能"每条之间清 KV"（那就退化成逐条了），于是隔离只能靠把第 j 条
+// 的 token 标 `seq_id = j`：库建注意力掩码时按 seq 分块，不同 seq 互不可见
+// （vendor `.so` 里 `llm_graph_context::build_inp_attn_kv` 那一支）。
+//
+// 也就是说：合批的正确性前提是"库真的按 seq_id 隔离"，而不是"我们没清 KV"。
+// 这两件事必须分开记（隔离本身不由本文件证明，本文件只保证"我们填对了"）：
+//   · 我们填对的判据 = `embedtext::batch_is_valid`（纯函数，宿主侧有单测）；
+//   · 隔离由库保证 —— `plan_batch` 的注释里写明了它的依据。
+//
+// 每一轮开头仍然清**所有** seq（`seq_rm(0..n_seq_max-1, -1, -1)`）：上一批的
+// KV 不该被这一批看见。**不许**只清 seq 0 —— 那样第二排之后的条目会复用到
+// 上一批同号 seq 的 KV，向量里混进上一批的语义，而接口 200。
+//
+// ═══════════════════════════════════════════════════════════════════════════
+// 返回契约：`null` = **整批不可用**（调用方回落逐条），`FloatArray(n*dim)` = 逐条向量
+// ═══════════════════════════════════════════════════════════════════════════
+// 与单条路径"一条失败返回 null"不同，合批里失败可能只发生在**某几条**上
+// （某条太长触发某个退化）。三种处置各自对应一类错：
+//   · 整批 decode 失败 -> 返回 null，调用方**回落逐条**（单条路径能独立归因，
+//     而合批这一层的失败信息量少得多）；
+//   · 某条归一化失败 -> 该条在返回数组里留**全零**，并**把它的下标带出去**
+//     （`nativeEmbedBatchFailed()`）。全零向量不会进索引 —— Kotlin 侧按
+//     `norm == 0` 判失败（与单条路径同一条判据），所以"哪条失败"这件事
+//     在两侧是同一个答案，不需要第二套协议；
+//   · 某条 tokenize 失败 / 空 -> 同上（全零 + 下标）。
+// 为什么不用"整批 null"兜住所有失败：那会让批里**一条**坏文本把整批 8 条
+// 打回逐条重跑，用户看到的进度会莫名倒退；而且坏的那条在逐条路径上会被
+// 正常归因（单条路径本来就有失败明细）。
+//
+// ⚠ 与单条路径的**池化口径必须逐位一致**（见 `plan_batch` 那段）：每条的
+// `pos` 从 0 起、每条的池化计划按**它自己的** token 数算。任何一处漂移都会
+// 让"合批的向量"与"逐条的向量"不是同一个 —— 用户改了批大小，检索结果就变，
+// 而没有任何日志指向这里。
+//
+// ═══════════════════════════════════════════════════════════════════════════
+// 0.9.208：MEAN / CLS / LAST(3) 也走这里了（以前它们被挡在合批外）
+// ═══════════════════════════════════════════════════════════════════════════
+// 这一版撤掉了"库自己池化的档不合批"那道闸（理由见 `embed_text.h::batchable_pooling`）：
+// 那三档的向量在库的 `embd_seq` 里，**每个 seq 一行**，第 j 条读
+// `llama_get_embeddings_seq(ctx, j)` —— 与单条路径（实参写死 0）是同一个 API。
+// 于是取向量这一支**按 `read_from_seq` 分岔**（与单条路径同一个判据），
+// 而 `batch_output_layout_ok`（"每条恰好一个 output"）只对读 `ith` 的那一档成立 ——
+// CLS/MEAN 是**整段**置 1（库的前置门禁），拿它去卡会恒假并把这些档再次打回逐条。
+JNIEXPORT jfloatArray JNICALL
+Java_com_xiaowan_localinference_LlmEngine_nativeEmbedBatch(
+        JNIEnv * env, jclass, jobjectArray jtexts) {
+    JNI_SPAN("embedBatch");
+    embed_failure_reset();
+    if (!jtexts) return nullptr;
+    if (!E.ctx || !E.model || !E.vocab) {
+        jlog("[embedBatch] 无嵌入模型，返回 null（调用方回落逐条）");
+        return nullptr;
+    }
+    const jsize nRows = env->GetArrayLength(jtexts);
+    if (nRows <= 0) return nullptr;
+
+    const int nEmbd = (int) llama_model_n_embd(E.model);
+    const int nEmbdOut = (int) llama_model_n_embd_out(E.model);
+    const int poolType = E.pool_type;
+    // 维度这一对照与单条路径**同一判据**（见 nativeEmbed 里那段推导）：
+    // 不等时读一行是未定义行为，绝不能拿它去填一批。
+    if (!embedtext::output_dim_ok(nEmbd, nEmbdOut)) {
+        jlog("[embedBatch] 输出维度不匹配：n_embd=%d, n_embd_out=%d，整批拒绝（回落逐条）", nEmbd, nEmbdOut);
+        embed_failure_set(embedtext::EmbedFailure::DIM_MISMATCH, 0, nEmbd, nEmbdOut, poolType, 0.0);
+        return nullptr;
+    }
+    // 这一档能不能合批。**0.9.208 起这条判据不再排除任何一档**（见
+    // `embed_text.h::batchable_pooling` 上方那段：`embd_seq` 在多 seq 下
+    // 就是"每个 seq 一行"，第 j 条读 `get_embeddings_seq(ctx, j)`）——
+    // 所以它现在只在 `plan_pooling` 本来就不认的档（RANK / 未知）上为假。
+    //
+    // ⚠ 保留这个调用点（而不是删掉）：它是"哪些档能合批"这**一条判据的
+    // 唯一落点**，删了就散进 `plan_batch` 与下面的 if 里 —— 而那正是本仓库
+    // 反复记录的"同一份清单抄成两份"。守卫正面钉住这里仍然问它。
+    // **拒绝时返回 null 让调用方回落逐条** —— 不是静默降级成"合批但用错口径"。
+    if (!embedtext::batchable_pooling(poolType)) {
+        jlog("[embedBatch] pooling=%d 不在可合批的档里（RANK/未知），返回 null 回落逐条", poolType);
+        return nullptr;
+    }
+    // 条数上限：**超过就返回 null 回落逐条**，而不是截断（截断会让调用方按
+    // 数组长度对齐时错位 —— 与 EmbeddingsApi 拒绝 MAX_INPUTS 同一条理由）。
+    if ((int) nRows > E.seq_max) {
+        jlog("[embedBatch] 批过大（%d > seq_max=%d），返回 null 回落逐条", (int) nRows, E.seq_max);
+        return nullptr;
+    }
+
+    // ── 逐条 tokenize（在填 batch **之前**，因为整批长度要靠它算出来）──────
+    std::vector<std::vector<llama_token>> toks((size_t) nRows);
+    std::vector<int> counts((size_t) nRows, 0);
+    std::vector<char> bad((size_t) nRows, 0);   // 这一条 tokenize 不出来 / 空
+    for (jsize j = 0; j < nRows; j++) {
+        jstring js = (jstring) env->GetObjectArrayElement(jtexts, j);
+        if (js) {
+            const char * t = env->GetStringUTFChars(js, nullptr);
+            if (t) {
+                std::string text(t);
+                env->ReleaseStringUTFChars(js, t);
+                if (!text.empty()) {
+                    int need = llama_tokenize(E.vocab, text.c_str(), (int32_t) text.size(),
+                                              nullptr, 0, true, true);
+                    if (need < 0) need = -need;
+                    if (need > 0) {
+                        toks[(size_t) j].resize((size_t) need);
+                        if (llama_tokenize(E.vocab, text.c_str(), (int32_t) text.size(),
+                                           toks[(size_t) j].data(), (int32_t) toks[(size_t) j].size(),
+                                           true, true) >= 0) {
+                            // 超长：与单条路径**同一口径**截断到 ctx-1（见 nativeEmbed
+                            // 里那段）。这里**不**改口径：合批与单条的截断点不同的话，
+                            // 同一条文本在两条路径上编码的不是同一段 —— 向量不同、
+                            // 长度相同、不报错。
+                            if ((int) toks[(size_t) j].size() >= E.n_ctx_seq)
+                                toks[(size_t) j].resize((size_t) (E.n_ctx_seq - 1));
+                            counts[(size_t) j] = (int) toks[(size_t) j].size();
+                        }
+                    }
+                }
+            }
+            env->DeleteLocalRef(js);
+        }
+        if (counts[(size_t) j] <= 0) bad[(size_t) j] = 1;
+    }
+
+    // ── 合批计划（纯函数）：**失败的条目按 0 token 处理**，不参与本批 ────────
+    // 为什么把坏条目剔出去而不是整批拒绝：批里一条坏文本不该让其余 7 条多跑
+    // 一次（用户看到的进度会倒退）。坏条目的向量位置留全零，由 Kotlin 侧按
+    // 与单条路径**同一条判据**（norm==0）判失败并报出下标 —— 见 nativeEmbedBatchFailed。
+    std::vector<int> live;          // 参与本批的行下标（按原顺序）
+    std::vector<int> liveCounts;
+    for (jsize j = 0; j < nRows; j++) {
+        if (!bad[(size_t) j]) { live.push_back((int) j); liveCounts.push_back(counts[(size_t) j]); }
+    }
+    if (live.empty()) {
+        jlog("[embedBatch] 全批 %d 条都 tokenize 不出（空文本/失败），返回 null 回落逐条", (int) nRows);
+        return nullptr;
+    }
+    const embedtext::BatchPlan plan = embedtext::plan_batch(poolType, liveCounts, E.seq_max);
+    if (!plan.valid) {
+        jlog("[embedBatch] 合批计划不可用（pooling=%d, 条数=%d），返回 null 回落逐条",
+             poolType, (int) live.size());
+        return nullptr;
+    }
+    // 自洽自检（纯函数，宿主侧有单测）——与单条路径的 `plan_is_coherent` 同一
+    // 位置的同一类判据：填 batch 之前先把"我们填的东西对不对"问一遍。
+    if (!embedtext::batch_is_valid(plan, poolType)) {
+        jlog("[embedBatch] 合批计划不自洽（n_tokens=%d, n_rows=%d）——这是填充逻辑的 bug，"
+             "返回 null 回落逐条", plan.n_tokens, plan.n_rows);
+        embed_failure_set(embedtext::EmbedFailure::POOLING_CONTRACT, plan.n_tokens,
+                          nEmbd, nEmbdOut, poolType, 0.0);
+        return nullptr;
+    }
+    // output 排位判据：**只对"每条恰好一个 output"那一类**成立（NONE / UNSPECIFIED，
+    // 读 `ith`）。`batch_output_layout_ok` 的判据是"整批恰有 n_rows 个 1"，
+    // 而 CLS/MEAN 那条路是**整段都置 1**（库的前置门禁要求，见 `plan_pooling`）
+    // —— 拿它去卡会恒假，于是这两档在合批里**又一次**被打回逐条
+    //（上一版是 `batchable_pooling` 挡的，这一版闸撤了：若这里不改，
+    //  症状是"判据说能合批、循环里全在回落"，而日志里两个方向的话都说得通）。
+    //
+    // 所以这个判据**按档分岔**：只有"读 ith"的那一档才要求每条一个 1。
+    // 它在那一条路是 `ith(j)` 取到"第 j 条最后一行"的**全部依据**；
+    // 读 `embd_seq` 的那一档根本不经过 output 数组，拿它去卡是问错了问题。
+    if (!embedtext::read_from_seq(poolType) && !embedtext::batch_output_layout_ok(plan)) {
+        jlog("[embedBatch] output 布局不是『每条一个』（n_rows=%d），返回 null 回落逐条", plan.n_rows);
+        return nullptr;
+    }
+
+    // ── 清**所有** seq 的 KV（见上面那段：只清 seq 0 会让后面几条复用上一批的 KV）──
+    for (int j = 0; j < E.seq_max; j++)
+        llama_memory_seq_rm(llama_get_memory(E.ctx), (llama_seq_id) j, -1, -1);
+
+    // ═══════════════════════════════════════════════════════════════════════
+    //  ⚠⚠ `n_tokens <= n_batch` —— 库在 `decode` 的**正常路径**上断言它
+    // ═══════════════════════════════════════════════════════════════════════
+    // 这一处是 0.9.209 修的**真机闪退**。用户在 104 条上复现，栈是：
+    //
+    //   LM_GGML_ASSERT(n_tokens_all <= cparams.n_batch) failed
+    //   /Users/vali/Desktop/dev/react_native/cui-llama.rn/cpp/llama-context.cpp:1711
+    //   ... llama_decode ... Java_..._nativeEmbedBatch
+    //
+    // release（NDK 默认 `-DNDEBUG`）里断言失败 = `abort()`：不是"这一批失败"、
+    // 不是"回落逐条"，而是**整个进程当场消失**（用户看到的"建索引闪退"）。
+    //
+    // 为什么合批**必然**撞上它：单条路径一条一次 decode，每次最多
+    // `n_ctx_seq - 1` 个 token，与 `n_batch`（默认 2048）无关 —— 所以合批
+    // 之前从来不崩。合批把 8 条塞进**同一个** batch：8 × 511 = 4088 > 2048。
+    // 于是"这一批里长条目凑够几条"就崩，看起来像随机闪退（与文本内容无关）。
+    //
+    // ⚠ 库自己会按 `n_ubatch` 再切（`ubatch.n_tokens == n_seq_tokens * n_seqs`），
+    // 但那条断言在**切分之前** —— "库会替我切"救不了这一批，进程在那之前就没了。
+    // 所以只能我们自己**在提交之前**按整批容量切成几段，一段一次 `llama_decode`。
+    //
+    // ⚠ 切分只按**整条**切：把一条文本劈成两半提交，它的池化结果就不是这一条的
+    // 语义了（而长度、维度、归一化全对）。某一条单独就超 `n_batch` 时，
+    // 整批只能返回 null 让调用方**逐条**跑（单条路径不受 `n_batch` 约束）。
+    const int nBatch = (int) llama_n_batch(E.ctx);
+    if (nBatch <= 0) {
+        // 取不到 `n_batch`（库版本/符号问题）。判据此时**放行**（见
+        // `batch_fits_n_batch` 那段：宁可让库报它自己的错，也不让一个取不到的
+        // 数把整条合批路径永久关掉）—— 但必须留一行，否则"这一批为什么没拦"
+        // 在事后完全查不出来。
+        jlog("[embedBatch] 取不到 n_batch（llama_n_batch 返回 %d），容量判据放行 ——"
+             "若随后 abort 在 llama_decode，先看这一行", nBatch);
+    }
+    // 这一段里**只有一处**回答"能一次提交几条"（`batch_chunk_rows`）。
+    // `batch_fits_n_batch` 不再单独调一次来与它对口径 —— 那会变成同一件事
+    // 由两个函数各答一遍，而两个答案分叉时的报应落在**进程**上（abort）。
+    // 它的职责因此回到"问『整批装不装得下』"这个**单一**的问题上：下面每个
+    // 分段在提交前都拿它过一遍（判据仍排在 `llama_decode` 之前，且是提交的**门禁**，
+    // 而不是装饰），`nBatch <= 0` 时**放行**的语义也仍然只有它一处。
+    // 两份口径的分家由构造保证：分段长度取 `batch_chunk_rows(本段的 counts)`，
+    // 于是每段自己的总和按构造 `<= nBatch`（在能装下的前提下）。
+    int chunkRows = embedtext::batch_chunk_rows(liveCounts, nBatch);
+    if (chunkRows <= 0) {
+        // 0 = 某一条自己就装不进整批。**不是**"这一批不能用合批"，
+        // 而是"合批这条路对这条文本无解"—— 单条路径一条一次 decode，照常能跑。
+        jlog("[embedBatch] 有单条超过 n_batch=%d（本批 %d 条），返回 null 回落逐条"
+             "（单条路径一条一次 decode，不受整批容量约束）", nBatch, plan.n_rows);
+        return nullptr;
+    }
+    if (chunkRows < plan.n_rows) {
+        // 装不下时**按条目边界切成几段、在同一次调用里接着编**（而不是整批回落逐条）。
+        //
+        // ⚠ 出口的选择（0.9.209 与 0.9.210 的分界）写下来免得下一个人改回去。
+        // 三条路都"看起来对"，代价差一个数量级：
+        //   · 整批返回 null，调用方回落逐条 —— 安全，但**整段批大小一起掉到逐条**
+        //     （4~8 条全废，104 条 = 104 次 decode）。0.9.209 就是这么写的；
+        //   · 只提交前几条、余下**记成失败** —— 那几条会进 `buildIndex` 的
+        //     `failedIdx` → 走 `savePartial` → **整个库**被标成"索引待重建"，
+        //     而用户看到的是"这几条坏了"。真相只是"这一批排不下"—— 那属于
+        //     **合批这一层**的事，不该渗透成"这个库要重建"；
+        //   · **接着编**（本版）—— 余下几条留在同一批的循环里继续提交，
+        //     一行都不进 `failedIdx`，落盘行数也不变。不变量是"所有活条都提交过"，
+        //     **不是**"一次提交完"。
+        //
+        // 逐条是这第三条路的**下界**（`chunkRows` 取到 1 时它退化成逐条），
+        // 所以它不会比逐条更慢，也不会比逐条更不准 —— 每一段用的都是**同一个**
+        // `plan` 里的 `BatchRow`（同一份 `pos` / `seq_id` / `logits` 计划）。
+        jlog("[embedBatch] 整批 %d tok 超过 n_batch=%d（本批 %d 条），按容量切段提交"
+             "（首段 %d 条；单条路径不受整批容量约束）",
+             plan.n_tokens, nBatch, plan.n_rows, chunkRows);
+    }
+
+    // ── 逐段提交 ─────────────────────────────────────────────────────────
+    // 返回值：长度 = nRows * nEmbd 的扁平数组（**包括**坏条目 —— 它的那一段是全零）。
+    // 为什么长度按 nRows 而不是 live.size()：调用方按原下标对齐落盘
+    //（`rows[i].vector`），数组长度一变就会整体错位 —— 而错位不报错。
+    jfloatArray out = env->NewFloatArray(nRows * nEmbd);
+    if (!out) return nullptr;
+    std::vector<float> flat((size_t) nRows * (size_t) nEmbd, 0.0f);
+    // 失败条目的下标（原下标），Kotlin 侧取走 —— 与 `lastEmbedFailure` 同一套
+    // "失败详情在失败当场取走"的模式（见 g_embed_fail 的说明）。
+    g_embed_batch_failed.clear();
+
+    int submitted = 0;                       // 已经提交过的**条数**（分段推进）
+    int decodeCount = 0;                     // 本批实际 decode 了几次（读数：切段可观测）
+    while (submitted < plan.n_rows) {
+        // 从 `submitted` 起**这一段**能一次提交几条。
+        // ⚠ 重算而不是"切一整轮再写死"：`nBatch` 是库给的**绝对**上限，
+        // 而"能装几条"取决于这一段自己的 token 数 —— 写死首段的条数会在
+        // 后面几段上悄悄越界（而那正是 abort）。
+        std::vector<int> rest(liveCounts.begin() + submitted, liveCounts.end());
+        const int segRows = embedtext::batch_chunk_rows(rest, nBatch);
+        if (segRows <= 0) {
+            // 不可能到这里：`submitted` 之前的每一段都按"自己的总和 <= nBatch"切完，
+            // 剩下的第一段若为 0 说明剩下的第一条**自己**就超容量 ——
+            // 而它当初会被首段判据返回 0（同一条 `liveCounts`）。
+            // 留着一行日志：真出现时它指向的是"判据被改坏了"，不是"这批太大"。
+            jlog("[embedBatch] 切段自检失败：第 %d 条起 `batch_chunk_rows` 返回 0 ——"
+                 "这是判据的 bug（返回 null 回落逐条）", submitted);
+            embed_failure_set(embedtext::EmbedFailure::POOLING_CONTRACT, plan.n_tokens,
+                              nEmbd, nEmbdOut, poolType, 0.0);
+            return nullptr;
+        }
+        // ⚠ 这一段的 token 数是**段内总量**（`segRows` 条各自的 token 之和），
+        // **不是** `lastRow.begin + lastRow.n` —— 后者的 `begin` 是**整批**下标的
+        // 起点，第二段起就带上了前面几段的偏移（8 条满长时第二段会算出 4088），
+        // 于是"这一段装得下"的判据恒假、整批回落逐条 —— 收益静默丢掉，不报错。
+        // 段内总量按 `plan` 逐条加：它是这一段的**真实**提交数
+        //（`plan.rows[*].n` 就是这一条 tokenize 出来的 token 数）。
+        int segTokens = 0;
+        for (int j = 0; j < segRows; j++)
+            segTokens += plan.rows[(size_t) (submitted + j)].n;
+        // 提交前的门禁（判据在 `llama_decode` **之前**，且是**这一段的**读数）：
+        // `nBatch <= 0` 时 `batch_chunk_rows` 返回全部条数，这里同样放行 ——
+        // 两份口径在"取不到"这一格上一致（不一致时下面这条会松掉，
+        // 而松掉的代价是 abort，所以宁可在这里再问一次）。
+        if (!embedtext::batch_fits_n_batch(segTokens, nBatch)) {
+            jlog("[embedBatch] 容量判据互相矛盾（本段 %d tok, n_batch=%d, 段内 %d 条）——"
+                 "这是判据的 bug，返回 null 回落逐条", segTokens, nBatch, segRows);
+            return nullptr;
+        }
+
+        llama_batch b = llama_batch_init(segTokens, 0, 1);
+        if (!b.token) {
+            jlog("[embedBatch] batch_init 失败（n_tokens=%d，第 %d 段）", segTokens, decodeCount + 1);
+            return nullptr;
+        }
+        // ⚠ 槽位是**段内**下标（`g - segBegin`）：这一段的第一个 token 必须落在
+        // `b` 的第 0 格 —— 直接用**整批**下标 `g` 时，第二段会从 2044 那一格
+        // 开始写而 `b` 只有 2044 格（越界写堆），且第 0..2043 格留空。
+        // `pos` / `seq_id` / `logits` 仍全从计划取（用整批下标 `g`）——
+        // 那是"每条的 pos 从 0 起"与"第 j 条用 seq j"的**唯一**真相来源。
+        const int segBegin = plan.rows[(size_t) submitted].begin;
+        for (int j = 0; j < segRows; j++) {
+            const int gi = submitted + j;                                  // 计划里的行号
+            const embedtext::BatchRow & r = plan.rows[(size_t) gi];
+            const std::vector<llama_token> & tk = toks[(size_t) live[(size_t) gi]];
+            for (int k = 0; k < r.n; k++) {
+                const int g = r.begin + k;
+                const int slot = g - segBegin;                             // 段内槽位
+                b.token[slot]     = tk[(size_t) k];
+                b.pos[slot]       = (llama_pos) plan.pos_of[(size_t) g];
+                b.n_seq_id[slot]  = 1;
+                b.seq_id[slot][0] = (llama_seq_id) plan.seq_of[(size_t) g];
+                b.logits[slot]    = plan.want_logits[(size_t) g] ? 1 : 0;
+            }
+        }
+        b.n_tokens = (int32_t) segTokens;
+
+        // ── 提交前的读数（0.9.211 补）────────────────────────────────────────
+        // 用户报"合批 <N 就闪退"时，**最要紧的那个数**是"这一批真实提交了多少
+        // token / 几条" —— 它在 0.9.210 及以前**一行都没打**，于是"2 条为什么
+        // 也会崩"只能靠倒推（而两个方向的倒推都说得通：块太大 / 门太小）。
+        //
+        // 一行同时给出三个数，让两道门**当场可比**：
+        //   · 本批条数 / 本批 token 数 —— 真实提交量；
+        //   · `n_batch` / `n_ubatch`   —— 库的两扇门（`llama_n_batch` /
+        //     `llama_n_ubatch`，与 `embed model ready` 那一行同源）。
+        // 因果模型的门是 `n_batch`（`:1711`），非因果是 `n_ubatch`（`:1426`）——
+        // 两行并排看就知道撞的是哪一扇，不必再去猜模型的架构。
+        //
+        // ⚠ 打的是**这一段**（切段后）的真实数，不是整批 —— 每段一次 decode，
+        // 撞门也发生在**段**这一级。整批数在上面那条"按容量切段提交"的日志里。
+        jlog("[embedBatch] 提交：本段 %d 条 / %d tok（第 %d 段，本批共 %d 条），"
+             "n_batch=%d n_ubatch=%d",
+             segRows, segTokens, decodeCount + 1,
+             plan.n_rows, nBatch, (int) llama_n_ubatch(E.ctx));
+
+        // 提交给库**之前**的 logits 自检 —— 与单条路径同一道闸（`logits_ok_for_library`），
+        // 但**按条目**问（拿整批去问会得到错的答案：它按 nTokens 判长度，
+        // 而每条的库约束是"该条整段 / 至少一个"）。`batch_is_valid` 内部已经逐条问过，
+        // 这里不再重复 —— 只留一条说明，避免下一个人以为漏了。
+        if (llama_decode(E.ctx, b) != 0) {
+            jlog("[embedBatch] decode 失败（本段 n_tokens=%d，第 %d/%d 段），返回 null 回落逐条",
+                 (int) b.n_tokens, decodeCount + 1, plan.n_rows);
+            llama_batch_free(b);
+            // decode 失败后 KV 里是半截内容 —— 全部 seq 立刻清掉（与单条路径同源）。
+            for (int j = 0; j < E.seq_max; j++)
+                llama_memory_seq_rm(llama_get_memory(E.ctx), (llama_seq_id) j, -1, -1);
+            embed_failure_set(embedtext::EmbedFailure::DECODE_FAILED, plan.n_tokens,
+                              nEmbd, nEmbdOut, poolType, 0.0);
+            return nullptr;
+        }
+
+        // ── 取这一段的向量 + 归一化 ──────────────────────────────────────
+        // ⚠ 取向量这一支**按档分岔**（`read_from_seq`），与单条路径**同一个判据**：
+        //   · MEAN(1) / CLS(2) / LAST(3)：池化结果在库的 `embd_seq` 里，
+        //     走 `llama_get_embeddings_seq(ctx, seq_id)`；合批时第 j 条的 seq_id == 计划行号
+        //     （由 `plan_batch` 保证），所以实参就是 `gi` —— 单条路径那里写死了 0，
+        //     因为它只有一个 seq，**不是**因为"只有第 0 行有数据"。
+        //   · NONE(0) / UNSPECIFIED(-1)：库逐 token 写 `embd.data`，走 `ith`，
+        //     排位 == 这一段内的序（`batch_output_layout_ok` 保证整批"每条一个 1"，
+        //     所以这一段内的排位就是段内下标 j）。
+        //
+        // 上一版这里**只**走 `ith`，而 `batchable_pooling` 把三档挡在外面，
+        // 所以没暴露。闸一撤（0.9.208）若这里不改，BGE / Qwen3 会读到
+        // `embd.data` 那块**从未写入**的内存（池化结果在 `result_embd_pooled`
+        // 那个独立张量里）——全零 -> 逐条 `ZERO_NORM`，而合批这一层会把它们记成
+        // "第 j 条失败"，看起来像"合批把好条目弄坏了"，实际上是我们问了错的那个 API。
+        //
+        // ⚠ 越界判据按**这一段**的条数（`segRows`），不是整批 —— 库的 `embd_seq`
+        // 里这一轮只有这一段那几条被写过（每段之前都清过所有 seq，见上面）。
+        const bool from_seq = embedtext::read_from_seq(poolType);
+        for (int j = 0; j < segRows; j++) {
+            const int gi = submitted + j;              // 计划里的行号（== 这一条的 seq 号）
+            const int rowIdx = live[(size_t) gi];      // 调用方看到的原下标
+            // 取值下标：走 seq 时是**那条的 seq 号**（= gi），走 ith 时是**段内 output 排位**（= j）。
+            // 合批按段提交时这两个数**不再同值**（`gi` 是整批行号、`j` 是段内排位）——
+            // 但**来历**本来就不同（一个是 seq 号、一个是 output 数组下标），
+            // 所以这里仍分两处写：任一侧的布局一变，改动点各自清楚。
+            const int slot = from_seq ? embedtext::pooled_vector_slot(gi) : j;
+            // 越界必须**在调用前**变成一条能归因的拒绝：`get_embeddings_seq` 对越界
+            // 下标没有契约（可能 null、可能返回别的行），而"读到看似正常的别的行"
+            // 正是本仓库最不想要的那类失败（长度维度全对、语义是别人的）。
+            if (from_seq && !embedtext::pooled_slot_is_row(slot, segRows)) {
+                jlog("[embedBatch] seq 下标越界（slot=%d, 本段 %d 条），整批拒绝——这是填充逻辑的 bug",
+                     slot, segRows);
+                embed_failure_set(embedtext::EmbedFailure::POOLING_CONTRACT, plan.n_tokens,
+                                  nEmbd, nEmbdOut, poolType, 0.0);
+                // ⚠ 这里**不许**再 `llama_batch_free(b)` —— `b` 已经在 decode 之后
+                // 还回去了，双重释放是进程级崩溃，而它的现场指向的是这里，
+                // 不是真正的错（越界下标）。
+                return nullptr;
+            }
+            float * raw = from_seq ? llama_get_embeddings_seq(E.ctx, (llama_seq_id) slot)
+                                   : llama_get_embeddings_ith(E.ctx, slot);
+            if (!raw) {
+                jlog("[embedBatch] %s(%d) 返回 null（第 %d 条留零向量）",
+                     from_seq ? "get_embeddings_seq" : "get_embeddings_ith", slot, rowIdx);
+                g_embed_batch_failed.push_back(rowIdx);
+                embed_failure_set(embedtext::EmbedFailure::NO_OUTPUT, plan.rows[(size_t) gi].n,
+                                  nEmbd, nEmbdOut, poolType, 0.0);
+                continue;
+            }
+            std::vector<float> vec(raw, raw + nEmbd);
+            const double norm = embedtext::norm_of(vec.data(), vec.size());
+            if (!embedtext::l2_normalize(vec.data(), vec.size())) {
+                jlog("[embedBatch] 第 %d 条归一化失败（范数=%.3g，n_tokens=%d，pooling=%d），留零向量",
+                     rowIdx, norm, plan.rows[(size_t) gi].n, poolType);
+                g_embed_batch_failed.push_back(rowIdx);
+                embed_failure_set(embedtext::EmbedFailure::ZERO_NORM, plan.rows[(size_t) gi].n,
+                                  nEmbd, nEmbdOut, poolType, norm);
+                continue;
+            }
+            std::memcpy(flat.data() + (size_t) rowIdx * (size_t) nEmbd,
+                        vec.data(), sizeof(float) * (size_t) nEmbd);
+        }
+        llama_batch_free(b);
+
+        // ⚠ 这一段**必须先还 batch 再清 KV**（顺序反了就是"清掉正要读的 seq"）。
+        // 清的是**所有** seq（见本函数顶部那段：只清段内那几个会让下一段
+        // 复用上一段的 KV，向量里混进上一段的语义，而接口 200）。
+        for (int j = 0; j < E.seq_max; j++)
+            llama_memory_seq_rm(llama_get_memory(E.ctx), (llama_seq_id) j, -1, -1);
+
+        decodeCount++;
+        submitted += segRows;
+    }
+    // 切段的读数：**一次调用替库省了几次 decode** 只有这里说得出来。
+    // 只切一段（正常路径）时也打一行 —— 它同时是"这一批没有长到需要切"的证据，
+    // 否则"切段到底生效没生效"只能靠倒推（而两个方向的倒推都说得通）。
+    if (decodeCount > 1) {
+        jlog("[embedBatch] 本批 %d 条解码 %d 次（n_batch=%d，逐条本要 %d 次）",
+             plan.n_rows, decodeCount, nBatch, plan.n_rows);
+    }
+    // 坏条目（tokenize 不出来 / 空）也记进失败下标 —— 它们没有进批，
+    // 但调用方必须知道"是哪几条"，否则那几条的正文会在 UI 上看起来正常。
+    for (jsize j = 0; j < nRows; j++)
+        if (bad[(size_t) j]) g_embed_batch_failed.push_back((int) j);
+    // ⚠ 这里**没有**"没提交的那几条"要记：`submitted` 走到这里必然 == `plan.n_rows`
+    //（上面那个 while 的退出条件就是它）。早先的版本在这里加过一个"从 submitRows
+    // 到 plan.n_rows"的尾巴循环 —— 它是**恒不执行**的死代码，而更坏的是它会让人
+    // 以为"切段"这件事已经做了。
+    // 反过来，"切段"这件事**必须**在循环里做完：给调用方的契约只有两种
+    //（返回 null = 整批回落逐条 / 返回数组 = 这一批每条一个向量），
+    // 少算几条而不记下标时，那几条的正文会在 UI 上看起来正常。
+
+    env->SetFloatArrayRegion(out, 0, nRows * nEmbd, flat.data());
+    return out;
+}
+
+/**
+ * 上一次 `nativeEmbedBatch` 里**失败的那几条**（原下标，升序、逗号分隔）。
+ *
+ * 为什么不能只靠"返回数组里那一段是全零"来判：全零与"这一条真的是零向量"
+ * 在数值上同形，而后者在 `l2_normalize` 的契约里是要**丢弃**的（它没有方向）。
+ * 也就是说"全零"这个读数本身没有区分能力，必须由产生它的那一层把**原因与下标**
+ * 带出来 —— 与 `nativeEmbedLastFailure`（单条路径）同一个取数模式。
+ *
+ * 返回值是逗号分隔的下标串（空串 = 本批全成功）。调用方在**同一把锁内**立刻取走。
+ */
+JNIEXPORT jstring JNICALL
+Java_com_xiaowan_localinference_LlmEngine_nativeEmbedBatchFailed(JNIEnv * env, jclass) {
+    if (g_embed_batch_failed.empty()) return env->NewStringUTF("");
+    std::string out;
+    for (size_t i = 0; i < g_embed_batch_failed.size(); i++) {
+        if (i) out += ",";
+        out += std::to_string(g_embed_batch_failed[i]);
+    }
+    return env->NewStringUTF(out.c_str());
+}
+
 JNIEXPORT jstring JNICALL
 Java_com_xiaowan_localinference_LlmEngine_nativeModelDesc(JNIEnv * env, jclass) {
     if (!S.model) return env->NewStringUTF("");
@@ -1728,11 +3286,126 @@ Java_com_xiaowan_localinference_LlmEngine_nativeModelDesc(JNIEnv * env, jclass) 
     return new_string_utf8_safe(env, desc);
 }
 
+// ═══════════════════════════════════════════════════════════════════════════
+//  模型档案（GGUF 元数据）—— `/v1/models/{id}` 与 `[模型档案]` 日志行的唯一取数口
+// ═══════════════════════════════════════════════════════════════════════════
+//
+// 为什么值得做：App 里关于"这个模型到底是什么"的可读的数**一个都没有** ——
+// 只有一行 256 字节的 `llama_model_desc`（库自己拼的短描述）。
+// 而 `ModelStore.Row.bytes` 是**文件字节**，与**权重字节**、**参数个数**、
+// **上下文上限**是三件完全不同的事。本仓库反复出现的坑正是"哪两个数不是一回事"
+//（文件名写着 4B 实际是别的、文件名写着 Q4_K_M 实际是 IQ4_XS，见 `[HTP判定]` 那一族）。
+// 把库真实读出来的档案接到 `[模型档案]` 日志与 `/v1/models/{id}` 上之后，
+// "这个包是不是这次构建""这份权重到底多大"就不必靠 `ls -l` 和猜。
+//
+// 返回 String[8]（**顺序是接口**，Kotlin 侧 ModelProfile.fromNative 按同一顺序解）：
+//   [0] 权重张量字节（llama_model_size，**不是**文件字节）
+//   [1] 参数个数（llama_model_n_params）
+//   [2] 模型名（GGUF `general.name`）
+//   [3] 训练上下文上限（`llama.context_length`，取不到时回落 llama_model_n_ctx_train）
+//   [4] 架构名（`general.architecture`）
+//   [5] 词表大小
+//   [6] 量化 dtype（`general.file_type`，库内部枚举值，字符串形式）
+//   [7] GGUF 元数据键值对条数
+// 每个数**各自**可以取不到（未加载 / 该字段缺失）；取不到一律回空串，
+// **绝不**回 "0" —— 0 与"读不到"在客户端完全同形，而"0 层"是个不存在的东西。
+//
+// 关于 `llama_model_meta_val_str` 的截断，这里必须写死：
+//   它把值**写进你给的 buffer**，返回**实际长度**，且按头文件约定这个长度**可以 ≥
+//   buffer_size**（返回值 -1 才表示失败）。也就是说 buffer 小了会**静默截断**：
+//   不报错、不抛异常，返回一个"看起来正常"的短串。这正是本仓库最擅长记的那类
+//   "哑得不响"的错。所以下面逐字段判 `n >= (int) sizeof(buf)` —— 判据取 **>=**
+//   而不是 >：等长说明写满了、无法区分"正好写满"与"被截断"，宁可当截断处理。
+//   8 KiB 对 GGUF 里全部 kv 字符串都远远够（最长的是 tokenizer 词表被拼成的大串，
+//   而下面根本不请求那个键）。
+//
+// 关于 `llama_model_size` / `llama_model_n_params` 的溢出：两者声明是 `uint64_t`，
+// 而 JNI 的 `jlong` 是**有符号** 64 位。正常模型（几十 GB、几十 B 参数）离 2^63 差着
+// 九个数量级，但真溢出了会静默变成一个**负数**。所以就地夹到 `INT64_MAX`：
+//   · 夹了也是错的（数不准），但那是**看得见**的错（客户端拿到的不是个合法量级）；
+//   · 不夹则表现为"这个模型大小是 -3 GB"，比截断更难认。宁可要看得见的错。
+static const char * model_meta_query(const char * key) {
+    // 静态缓冲：本函数只由 JNI 调用（单线程语义与 S 的其他访问者相同），
+    // 且返回值立刻被拷进 std::string 数组，不跨调用存活。
+    static char buf[8192];
+    buf[0] = '\0';
+    if (!S.model) return nullptr;
+    const int n = llama_model_meta_val_str(S.model, key, buf, sizeof(buf));
+    if (n < 0) return nullptr;                       // 键不存在 / 库侧失败
+    if (n >= (int) sizeof(buf)) return nullptr;      // 截断了 —— 当"读不到"，不回半截值
+    buf[sizeof(buf) - 1] = '\0';                     // 防御：库未按约定置尾零时兜底
+    return buf[0] ? buf : nullptr;                   // 空值同样按"读不到"处理
+}
+
+JNIEXPORT jobjectArray JNICALL
+Java_com_xiaowan_localinference_LlmEngine_nativeModelMeta(JNIEnv * env, jclass) {
+    // 8 个字段的取值顺序**是接口**：Kotlin 侧 ModelProfile.fromNative 按同一顺序解，
+    // 两边由 tools/run_models_profile_guard.sh 钉住同一个 8。
+    const int kFields = 8;
+    jclass strCls = env->FindClass("java/lang/String");
+    if (!strCls) return nullptr;
+    // 初值**必须是**一个真实空串、且**只造一个**：
+    //   · 用 `nullptr` 当初值会让数组里是 null —— Kotlin 侧声明是
+    //     `Array<String>`（非空元素），解包处会 NPE，而那是"档案读不到"
+    //     最不该付的代价；
+    //   · 每格各造一个 `NewStringUTF("")` 则一次产生 8 个 local ref。
+    //     local ref 表默认 512 格，而这个函数每次 `/v1/models` 都调一次 ——
+    //     泄漏的形态是"跑一阵子之后这个线程上的任何 JNI 调用都失败"，
+    //     与本改动毫无表面关联，最难查。
+    jstring empty = env->NewStringUTF("");
+    jobjectArray out = env->NewObjectArray(kFields, strCls, empty);
+    if (empty) env->DeleteLocalRef(empty);
+    env->DeleteLocalRef(strCls);
+    if (!out) return nullptr;
+
+    auto put = [&](int i, const std::string & v) {
+        jstring s = new_string_utf8_safe(env, v.c_str());
+        if (s) { env->SetObjectArrayElement(out, i, s); env->DeleteLocalRef(s); }
+    };
+    auto put_u64 = [&](int i, uint64_t v) {
+        // 夹到 INT64_MAX：见上方注释（溢出要变成看得见的错）
+        if (v > (uint64_t) INT64_MAX) v = (uint64_t) INT64_MAX;
+        put(i, std::to_string((long long) v));
+    };
+
+    if (!S.model) return out;   // 未加载：8 个空串，调用方据此判「档案不可用」
+
+    put_u64(0, (uint64_t) llama_model_size(S.model));    // 权重张量字节（≠ 文件字节）
+    put_u64(1, (uint64_t) llama_model_n_params(S.model));// 参数个数
+    // ⚠ 下标**不可颠倒**：上面两个都是 `uint64_t` 返回。写反了不报错、类型都对，
+    //   只会让"权重 4 GB / 参数 0.3 个"这种读数悄悄出现在 /v1/models 上。
+    {
+        char buf[256] = {0};
+        if (llama_model_meta_val_str(S.model, "general.name", buf, sizeof(buf)) >= 0) put(2, buf);
+    }
+    {
+        // n_ctx_train = GGUF 声明的**训练时**上下文上限，不是用户设的 n_ctx。
+        // 取不到时回落到 `llama_model_n_ctx_train`（同一个量的库侧接口）。
+        const char * v = model_meta_query("llama.context_length");
+        if (v) put(3, v);
+        else {
+            const int n = (int) llama_model_n_ctx_train(S.model);
+            if (n > 0) put(3, std::to_string(n));
+        }
+    }
+    {
+        char buf[256] = {0};
+        if (llama_model_meta_val_str(S.model, "general.architecture", buf, sizeof(buf)) >= 0) put(4, buf);
+    }
+    put(5, std::to_string((int) llama_vocab_n_tokens(S.vocab ? S.vocab : llama_model_get_vocab(S.model))));
+    {
+        char buf[256] = {0};
+        if (llama_model_meta_val_str(S.model, "general.file_type", buf, sizeof(buf)) >= 0) put(6, buf);
+    }
+    put(7, std::to_string((int) llama_model_meta_count(S.model)));
+    return out;
+}
+
 JNIEXPORT jint JNICALL Java_com_xiaowan_localinference_LlmEngine_nativeCtxSize(JNIEnv *, jclass) { return S.n_ctx; }
 JNIEXPORT jint JNICALL Java_com_xiaowan_localinference_LlmEngine_nativeCtxUsed(JNIEnv *, jclass)  { return S.n_used; }
 // KV 前缀复用的可观测面（/health 用）：上一轮复用了多少 token、新算了多少 token、
 // 以及**已经跑完 prefill 的轮次数**。
-// 返回 int[3] = { last_reuse, last_prefill_tokens, kv_rounds }。
+// 返回 int[4] = { last_reuse, last_prefill_tokens, kv_rounds, last_lcp }。
 //
 // 为什么必须暴露前两个：复用是**纯加速**，效果不体现为任何状态变化 —— 没有这两个数，
 // "缓存到底有没有生效"只能靠读 native 日志，而日志默认是关的。
@@ -1742,10 +3415,11 @@ JNIEXPORT jint JNICALL Java_com_xiaowan_localinference_LlmEngine_nativeCtxUsed(J
 // 只报 kv_valid 会让它们同形，而一个是冷启动、另一个是故障/取消。
 // kv_rounds==0 即"从未跑过"，> 0 且 kv_valid==false 即"跑过但账本已失效"。
 JNIEXPORT jintArray JNICALL Java_com_xiaowan_localinference_LlmEngine_nativeKvCacheStats(JNIEnv * env, jclass) {
-    jintArray a = env->NewIntArray(3);
+    jintArray a = env->NewIntArray(4);
     if (!a) return nullptr;
-    jint v[3] = { (jint) S.last_reuse, (jint) S.last_prefill_tokens, (jint) S.kv_rounds };
-    env->SetIntArrayRegion(a, 0, 3, v);
+    jint v[4] = { (jint) S.last_reuse, (jint) S.last_prefill_tokens, (jint) S.kv_rounds,
+                  (jint) S.last_lcp };
+    env->SetIntArrayRegion(a, 0, 4, v);
     return a;
 }
 
@@ -1777,13 +3451,11 @@ JNIEXPORT jint JNICALL Java_com_xiaowan_localinference_LlmEngine_nativeRssPeakMb
 //   应用列表里显示的占用同源，用户看到的是"关掉 repack 也没省"。
 //   要拿回来只有两条路：`malloc_trim(0)`（把空闲堆段还给内核），或整进程重启。
 //
-// 两条路都试，各自报结果 —— 这是"不锚单一机制"的写法：
+// 做法（**只留能自证安全的那一条**，理由见下方 ISSUE #274）：
 //   ① 先读一次 RSS 作基线；
 //   ② `malloc_trim(0)`（只有 glibc 有这个名字，见文件头的条件 include）；
-//   ③ bionic 上没有 ②，用 `__NR_madvise`(syscall) 对「已释放的块」补 DONTNEED —— 无论
-//      libc 是哪一套都执行（对 glibc 同样无害：对未映射区间内核返回 EINVAL）；
-//      为什么走 syscall 而不是直接调 `madvise(2)`：这样**不依赖 `<sys/mman.h>` 的声明**，
-//      本函数在任何 Android API 级别上都能编过（bionic 的 `madvise` 到 API 21 才有）。
+//   ③ bionic 上没有 ② —— 于是**什么都不做**（旧版在这里补了一段匿名段 DONTNEED，
+//      正是它崩了进程，见下方 ISSUE #274 那段）。
 //   ④ 再读一次，把前后值打进日志 —— **自证**，否则"到底还了没有"又只能靠装机读 /proc。
 //
 // ⚠ 只用"本进程内一定成功"的手段，**不 fork 任何子进程**：本仓库此前在 native probe 里
@@ -1791,6 +3463,42 @@ JNIEXPORT jint JNICALL Java_com_xiaowan_localinference_LlmEngine_nativeRssPeakMb
 //   `mallinfo2`/`mallinfo` 同属 glibc 专有 —— 因此不用它，只在日志里报 RSS 差值。
 //
 // 失败**不影响任何结果**：最坏情况就是"没多还这一份"，与不做之前完全一致。
+//
+// ═══════════════════════════════════════════════════════════════════════════
+// ⚠⚠ 0.9.1xx 现场（ISSUE #274）：旧实现把整段匿名堆 DONTNEED 掉，直接崩进程
+// ═══════════════════════════════════════════════════════════════════════════
+// 旧实现在这里从 /proc/self/maps 挑出**最大的 `rw-p` 私有匿名区间**，对整段
+// `madvise(MADV_DONTNEED)`，理由是"私有匿名段里只会有本进程的堆/静态区，
+// DONTNEED 不影响任何被引用的数据"。**这句是错的**，而且是致命的那种错：
+//
+//   · bionic 的 scudo 把主堆做成一整块 `rw-p` 匿名映射（就是"最大区间"命中
+//     的那一块）。它里面**同时**装着活对象与空闲块 —— DONTNEED 不看这些，
+//     它按页清零。于是活对象的字节被抹成 0。
+//   · 被抹掉的包括 scudo 分配器的 **chunk 头**。下一次 `free()` 读到全 0 的头，
+//     认不出这是自己发出去的块，直接 `abort()`：
+//
+//       [stderr] Invalid 0x732a679000 passed to free: value not allocated,
+//                chunk: 0x732a600000 mapbits: 0 msg:
+//
+//     这就是用户报的"加载对话模型闪退"——崩在**卸载/加载交替的那一刻**，
+//     而不是加载本身：STOP 卸模型 → 这一脚抹堆 → START 重新加载时
+//     分配器第一次 `free` 就撞上被抹坏的头（现场见探针日志，
+//     上一行正是 `[内存] 卸载[对话] RSS 1844 MB → 1844 MB`，紧随其后就是那行 stderr）。
+//
+// 教训与本仓库 `release_populated_pages` 那次**同源**：DONTNEED 只能打在
+// **自己完全拥有、且确定里面没有活数据**的区间上。mmap 那条路是文件映射
+// （按路径认出来的，页是干净的、丢了自己会缺页读回），所以安全；
+// "最大的匿名段"没有任何东西保证它里头没有活对象 —— 它是**猜**的。
+// 一条把"猜"当成判据的内存路径，迟早用一次 SIGABRT 来收学费。
+//
+// 因此本函数**只保留能自证安全的那条路**：
+//   · glibc：`malloc_trim(0)` —— 由分配器自己判断哪些段可还，它知道哪里是空闲的；
+//     bionic 没有这个接口（scudo 也没有等价物），那就**什么都不做**。
+//   · 不碰任何匿名区间。宁可"这一脚没省下内存"，也不做一件可能抹掉活对象的事。
+//     "没省下"是性能问题，"抹掉"是崩溃问题；两者不能放在同一个取舍里比。
+//
+// 保留这一段的意义仍是自证：把 RSS 前后值打进日志，让"到底还了没有"可读 ——
+// 只是现在它能报的最大额度就是 malloc_trim 的那一份。
 extern "C" JNIEXPORT jstring JNICALL
 Java_com_xiaowan_localinference_LlmEngine_nativeReclaimReleasedHeap(JNIEnv * env, jclass) {
     const long before_kb = proc_rss_kb();
@@ -1800,47 +3508,17 @@ Java_com_xiaowan_localinference_LlmEngine_nativeReclaimReleasedHeap(JNIEnv * env
     trimmed = (malloc_trim(0) != 0);
 #endif
 
-    // 扫描一段**本进程的留存地址空间**并对已释放的块补 DONTNEED。起点/终点取自
-    // /proc/self/maps 里私有匿名映射（`rw-p` 且无路径）的**最大区间**，而不是
-    // 写死地址：写死会在不同 ROM 的加载布局上直接失败，而且失败时与"无需归还"同形。
-    // rw-p 的私有匿名段里只会有本进程的堆/静态区，对它 DONTNEED 不影响任何被引用的数据。
-    long madv_ok = 0, madv_fail = 0;
-    void * best = nullptr; size_t best_sz = 0;
-    if (FILE * mf = fopen("/proc/self/maps", "r")) {
-        char line[512];
-        while (fgets(line, sizeof(line), mf)) {
-            unsigned long long a = 0, b = 0;
-            char perms[8] = {0};
-            if (sscanf(line, "%llx-%llx %7s", &a, &b, perms) != 3) continue;
-            // 判据收紧到"私有匿名"：rw-p、且行内第三段之后没有可执行/共享标记。
-            if (strcmp(perms, "rw-p") != 0) continue;
-            // 有路径 = 文件映射，不碰（mmap 那条路已由 [mmap释放] 负责）。
-            if (strchr(line, '/') != nullptr) continue;
-            const size_t sz = (size_t) (b - a);
-            if (sz > best_sz) { best_sz = sz; best = (void *) (uintptr_t) a; }
-        }
-        fclose(mf);
-    }
-    if (best && best_sz) {
-        const long rc = (long) syscall(__NR_madvise, best, best_sz, MADV_DONTNEED);
-        if (rc == 0) madv_ok++;
-        else madv_fail++;
-    }
-
     const long after_kb = proc_rss_kb();
     const long freed_kb = (before_kb >= 0 && after_kb >= 0) ? (before_kb - after_kb) : -1;
 
+    if (freed_kb <= 0) return nullptr;
     char msg[256];
-    if (freed_kb <= 0) {
-        // 没降**不等于**没生效：这一脚只在有空闲段可还时才降。不发现场读数，
-        // 是因为大多数卸载本来就没有可还的（页已经在 free 时被直接 munmap 掉了）。
-        return nullptr;
-    }
+    // bionic 上没有 malloc_trim：这一脚在 Android 上是 no-op，如实写出来 ——
+    // 不写成"已归还"（那会是一条恒真的假读数，本仓库为这种事付过学费）。
+    const char * how = trimmed ? "已调用" : "本 libc 无此接口（不还：匿名段 DONTNEED 会抹活对象，已移除）";
     snprintf(msg, sizeof(msg),
-             "[内存] 归还空闲堆段 RSS %ld MB → %ld MB（还 %ld MB）｜ malloc_trim=%s、"
-             "匿名段 DONTNEED=%ld 处（失败 %ld）",
-             before_kb / 1024, after_kb / 1024, freed_kb / 1024,
-             trimmed ? "已调用" : "本 libc 无此接口", madv_ok, madv_fail);
+             "[内存] 归还空闲堆段 RSS %ld MB → %ld MB（还 %ld MB）｜ malloc_trim=%s",
+             before_kb / 1024, after_kb / 1024, freed_kb / 1024, how);
     return env->NewStringUTF(msg);
 }
 
@@ -2098,12 +3776,13 @@ Java_com_xiaowan_localinference_LlmEngine_nativeNewSampler(
         JNIEnv * env, jclass, jfloat temp, jfloat topP, jfloat minP, jint topK,
         jfloat repPenalty, jint penaltyN, jfloat freqPenalty, jfloat presencePenalty, jlong seed,
         jobjectArray jstops, jstring jschema, jstring jgenPrompt, jstring jtmpl,
-        jboolean jthinkingOn) {
+        jboolean jthinkingOn, jintArray jbiasIds, jfloatArray jbiasVals) {
     jp(">> newSampler temp=%.3f topP=%.3f minP=%.3f topK=%d rep=%.3f n=%d freq=%.3f pres=%.3f seed=%lld"
-       " schema=%s genPrompt=%s think=%d\n",
+       " schema=%s genPrompt=%s think=%d bias=%d\n",
        (double) temp, (double) topP, (double) minP, (int) topK, (double) repPenalty, (int) penaltyN,
        (double) freqPenalty, (double) presencePenalty, (long long) seed,
-       jschema ? "有" : "无", jgenPrompt ? "有" : "无", (int) (jthinkingOn == JNI_TRUE));
+       jschema ? "有" : "无", jgenPrompt ? "有" : "无", (int) (jthinkingOn == JNI_TRUE),
+       jbiasIds ? (int) env->GetArrayLength(jbiasIds) : 0);
     if (!S.ctx) { jp("<< newSampler 无 ctx -> false\n"); return JNI_FALSE; }
     if (S.smpl) { llama_sampler_free(S.smpl); S.smpl = nullptr; }
     llama_sampler * ch = llama_sampler_chain_init(llama_sampler_chain_default_params());
@@ -2130,13 +3809,48 @@ Java_com_xiaowan_localinference_LlmEngine_nativeNewSampler(
             // 预填只把 grammar 推过"首字面量"那一截；真后缀比它长的那一段（错位段）
             // 也要一起咽下去，否则 grammar 的落点与模型续写的位置差着那一段 ——
             // 见 advance_grammar_past_mismatch 的文件头（第十处成因）。
-            if (!sg.gbnf.empty())
-                attach_grammar_sampler(ch, sg.gbnf.c_str(), sg.prefill.c_str(), gp,
-                                       sg.pegLiteral.c_str());
+            attach_grammar_sampler(ch, sg.gbnf.c_str(), sg.prefill.c_str(), gp,
+                                   sg.pegLiteral.c_str());
             if (gp) env->ReleaseStringUTFChars(jgenPrompt, gp);
         }
         if (tm) env->ReleaseStringUTFChars(jtmpl, tm);
         if (sc) env->ReleaseStringUTFChars(jschema, sc);
+    }
+
+    // logit_bias（OpenAI `logit_bias`）：给指定 token 的 logit 加偏置。
+    //
+    // 位置：**在所有选择器与贪心分支之前**，紧跟 grammar（上面那段）。两条理由：
+    //   · 语义上它是"改候选分数"，属于约束类而不是选择类（与 grammar 同一族）；
+    //   · `llama_sampler_init_logit_bias` 的语义是"候选表里 id 相等就加偏置"，
+    //     而候选表在 top_k/top_p/min_p 之后已经被砍小 —— 放在后面会让
+    //     "被砍掉那个 token"的偏置完全不起作用（正偏置尤其明显：它本该把
+    //     一个低分 token 拉回来，放在截断之后就再也拉不回来了）。
+    // 且放在贪心分支**之前**：`temperature=0` 时贪心同样要受偏置影响。
+    //
+    // 词表外的 id 是**空操作**（候选表里没有它就不匹配），不越界、不崩 ——
+    // 所以 Kotlin 侧只做格式校验，语义校验交给这里。仍要报一行数量，
+    // 让"偏置挂上了几条"可查（挂成 0 条与"没给"在客户端看起来一样，但在
+    // 日志里必须区分得开）。
+    {
+        const int n_bias = jbiasIds ? env->GetArrayLength(jbiasIds) : 0;
+        const int n_vals = jbiasVals ? env->GetArrayLength(jbiasVals) : 0;
+        // 两个平行数组长度不等 = 调用方契约破缺。**不**按较短的那个截断使用：
+        // 那会把一个"Kotlin 侧接线写错"的 bug 静默成一个"偏置少了几条"的现象。
+        // 报错并整条不挂 —— 宁可这一轮没有偏置，也不要一半。
+        if (n_bias > 0 && n_bias == n_vals) {
+            std::vector<jint> ids((size_t) n_bias);
+            std::vector<jfloat> vals((size_t) n_vals);
+            env->GetIntArrayRegion(jbiasIds, 0, n_bias, ids.data());
+            env->GetFloatArrayRegion(jbiasVals, 0, n_vals, vals.data());
+            std::vector<llama_logit_bias> lb;
+            lb.reserve((size_t) n_bias);
+            for (int i = 0; i < n_bias; i++) lb.push_back(llama_logit_bias{ (llama_token) ids[i], vals[i] });
+            llama_sampler_chain_add(ch,
+                llama_sampler_init_logit_bias(llama_vocab_n_tokens(S.vocab), n_bias, lb.data()));
+            jlog("[bias] 已挂载 logit_bias 采样器：%d 条\n", n_bias);
+        } else if (n_bias != n_vals) {
+            jlog("[bias] logit_bias 的 id/bias 数组长度不一致（%d vs %d）-> 本轮不挂偏置\n", n_bias, n_vals);
+        }
     }
 
     if (temp <= 0.0f) {
@@ -2191,6 +3905,7 @@ static void kv_invalidate(const char * why) {
     S.last_tokens.clear();
     S.last_reuse = 0;
     S.last_prefill_tokens = 0;
+    S.last_lcp = 0;
     // 注意：**不动** S.kv_rounds —— 它是"跑过几轮"的单调计数，不是账本状态。
     // 作废账本(这份缓存不能用)与"这一轮没跑过"(计数器)是两件事；
     // 把计数一起清零会把 abort 后的 /health 变回"从未跑过"的样子（E-5 要修的就是它）。
@@ -2214,7 +3929,24 @@ Java_com_xiaowan_localinference_LlmEngine_nativeStartCompletion(
     std::string prompt(p);
     env->ReleaseStringUTFChars(jprompt, p);
 
-    // 本轮开始前的采样器复位（stop 状态机等）与上一次的 abort 标志清理。
+    // 本轮开始前的状态清理：清 pending / n_rem / gen_in_ledger，并清上一次的 abort 标志。
+    //
+    // ⚠ 这里**不**、也**不需要**复位采样器（stop 状态机）。原文写的是"采样器复位
+    //   （stop 状态机等）"，而本文件从未调用过 `llama_sampler_reset` —— 那句话与实现
+    //   分叉，是个谎言。真实的不变量是**另一条**：
+    //     `S.smpl` 在每轮生成前都被 `nativeNewSampler` **整条重建**
+    //     （先 `llama_sampler_free(S.smpl)`，再 `llama_sampler_chain_init`），
+    //     而 `newSampler` 由调用方在持 `genLock` 时、`startCompletion` **之前**调，
+    //     于是 `stop_match_ctx`（st / emitted / head_byte）每轮都是全新的。
+    //   所以"上一轮的暂扣/命中状态泄漏到下一轮"这条路径**不成立**。
+    //
+    //   代价：`stop_sampler_reset`（iface 里的 .reset）因此**当前没有调用点**，
+    //   是"接线正确但没人走"的一段代码。保留它是因为它是 `stop_match_ctx` 状态的
+    //   唯一复位入口 —— 一旦将来改成"链复用/跨轮重入"，漏掉它就会让下一轮
+    //   首批正文被整段跳过（emitted 账没清）。这一点由
+    //   `tools/run_gen_state_guard.sh` 正面钉住（"链由 newSampler 重建"与
+    //   "reset 没有调用点"必须**同时**成立，二者只剩一个就是真 bug）。
+    //
     // 注意：**不**在这里清 KV、也**不**在这里作废账本 —— 复用与否由下面的计划决定。
     //
     /// 领取本轮的编号并清除上一轮的取消标志。
@@ -2331,6 +4063,7 @@ Java_com_xiaowan_localinference_LlmEngine_nativeStartCompletion(
     }
     S.last_prefill_tokens = (int) (tokens.size() - start);
     S.last_reuse = plan.reuse;
+    S.last_lcp = plan.lcp;
     // 这一轮真的跑起来了（prefill 完整成功）。/health 用它区分
     // 「从未跑过」与「跑过但账本已失效」——见 Session::kv_rounds 的注释。
     S.kv_rounds++;
@@ -4003,15 +5736,31 @@ JNIEXPORT void JNICALL Java_com_xiaowan_localinference_LlmEngine_nativeFreeSampl
 
 
 JNIEXPORT void JNICALL
-Java_com_xiaowan_localinference_LlmEngine_nativeUnloadModel(JNIEnv *, jclass) { jp(">> unloadModel\n"); unloadModelInternal(); }
+Java_com_xiaowan_localinference_LlmEngine_nativeUnloadModel(JNIEnv *, jclass) { jp(">> unloadModel\n"); unloadModelInternal(S); }
+
+// 卸载**嵌入**模型（只拆 E，绝不碰 S）。与 nativeUnloadModel 分开是两个原因：
+//   1. 双常驻下"卸载对话模型"不该顺带把嵌入模型也拆了 —— 那会让每次换对话模型
+//      都白丢一份嵌入模型与（更贵的）它的 KV；
+//   2. 分开之后各自的守卫可以正面断言"这条路径没有动另一份 Session"，
+//      而共用一条会被参数化掩盖（参数写错就静默拆错那一份）。
+JNIEXPORT void JNICALL
+Java_com_xiaowan_localinference_LlmEngine_nativeUnloadEmbedModel(JNIEnv *, jclass) { jp(">> unloadEmbed\n"); unloadModelInternal(E); }
 
 } // extern "C"
 
-static void unloadModelInternal() {
+// 释放一份 Session 持有的采样器 / 上下文 / 模型。**参数化**而不是只对 S 动手：
+// 双常驻之后进程里有 S（对话）与 E（嵌入）两份，两者都必须能被独立、干净地拆掉。
+// 参数化同时把"拆错那一份"这类错误变成**看得见**的（调用点写的是哪一个变量），
+// 而不是靠"约定只对 S 动手"——约定在 6 个月后没人记得。
+static void unloadModelInternal(Session & s) {
     // 换模型 / 卸载：KV 与它的账本一起没了 —— **必须先作废账本**。
     // 漏掉这一笔的失效很隐蔽：换模型后第一轮会按旧账本"命中复用"，
     // 于是把上一个模型算出的 KV 当成新模型的历史喂进去（不崩、不报错，
     // 只输出一份与 prompt 无关的内容）。这是本功能唯一一个"静默答非所问"的入口。
+    //
+    // 只对**对话**那份作废账本：KV 前缀复用的账本是 chat 路径的东西（kv_prefix.h），
+    // 嵌入路径不读它。但对 E 调用 kv_invalidate 也无害（E 从不写 last_tokens），
+    // 所以这里不做角色分支 —— 少一个分支就少一处能写错的地方。
     kv_invalidate("模型卸载/换模型");
     // 峰值跟着模型走：换模型后重新累计，否则新模型会继承上一个模型的峰值，
     // 读数与"这次加载"对不上（而这一行本来就是对账用的）。
@@ -4026,15 +5775,28 @@ static void unloadModelInternal() {
     //
     // ⚠ 只读 /proc/self/status 的 VmRSS，不猜：读不到就报 -1（与其它探针同一口径）。
     const long rss_before_kb = proc_rss_kb();
-    if (S.smpl)  { llama_sampler_free(S.smpl);   S.smpl = nullptr; }
-    if (S.ctx)   { llama_free(S.ctx);            S.ctx = nullptr; }
-    if (S.model) { llama_model_free(S.model);    S.model = nullptr; S.vocab = nullptr; }
+    if (s.smpl)  { llama_sampler_free(s.smpl);   s.smpl = nullptr; }
+    if (s.ctx)   { llama_free(s.ctx);            s.ctx = nullptr; }
+    if (s.model) { llama_model_free(s.model);    s.model = nullptr; s.vocab = nullptr; }
     const long rss_after_kb = proc_rss_kb();
-    jlog("[内存] 卸载 RSS %ld MB → %ld MB（还 %ld MB）｜ 读数是 VmRSS：已 free 但未归还"
+    // 角色必须出现在日志里：双常驻下"哪一份被拆了"是排障的第一判据 ——
+    // 一行 `[内存] 卸载[嵌入] …` 与 `[内存] 卸载[对话] …` 一眼可辨，
+    // 而共用一行会在"聊到一半模型没了"这类故障里把方向指错。
+    jlog("[内存] 卸载[%s] RSS %ld MB → %ld MB（还 %ld MB）｜ 读数是 VmRSS：已 free 但未归还"
          "内核的匿名页仍计入其中，应用列表里的「占用」同源",
+         s.embedding ? "嵌入" : "对话",
          rss_before_kb / 1024, rss_after_kb / 1024,
          (rss_before_kb >= 0 && rss_after_kb >= 0) ? (rss_before_kb - rss_after_kb) / 1024 : -1);
-    S.n_ctx = 0; S.n_used = 0; S.n_rem = 0;
-    S.pending.clear();
+    s.n_ctx = 0; s.n_used = 0; s.n_rem = 0;
+    s.pending.clear();
+    // 角色标记复位：卸载之后这两份 Session 都回到"空的对话槽"状态。
+    // 不复位会让下一次"加载对话模型"往一个 embedding=true 的槽里写，
+    // 而那个标记决定加载参数（embeddings=true/false）—— 直接串味。
+    s.embedding = false;
+    // 池化类型同理复位（见 Session::pool_type 的注释）：不复位时，
+    // "卸载嵌入 → 加载对话模型 → 误走嵌入路径"会带着上一份模型的池化类型。
+    // 与 embedding 标记同一段、同一理由：**角色相关的加载期状态必须整组复位**，
+    // 漏一个就是一个只在特定顺序下出现的静默故障。
+    s.pool_type = -1;
 }
 

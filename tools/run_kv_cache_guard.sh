@@ -103,6 +103,28 @@ c "LlmEngine 有 discard 出口 resetKvCache" "grep -q 'fun resetKvCache' \$SRC/
 c "native 侧三个出口与 Kotlin 声明一一对应" \
   "grep -q 'nativeKvCacheStats' \$JNI && grep -q 'nativeKvCacheStats' \$SRC/LlmEngine.kt && grep -q 'nativeKvCacheValid' \$JNI && grep -q 'nativeKvCacheValid' \$SRC/LlmEngine.kt && grep -q 'nativeKvCacheReset' \$JNI && grep -q 'nativeKvCacheReset' \$SRC/LlmEngine.kt"
 
+# ── 7) 「没命中」必须拆得开：公共前缀（第 5 步）─────────────────────────
+# 只报 `reuse=0` 时，"差一点没命中"（门槛/容量拦的，值得查）与"两轮 prompt
+# 真的不一样"（开了知识库、检索结果每轮变，要改注入位置）在日志与 /health 上
+# **逐字相同**，用户只能猜。判据锚三件事，缺一不可：
+#   · `Plan` 里有 lcp 字段、且无论是否命中都记下（记在 `return p` 之前）；
+#   · `describe` 真的把它打出来（不是只存着不用）；
+#   · /health 有 kv_lcp_tokens、且取的是引擎实况（不是常量）。
+c "kv_prefix.h 的 Plan 带 lcp（逐 token 公共前缀，不设门槛）" \
+  "grep -q 'int lcp = 0;' \$HDR"
+c "lcp 在两道闸**之前**就记下（未命中时也有值，否则可观测面在关键场景恒为 0）" \
+  "grep -q 'p.lcp = lcp;' \$HDR && awk '/p.lcp = lcp;/{l=NR} /if \(lcp < kMinReuseTokens\) return p;/{m=NR} END{exit !(l<m)}' \$HDR"
+# ⚠ 锚**未命中那一支**的文案（`未命中（公共前缀 `），不锚"文件里出现过公共前缀" ——
+#   后者恒真：命中那一支也带这个标签，于是把未命中支的 lcp 摘掉判据照样绿（桩⑨）。
+c "describe 在**未命中**时也打公共前缀（要能区分门槛拦的还是真的不一样）" \
+  "grep -q '未命中（公共前缀 ' \$HDR"
+c "HttpApi /health 报 kv_lcp_tokens（且取的是引擎实况）" \
+  "grep -q '\"kv_lcp_tokens\":\$kvLcp' \$SRC/HttpApi.kt && grep -q 'kvLcp = if (loaded) LlmEngine.lastLcpTokens' \$SRC/HttpApi.kt"
+c "native kvcache stats 返回 4 个字段（lcp 是第 4 个，别漏进 NewIntArray）" \
+  "grep -q 'jint v\[4\] = { (jint) S.last_reuse, (jint) S.last_prefill_tokens, (jint) S.kv_rounds,' \$JNI"
+c "LlmEngine 暴露 lastLcpTokens（取第 4 个元素）" \
+  "grep -q 'val lastLcpTokens' \$SRC/LlmEngine.kt && grep -q 'nativeKvCacheStats()\[3\]' \$SRC/LlmEngine.kt"
+
 echo ""
 if [ "$bad" = "0" ]; then echo "=== KV 前缀复用守卫：PASS $ok / FAIL 0 ==="; exit 0; fi
 echo "=== KV 前缀复用守卫：PASS $ok / FAIL $bad ==="; exit 1

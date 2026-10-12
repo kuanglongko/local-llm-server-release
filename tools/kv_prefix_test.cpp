@@ -154,6 +154,37 @@ int main() {
         ok(miss.find("复用 100") == std::string::npos, "未命中描述不许出现复用量");
     }
 
+    printf("== 组 9：未命中时必须报出「公共前缀」（第 5 步的可观测面）==\n");
+    // 只报 reuse=0 时，「差一点没命中」与「两轮 prompt 真的不一样」在日志上
+    // 逐字相同，用户只能猜是门槛拦的还是注入位置的问题。lcp 就是那道分界。
+    {
+        // ① 公共前缀 100 > 门槛 16，但 prev_valid=false（账本作废）-> 不复用，
+        //    此时 lcp 仍必须是 100（"差一点"的证据），不能是 0。
+        V prev = seq(100), cur = cat(seq(100), 10);
+        auto p = kvprefix::plan_reuse(prev, cur, false, 4096);
+        ok(p.lcp == 0, "账本无效时不算前缀（prev 不参与）-> lcp 保持 0");
+        auto pv = kvprefix::plan_reuse(prev, cur, true, 4096);
+        ok(pv.lcp == 100, "命中时 lcp = 公共前缀长度（100）");
+
+        // ② 前缀短于门槛：不命中，但 lcp 要如实报出来（不是 0）。
+        V short10 = seq(10), cur10 = cat(seq(10), 7);
+        auto ps = kvprefix::plan_reuse(short10, cur10, true, 4096);
+        ok(!ps.hit(), "前缀 10 < 门槛 16 -> 不命中");
+        ok(ps.lcp == 10, "不命中时 lcp 仍如实报 10（这就是「差一点」的证据）");
+
+        // ③ 描述里带上公共前缀，且未命中那一支也要有。
+        auto d = kvprefix::describe(ps);
+        ok(d.find("公共前缀 10") != std::string::npos, "未命中描述报出公共前缀 10");
+
+        // ④ 两轮真的不同（lcp 很小）—— 与 ③ 的"差一点"在日志上必须能分开。
+        V a = seq(50), b = {7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7};
+        auto pd = kvprefix::plan_reuse(a, b, true, 4096);
+        ok(pd.lcp == 0, "两轮首 token 就不同 -> lcp = 0");
+        auto dd = kvprefix::describe(pd);
+        ok(dd.find("公共前缀 0") != std::string::npos, "完全不同时描述报「公共前缀 0」");
+        ok(dd != d, "「差一点」与「完全不同」的日志必须不是同一句");
+    }
+
     printf("\n%s：PASS %d / FAIL %d\n", g_fail == 0 ? "PASS" : "FAIL", g_pass, g_fail);
     return g_fail == 0 ? 0 : 1;
 }

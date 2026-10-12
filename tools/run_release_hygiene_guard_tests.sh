@@ -23,6 +23,7 @@
 # 运行：sh tools/run_release_hygiene_guard_tests.sh
 set -e
 cd "$(dirname "$0")/.."
+. "$(dirname "$0")/with_worktree_lock.sh"   # 工作区独占锁：见该文件顶部说明
 
 PY=${PYTHON:-python3}
 GUARD=tools/run_release_hygiene_guard.sh
@@ -49,7 +50,13 @@ restore() {
     cp "$TMP/guard.bak" "$GUARD"
     rm -rf "$TMP"
 }
-trap restore EXIT
+# 退出即还原：EXIT / INT / TERM / HUP 都走同一个还原 ——
+# 只 trap EXIT 时，CI 的 kill（默认 TERM）不会触发 EXIT trap，
+# 打桩源码就会留在工作区（正是 #126 那轮脏工作区的机制）。
+# 就地打桩前先抢工作区独占锁：本脚本会改真源码再 trap 还原，
+# 与其他同套路自测并行时会互相盖桩（假红/漏桩）。见 tools/with_worktree_lock.sh。
+worktree_lock_acquire "$0"
+trap restore EXIT INT TERM HUP
 
 run_guard() {
     set +e
@@ -138,6 +145,21 @@ must_red "桩⑪（--skip-hygiene-selfcheck 没注册）" "--skip-hygiene-selfch
 
 reset_src; stub "$GUARD"  "$STUBS/s12_truncated_regex.py"
 must_red "桩⑫（守卫退回截断式正则取 blocked → 正确源码被报假故障）" "发布器自检的结论真的进了 blocked"
+
+# ── 13~15) 桩⑬/⑭/⑮：DROP_EXACT 的三种失效形态（帐目②）────────────────────
+# 这三根针对的是"清单还在、但已经不完整 / 已经空转"的形态：
+#   · ⑬ 少一项（SUMMARY 被误发进发布包的那一项）；
+#   · ⑭ 拼错一个字符（看着齐全，实际恒不命中）；
+#   · ⑮ 定义了却不再被 is_dropped() 读（整份清单一行都没用上）。
+# 与 ①~⑫ 同一规矩：桩全部取自**真正的旧写法 / 最小改动**。
+reset_src; stub "$REL" "$STUBS/s13_drop_exact_item_removed.py"
+must_red "桩⑬（DROP_EXACT 少了 REVIEW-110-SUMMARY）" "DROP_EXACT 含全部 4 个开发期文档"
+
+reset_src; stub "$REL" "$STUBS/s14_drop_exact_typo.py"
+must_red "桩⑭（DROP_EXACT 里名字拼错一个字符）" "DROP_EXACT 的每一项都真的存在于磁盘"
+
+reset_src; stub "$REL" "$STUBS/s15_drop_exact_not_used.py"
+must_red "桩⑮（DROP_EXACT 定义了却不再被 is_dropped 读）" "is_dropped() 真的读 DROP_EXACT"
 
 # ── 还原后必须回到全绿（否则"变红"可能是因为桩没还原掉）──────────────────
 reset_src

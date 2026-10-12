@@ -274,8 +274,14 @@ c "推理期 RSS 采样在 prefill 成功之后被真的调用（不是只定义
 # 锚常量名的话，别人把复位值改成一个新的宏/字面量，判据会红在自己的措辞上
 # （那是"守卫讨厌某种写法"，不是"代码坏了"）；而 `g_rss_peak_kb = ...` 这种
 # 赋值形式是语义本身 —— 去掉赋值就真的没复位。
+# ⚠ 锚点只钉「定义」，不钉声明 —— 本文件里 `unloadModelInternal` 有两处**前置声明**
+# （上面那段"先用后定义"的说明解释了为什么），它们的写法是 `...(Session & s);`、
+# 以分号收尾；**定义**才是以 `{` 收尾的那一处。只写 `[(]` 会命中第一个声明、
+# 取到一段空体（fnbody 从声明行往后数花括号），于是"复位"这一条在代码完全正确时
+# 也是红的 —— 而它红在一个与"复位"无关的措辞上（判据漂移）。
+# 用「`{` 收尾 + 形参带 `Session & s`」同时排掉两处声明。
 c "峰值跨加载周期复位（换模型后不继承上一个模型的数）" \
-  "fnbody \$JNI '^static void unloadModelInternal[(][)][[:space:]]*[{]$' | nocomment | grep -qE 'g_rss_peak_kb[[:space:]]*='"
+  "fnbody \$JNI '^static void unloadModelInternal[(]Session & s[)][[:space:]]*[{]' | nocomment | grep -qE 'g_rss_peak_kb[[:space:]]*='"
 
 c "峰值有对外读数（nativeRssPeakMb），否则只能靠人读日志" \
   "grep -q 'Java_com_xiaowan_localinference_LlmEngine_nativeRssPeakMb' \$JNI"

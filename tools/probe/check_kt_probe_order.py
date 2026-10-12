@@ -17,7 +17,7 @@ if not m:
 # 去掉行内注释，免得注释里提到这些串
 body = "\n".join(line.split("//")[0] for line in m.group(0).splitlines())
 call = body.find("nativeProbeInit(dir.absolutePath")
-early = body.find("if (!probeEnabled) return null")
+early = body.find("if (!probeEnabled) return")
 if call < 0:
     print("startProbe 里没有调 nativeProbeInit(dir.absolutePath, ...)", file=sys.stderr)
     sys.exit(1)

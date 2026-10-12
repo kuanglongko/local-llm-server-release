@@ -71,8 +71,13 @@ c "401 带 WWW-Authenticate 头（告诉客户端该带什么凭据）" \
 # ── 3) 硬安全承诺：token 绝不进日志 / 错误正文 ─────────────────────────────
 # 这几条是"防手滑"：调鉴权时最自然的调试动作就是把收到的凭据打出来，
 # 而那一行日志会永久留在 logcat / 导出文件 / Issue 截图里。
+# ⚠ 判据只点名**真正打印凭据**的形态（`req.auth` / `bearer(`）。原来还带一个
+# 裸 `got`：它想抓的是"把收到的凭据存进某个 got 变量再打出来"，但那是个普通英文
+# 词，`gotBodyBytes`（截断 body 的**字节数**，与凭据无关）也会命中 ——
+# 于是守卫会因为一句合法的日志而红。收窄成点号形态：既仍抓得住真坏法
+#（`auth=${req.auth}` 这条桩见 run_auth_guard_tests.sh 桩⑤），又不误伤。
 c "鉴权拒绝的日志不打印收到的凭据" \
-  "! grep -qE 'emitLog\\(.*(req\\.auth|got|bearer\\()' \$HTTP"
+  "! grep -qE 'emitLog\\(.*(req\\.auth|bearer\\()' \$HTTP"
 c "鉴权拒绝的日志点明了是「没带」还是「不匹配」（否则无法归因）" \
   "grep -q '凭据不匹配' \$HTTP && grep -q '未带 Authorization 头' \$HTTP"
 # 错误正文只来自 ApiAuth.verdict（唯一一处措辞），HttpApi 不另编一套。
@@ -147,8 +152,12 @@ c "思考开关用的是 addFull（与采样参数同一套整行布局，不是
 # ── 7) 文档：token 的用法与"它不是访问控制"都要写清 ────────────────────────
 c "README 写明 Authorization: Bearer 的用法" \
   "grep -q 'Authorization: Bearer' \$README"
+# 这条原写成 `grep -q '带鉴权' || grep -q '免鉴权'`：README 里从没有"带鉴权"这个词
+#（写的是"一律免鉴权"/"无鉴权"/"豁免鉴权"），第一支**恒不命中**，一直靠第二支兜底
+#（甲-1 判据② 抓到的死支）。现在锚在 README 现文上，并补上它承诺的那几个端点。
 c "README 写明哪些端点免鉴权（/health、/v1/models、OPTIONS、GET /）" \
-  "grep -q '带鉴权' \$README || grep -q '免鉴权' \$README"
+  "grep -q '一律免鉴权' \$README && \
+   grep -q 'GET /health' \$README && grep -q 'OPTIONS' \$README"
 c "README 写明默认不开（保持旧行为）" \
   "grep -q '默认不开' \$README || grep -q '未设 token' \$README || grep -q '默认不开启' \$README"
 c "README 写明它不是访问控制（与 CORS 同一句提醒）" \

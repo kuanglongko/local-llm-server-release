@@ -70,11 +70,18 @@ native 闪退发生在 `abort()` / `SIGSEGV` 之后，JVM 侧拿不到任何遗�
 （`UncaughtExceptionHandler` 覆盖不到 native abort，`llama_log_set` 缓冲里的日志也会丢）。
 所以取证不能只靠 Kotlin 日志，要靠 native 侧自己直写文件。
 
-**打开**：设置页 →「崩溃取证（探针）」→ 打开 → **完全退出 App 再启动**。
+**打开**：设置页 →「崩溃取证（闪退排查）」→ 打开「崩溃取证模式」→ **完全退出 App 再启动**。
 
 **取证据**：复现闪退后重开 App → 日志页 →「导出崩溃探针」，得到 `probe-<时间戳>.txt`。
 这一份已含排查所需的全部内容：native 探针原文（含信号现场与逐 token 原始输出）、
 Kotlin 本次与上次会话全文、设备/后端/变体/Boot ID。
+
+**两份日志的分工**（`0.9.x` 修正常量「取证模式吞日志」后）：取证模式开着时，
+`probe-native.log` = native 全量（`llama_log_set` 的 sink 直写，含 GGUF 解析 / tensor 装载）
++ stderr 遗言（`ggml_abort` 那类只往 fd 2 打的行）+ 逐 token 原始流 + 信号现场；
+`session-*.log` 同时保留 Kotlin 侧全量且**不折叠**（进程没崩时便于一次读完）。
+两份合起来才是全量 —— 此前取证模式下 Kotlin 侧主动不写会话文件、且 `probe_log_sink`
+是空函数，于是"加载模型"那段只剩 `>> loadModel` 骨架，看着像"什么都没干"。
 
 **怎么读**：
 
@@ -86,6 +93,19 @@ Kotlin 本次与上次会话全文、设备/后端/变体/Boot ID。
 | 只有 `[boot]` 开头的内容 | 崩点落在 Kotlin → native 之间，native 业务还没开始跑 |
 | 一条 `[boot]` 都没有 | native 库根本没跑起来（`loadLibrary` 失败或拿的是旧包） |
 | `UnsatisfiedLinkError: nativeProbeInit` | `.so` 与 `.kt` 不是同一次构建（覆盖安装 / native 未重编） |
+
+**文件的重置与保留**（Issue #238 日志一轮）：
+
+- `probe-native.log` **每代一份**：每次冷启动（`nativeProbeInit` 打开文件前）把上一份滚成
+  `probe-native.log.prev`，本代从零写。只留两代 —— 用 `rename` 而不是 `unlink`，
+  因为崩前那几行在前面，删掉等于把上次那座现场扔掉。滚动失败**不阻断**取证，只留一行 `LOGW`。
+- `session-*.log` 保留最近 `LogFileStore.KEEP`（8）个会话，排序口径是**文件名里的时间戳**
+  （`session-yyyyMMdd-HHmmss.log`）。此前用的是 `lastModified()`，而本次会话文件在筛"上一次"
+  之前就已创建、mtime 立刻是 now —— 于是本次永远排第 1，`drop(KEEP-1)` 恰好删掉
+  **上一次会话**。那句"保留最近 8 个会话，够回溯"从写下那天起就没成立过。
+- **目前没有体积上限**，这是有意的：上限值要先有实测数据（单轮写多少字节 × 想保留几轮现场），
+  在有数据之前拍一个圆整数写死，等于用一个新的没有依据的数去替一个没有数。
+  所以探针文件会一直长；嫌占地方就关开关或直接删文件（下次冷启动照建）。
 
 **探针自身的兜底**（`0.9.113`，模块 K 修复后）：
 

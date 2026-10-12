@@ -35,8 +35,11 @@ class App : Application() {
                     appendLine("time=${java.util.Date()}")
                     appendLine("---- stack ----")
                     appendLine(sw)
-                    appendLine("---- recent engine logs (${LlmEngine.recentLogs().size} lines) ----")
-                    appendLine(LlmEngine.recentLogs().joinToString("\n"))
+                    // 崩溃现场必须取**全量**：日志页的过滤档位与"哪些行进了 ring"无关，
+                    // 用过滤后的取数会让这份现场在有档位时凭空少掉几段。
+                    val ring = LlmEngine.recentLogsUnfiltered()
+                    appendLine("---- recent engine logs (${ring.size} lines) ----")
+                    appendLine(ring.joinToString("\n"))
                 }
                 // 私有 filesDir 保底 + 外部目录便于用户直接取
                 runCatching {

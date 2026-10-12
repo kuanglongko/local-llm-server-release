@@ -33,9 +33,12 @@ set -e
 cd "$(dirname "$0")/.."
 SRC=app/src/main/java/com/xiaowan/localinference
 SS=$SRC/SessionStore.kt
+LFS=$SRC/LogFileStore.kt
+PLT=tools/pure_logic/PureLogicTest.kt
 TS=$SRC/ThinkStream.kt
 SP=$SRC/SamplingParams.kt
 TC=$SRC/ThinkingControl.kt
+PY=${PYTHON:-python3}
 
 ok=0; bad=0
 c() { if eval "$2"; then echo "PASS  $1"; ok=$((ok+1)); else echo "FAIL  $1"; bad=$((bad+1)); fi; }
@@ -53,9 +56,13 @@ c "旧形状（size > 2 当先决条件的复合 while）已绝迹" \
   "! grep -q 'sumOf .* > 24000 && msgs.size > 2' \$SS"
 c "裁剪逻辑抽成独立函数（可与条数保底分开处理）" \
   "grep -q 'private fun capChars(' \$SS"
+# S1 起第二半换成"逐条收窄"那两行，且**不再是**对 `msgs[i]` 的无条件下标 ——
+# 后者正是"从最新往前截、啃掉当轮提问"的旧形状，现在只允许出现在注释与对照桩里。
 c "先按上限裁历史、再把剩余超限量逐条截断（两级口径）" \
   "grep -q 'while (msgs.size > MIN_MSGS && total() > MAX_CHARS) msgs.removeAt(0)' \$SS && \
-   grep -q 'msgs\[i\].put(\"content\", cur.substring(0, cur.length - cut))' \$SS"
+   grep -q 'msgs\[at\].put(\"content\", cur.substring(0, cur.length - cut))' \$SS && \
+   ! grep -vE '^\s*(//|\*)' \$SS | grep -q 'msgs\[i\].put(\"content\"'"
+
 # 判据只看**代码行**（注释里保留了旧写法的引用，那是给后来人看的）：
 # 以 `//` 或 `*` 开头的行不算。
 c "保底条数是具名常量，且代码里不再有 `msgs.size > 2` 这种先决条件" \
@@ -105,6 +112,42 @@ c "null 不得吞掉后续判据（kwargs / reasoning_effort 仍要被读到）"
   "grep -q 'val kwEt = j.optJSONObject(\"chat_template_kwargs\")?.opt(\"enable_thinking\")' \$TC"
 c "与 SamplingParams 的 null=Absent 判据一致（两处都排除 isNull）" \
   "grep -q 'if (!j.has(key) || j.isNull(key)) return Read.Absent' \$SP"
+
+# ── 5) 日志页筛选：宿主复刻与实现必须指向同一批判据 ──────────────────────
+# 复刻测试（PureLogicTest.kt）里的 matches/keywordMatches 是**抄的一份控制流**。
+# 只测自己抄的那一份，等于在测"我写的一份近似"—— 所以这里把两侧的字面量对齐钉住：
+# 复刻里出现的档位名与提示语，必须仍是实现里那几句；反过来，实现侧的取数判据
+# 必须仍是常量引用（不得退化成 startsWith("[内存]") 字面量）。
+c "复刻测试里出现四个档位名（与实现同源）" \
+  "grep -q '筛选：复刻用的档位名就是源码里的常量值' \$PLT"
+c "复刻测试钉了「正文里提到标签不算命中」这条反例" \
+  "grep -q '正文里提到标签不算命中' \$PLT"
+# 多选引入的两条新反例：它们各自的坏法都是一个"看不出是 bug"的空白页。
+c "复刻测试钉了「一个都没选 = 全部」这条多选反例" \
+  "grep -q '一个都没选 = 全部' \$PLT"
+c "复刻测试钉了「仅错误单独选时不看标签」这条收窄反例" \
+  "grep -q '单独选时\*\*不看标签\*\*' \$PLT"
+c "复刻测试钉了关键字的三条（子串 / 大小写 / 空即不筛）" \
+  "grep -q '关键字：大小写不敏感' \$PLT && grep -q '关键字：空串不筛' \$PLT"
+# 用 python 而不是 `grep 'TAG_MEM = "[内存]"'`：shell 的引号层数会把内层双引号吃掉，
+# 判据会退化成"出现过 TAG_MEM"，那正是本仓库反复栽的**恒真**形态。
+# 走 python3 的 sys.argv 而不是内联 heredoc —— 内联时这段代码要先穿过
+# shell 的**双引号层**，里面任何双引号都得成对转义，本仓库已经在这上面栽过
+# （桩里最需要原样的源码字面量会被 heredoc 的引号层数吃掉，见 release_hygiene 那段）。
+c "复刻测试与源码里的 TAG_* 常量逐条比对（防复刻漂移）" \
+  "\$PY tools/log_filter/check_tag_sync.py \$PLT \$LFS"
+
+c "实现侧 matches 仍是常量引用而非字面量" \
+  "grep -q 'MEM in keys && l.startsWith(TAG_MEM)' \$LFS"
+# 多选的两条实现侧判据（复刻侧已各钉一遍，这里钉实现侧那几行）。
+c "实现侧「空集合 = 全部」仍是显式的一支" \
+  "grep -q 'val byLabel = if (!anyLabel(keys)) true else labelMatch(keys, l)' \$LFS"
+c "实现侧「仅错误」经 errorOnly 判（不在两处各抄一次 ERR）" \
+  "grep -q 'return byLabel && (!errorOnly(keys) || isError(l))' \$LFS"
+c "实现侧关键字走 ignoreCase 的 contains（不是 equals/startsWith）" \
+  "grep -q 'line.contains(keyword, ignoreCase = true)' \$LFS"
+c "实现侧空白页提示的两句话与复刻一致" \
+  "grep -q '日志为空：还没有写入任何日志行' \$LFS && grep -q '日志为空：还没有写入任何日志行' \$PLT"
 
 echo
 echo "=== 纯逻辑接线守卫：PASS $ok / FAIL $bad ==="

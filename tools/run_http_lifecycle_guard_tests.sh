@@ -16,6 +16,7 @@
 # 纯 sh + python3 标准库，不依赖工具链。运行：sh tools/run_http_lifecycle_guard_tests.sh
 set -e
 cd "$(dirname "$0")/.."
+. "$(dirname "$0")/with_worktree_lock.sh"   # 工作区独占锁：见该文件顶部说明
 
 PY=${PYTHON:-python3}
 GUARD=tools/run_http_lifecycle_guard.sh
@@ -30,7 +31,14 @@ ck() { if [ "$2" = "1" ]; then echo "PASS  $1"; ok=$((ok+1));
 TMP=$(mktemp -d)
 cp "$HTTP" "$TMP/http.bak"
 restore() { cp "$TMP/http.bak" "$HTTP"; rm -rf "$TMP"; }
-trap restore EXIT
+# 退出即还原：EXIT / INT / TERM / HUP 都走同一个还原 ——
+# 只 trap EXIT 时，CI 的 kill（默认 TERM）不会触发 EXIT trap，
+# 打桩源码就会留在工作区（正是 #126 那轮脏工作区的机制）。
+# 就地打桩前先抢工作区独占锁：本脚本会改真源码再 trap 还原，
+# 与其他同套路自测并行时会互相盖桩（假红/漏桩）。见 tools/with_worktree_lock.sh。
+worktree_lock_acquire "$0"
+trap restore EXIT INT TERM HUP
+
 reset_src() { cp "$TMP/http.bak" "$HTTP"; }
 
 # must_red "<桩名>" "<期望被点名的那条断言>"
@@ -286,13 +294,98 @@ reset_src
 "$PY" - $HTTP <<'PYEOF'
 import sys
 p = sys.argv[1]; s = open(p, encoding="utf-8").read()
-old = "        s.soTimeout = 15_000  // 15s 内未收到完整请求即断开；生成期只写不读，不受影响"
+old = "        s.soTimeout = headTimeoutMs"
 new = "        s.soTimeout = 0  // 永不超时（反例：满员后容量不自愈）"
 assert s.count(old) == 1, "stub18: anchor not found"
 open(p, "w", encoding="utf-8").write(s.replace(old, new, 1))
 PYEOF
 must_red "桩⑱（读超时被改成 0）" "读超时不许被改成 0"
 must_red "桩⑱（读超时被改成 0）" "有非零读超时"
+reset_src
+
+# ── 桩⑲~㉓（Issue #159：后台冻结自愈）──────────────────────────────────────
+# 全部取自这一轮真正的**旧写法**，不是编出来的反例。
+#   ⑲ 探活失败即重启（本轮要防的那个"每一句读起来都对"的写法）
+#   ⑳ 消费登记时不查空闲（于是"欠一次重启"会在流还在跑时被消费掉）
+#   ㉑ 看门狗不再在生成期跳过 socket 探活
+#   ㉒ 探活超时退回 2s（后台被冻时自造失败）
+#   ㉓ 冻结不记账（痕迹永远为 0，"有没有被冻"永远验不了）
+#   ㉔ 首字节超时退回静默断连（客户端分不清"服务满"与"服务挂"）
+for stub in 19 20 21 22 23 24; do :; done
+
+"$PY" - $HTTP <<'PYEOF'
+import sys
+p = sys.argv[1]; s = open(p, encoding="utf-8").read()
+old = """                    if (failStreak >= FAIL_STREAK_LIMIT) {"""
+new = """                    if (failStreak >= FAIL_STREAK_LIMIT) {
+                        if (restartListenerIfDesired("反例：探活失败即重启")) { failStreak = 0; continue }"""
+assert s.count(old) == 1, "stub19: anchor not found"
+open(p, "w", encoding="utf-8").write(s.replace(old, new, 1))
+PYEOF
+must_red "桩⑲（探活失败即重启）" "watchdog 在探活失败处不直接重启"
+reset_src
+
+"$PY" - $HTTP <<'PYEOF'
+import sys
+p = sys.argv[1]; s = open(p, encoding="utf-8").read()
+old = """        if (isGenerating) return false          // 这会儿又忙起来了：继续欠着，绝不掐流
+"""
+assert s.count(old) == 1, "stub20: anchor not found"
+open(p, "w", encoding="utf-8").write(s.replace(old, "", 1))
+PYEOF
+must_red "桩⑳（消费登记时不查空闲）" "消费登记前先查「此刻是否空闲」"
+reset_src
+
+"$PY" - $HTTP <<'PYEOF'
+import sys
+p = sys.argv[1]; s = open(p, encoding="utf-8").read()
+old = """                    if (isGenerating) { failStreak = 0; continue }
+"""
+assert s.count(old) == 1, "stub21: anchor not found"
+open(p, "w", encoding="utf-8").write(s.replace(old, "", 1))
+PYEOF
+must_red "桩㉑（生成期不再跳过探活）" "生成期为真时不碰 socket"
+must_red "桩㉑（生成期不再跳过探活）" "生成期闸门排在探活之前"
+reset_src
+
+"$PY" - $HTTP <<'PYEOF'
+import sys
+p = sys.argv[1]; s = open(p, encoding="utf-8").read()
+old = "    private const val PROBE_TIMEOUT_MS = 3_000"
+new = "    private const val PROBE_TIMEOUT_MS = 2_000"
+assert s.count(old) == 1, "stub22: anchor not found"
+open(p, "w", encoding="utf-8").write(s.replace(old, new, 1))
+PYEOF
+must_red "桩㉒（探活超时退回 2s）" "探活超时是具名常量且 ≥3s"
+reset_src
+
+"$PY" - $HTTP <<'PYEOF'
+import sys
+p = sys.argv[1]; s = open(p, encoding="utf-8").read()
+# ⚠ 锚点跟过一次源码：这一处改用**单调钟**（`System.nanoTime()`）来量实际睡眠，
+#   而不是墙钟 `currentTimeMillis()` —— 墙钟跳变会把"睡够了"报成没睡（见
+#   `run_monotonic_clock_guard.sh` 那一族）。桩要钉的是"冻结痕迹由**唯一一处**
+#   记账"，锚点跟着换成当前写法，换的是量时钟的方式，不是判据。
+old = """                    recordWatchdogSleep(plannedMs, (System.nanoTime() - t0) / 1_000_000L)
+"""
+assert s.count(old) == 1, "stub23: anchor not found"
+open(p, "w", encoding="utf-8").write(s.replace(old, "", 1))
+PYEOF
+must_red "桩㉓（冻结不记账）" "冻结痕迹在睡眠之后由唯一一处记账"
+reset_src
+
+"$PY" - $HTTP <<'PYEOF'
+import sys
+p = sys.argv[1]; s = open(p, encoding="utf-8").read()
+old = """out, 503, errJson(
+                    "request head not received within ${headTimeoutMs}ms; " +
+                        "service is up, retry with a complete request"), corsOrigin)"""
+new = """out, 503, errJson("silent"), corsOrigin)  // 反例：客户端分不清服务满与服务挂"""
+n = s.count(old)
+assert n == 1, f"stub24: 期望一处可读 503，实际 {n} 处"
+open(p, "w", encoding="utf-8").write(s.replace(old, new))
+PYEOF
+must_red "桩㉔（首字节超时静默断连）" "首字节超时必须回"
 reset_src
 
 # ── 收尾：还原后守卫必须恢复全绿 ──────────────────────────────────────────

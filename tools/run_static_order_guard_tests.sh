@@ -14,6 +14,7 @@
 # 运行：sh tools/run_static_order_guard_tests.sh
 set -e
 cd "$(dirname "$0")/.."
+. "$(dirname "$0")/with_worktree_lock.sh"   # 工作区独占锁：见该文件顶部说明
 JNI=app/src/main/cpp/llama_jni.cpp
 # 与守卫同一口径：编译器由守卫自己挑（必须能过 libc++）。
 # 自测里只在把 CXX 显式传下去时有意义 —— 默认留空，让守卫用它的候选表。
@@ -27,18 +28,39 @@ chk() {
     else echo "FAIL  $name：期望 $want，实得 $got"; bad=$((bad+1)); fi
 }
 
-STASH=/tmp/static_order_stash
-rm -rf "$STASH"; mkdir -p "$STASH"
+STASH=$(mktemp -d "${TMPDIR:-/tmp}/static_order_XXXXXX")
+STUB_JNI=tools/stub_jni/jni.h
 cp "$JNI" "$STASH/llama_jni.cpp"
-restore() { cp "$STASH/llama_jni.cpp" "$JNI"; }
-trap restore EXIT
+cp "$STUB_JNI" "$STASH/jni.h"
+restore() { cp "$STASH/llama_jni.cpp" "$JNI"; cp "$STASH/jni.h" "$STUB_JNI"; }
+# 退出即还原：EXIT / INT / TERM / HUP 都走同一个还原 ——
+# 只 trap EXIT 时，CI 的 kill（默认 TERM）不会触发 EXIT trap，
+# 打桩源码就会留在工作区（正是 #126 那轮脏工作区的机制）。
+# restore 供运行时复位反复调用（不清理，否则后续桩失去基线）；
+# 退出清理只做一次，避免重复 rm。
+_exit_cleaned=0
+_on_exit() { [ "$_exit_cleaned" = 1 ] && return 0; _exit_cleaned=1; restore; rm -rf "$STASH"; }
+# 就地打桩前先抢工作区独占锁：本脚本会改真源码再 trap 还原，
+# 与其他同套路自测并行时会互相盖桩（假红/漏桩）。见 tools/with_worktree_lock.sh。
+worktree_lock_acquire "$0"
+trap _on_exit EXIT INT TERM HUP
 
 
 
 stub() {
     name="$1"; want="$2"; prog="$3"
     cp "$STASH/llama_jni.cpp" "$JNI"
+    cp "$STASH/jni.h" "$STUB_JNI"
     printf '%s\n' "$prog" | python3 - "$JNI"
+    chk "$name" "$want"
+}
+
+# 只打桩 header（⑧/⑧b 用）：源码保持原样。
+stub_hdr() {
+    name="$1"; want="$2"; prog="$3"
+    cp "$STASH/llama_jni.cpp" "$JNI"
+    cp "$STASH/jni.h" "$STUB_JNI"
+    printf '%s\n' "$prog" | python3 - "$STUB_JNI"
     chk "$name" "$want"
 }
 
@@ -99,7 +121,11 @@ io.open(p, "w", encoding="utf-8").write(s)
 GUARD=tools/run_static_order_guard.sh
 cp "$GUARD" "$STASH/guard.sh"
 restore_guard() { cp "$STASH/guard.sh" "$GUARD"; }
-trap 'restore; restore_guard' EXIT
+# 这里多了一份守卫脚本备份：退出清理要连它一起还原，
+# 并复用上面的 _on_exit（幂等 + 清 $STASH）。
+restore_all() { restore; restore_guard; [ "$_exit_cleaned" = 1 ] && return 0; _exit_cleaned=1; rm -rf "$STASH"; }
+trap restore_all EXIT INT TERM HUP
+
 python3 - "$GUARD" <<'PYEOF'
 import sys, io
 p = sys.argv[1]; s = io.open(p, encoding="utf-8").read()
@@ -124,6 +150,40 @@ s = s.replace(decl, "", 1)
 anchor = "    jlog(\"[mmap诊断]"
 i = s.index(anchor)
 s = s[:i] + "    jlog(\"split_desc_append 只是被提到，不是调用\");\n" + s[i:]
+io.open(p, "w", encoding="utf-8").write(s)
+'
+
+# ⑧ 桩缺一个成员（C-1 本体）：真源码用 `GetFloatArrayRegion`，桩里删掉它。
+# 打的是判据⑤ 那一半 —— "桩缺成员"在**没有编译器**的宿主上此前谁也不红。
+# 这里源码不动、只动桩，正是 C-1 的形状：源码先用了，桩没跟上。
+stub_hdr "桩缺 JNIEnv 成员（C-1 本体：源码用了、桩没补）" red '
+import sys, io
+p = sys.argv[1]; s = io.open(p, encoding="utf-8").read()
+old = "    void  GetFloatArrayRegion(jfloatArray, jsize, jsize, jfloat *) {}\n"
+assert old in s, "桩形状变了，本自测要一起更新"
+s = s.replace(old, "", 1)
+io.open(p, "w", encoding="utf-8").write(s)
+'
+
+# ⑧b 桩缺一个 JNI 数组类型 typedef（C-1 的 `jfloatArray` 那一半）。
+stub_hdr "桩缺 JNI 数组类型 typedef（C-1 的 jfloatArray 那一半）" red '
+import sys, io
+p = sys.argv[1]; s = io.open(p, encoding="utf-8").read()
+old = "typedef _jobject * jfloatArray;\n"
+assert old in s, "桩形状变了，本自测要一起更新"
+s = s.replace(old, "", 1)
+io.open(p, "w", encoding="utf-8").write(s)
+'
+
+# ⑨ 判据⑤ 必须锚「真源码用到了什么」，不锚「桩里写没写」：
+# 源码里**没用到**的成员删掉，照样绿（否则它就成了"桩名单必须超集"的恒真断言，
+# 把"多写一个"也判红 —— 而"多写"按存根自己的规矩**不算问题**）。
+stub_hdr "源码未使用的成员删掉仍绿（判据⑤ 不许退化成名单超集断言）" green '
+import sys, io
+p = sys.argv[1]; s = io.open(p, encoding="utf-8").read()
+old = "    void  DeleteGlobalRef(jobject) {}\n"
+assert old in s
+s = s.replace(old, "", 1)
 io.open(p, "w", encoding="utf-8").write(s)
 '
 

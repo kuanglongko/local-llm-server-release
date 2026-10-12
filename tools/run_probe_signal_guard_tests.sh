@@ -11,6 +11,7 @@
 # 运行：sh tools/run_probe_signal_guard_tests.sh
 set -e
 cd "$(dirname "$0")/.."
+. "$(dirname "$0")/with_worktree_lock.sh"   # 工作区独占锁：见该文件顶部说明
 
 JNI=app/src/main/cpp/llama_jni.cpp
 KT=app/src/main/java/com/xiaowan/localinference/LlmEngine.kt
@@ -24,12 +25,21 @@ chk() { # chk <描述> <期望:red|green> <stub 目录>
 }
 
 # 桩机制：把仓库里的两份源**临时替换**成桩，跑完守卫再还原（trap 保证异常也还原）。
-STASH=/tmp/probe_signal_guard_stash
-rm -rf "$STASH"; mkdir -p "$STASH"
+STASH=$(mktemp -d "${TMPDIR:-/tmp}/probe_signal_guard_XXXXXX")
 cp "$JNI" "$STASH/llama_jni.cpp"
 cp "$KT"  "$STASH/LlmEngine.kt"
 restore() { cp "$STASH/llama_jni.cpp" "$JNI"; cp "$STASH/LlmEngine.kt" "$KT"; }
-trap restore EXIT
+# 退出即还原：EXIT / INT / TERM / HUP 都走同一个还原 ——
+# 只 trap EXIT 时，CI 的 kill（默认 TERM）不会触发 EXIT trap，
+# 打桩源码就会留在工作区（正是 #126 那轮脏工作区的机制）。
+# restore 供运行时复位反复调用（不清理，否则后续桩失去基线）；
+# 退出清理只做一次，避免重复 rm。
+_exit_cleaned=0
+_on_exit() { [ "$_exit_cleaned" = 1 ] && return 0; _exit_cleaned=1; restore; rm -rf "$STASH"; }
+# 就地打桩前先抢工作区独占锁：本脚本会改真源码再 trap 还原，
+# 与其他同套路自测并行时会互相盖桩（假红/漏桩）。见 tools/with_worktree_lock.sh。
+worktree_lock_acquire "$0"
+trap _on_exit EXIT INT TERM HUP
 
 run_stub() { # run_stub <name> <expect> <sed 脚本...>
     name="$1"; want="$2"; shift 2

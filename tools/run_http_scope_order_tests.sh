@@ -20,6 +20,7 @@
 # 不需要工具链，只要 sh + python3。
 set -e
 cd "$(dirname "$0")/.."
+. "$(dirname "$0")/with_worktree_lock.sh"   # 工作区独占锁：见该文件顶部说明
 
 PY=${PYTHON:-python3}
 CHECK=tools/run_http_scope_order.py
@@ -34,6 +35,9 @@ ck() { if [ "$2" = "1" ]; then echo "PASS  $1"; ok=$((ok+1));
 TMP=$(mktemp -d)
 cp "$HTTP" "$TMP/http.bak"
 restore() { cp "$TMP/http.bak" "$HTTP"; rm -rf "$TMP"; }
+# 就地打桩前先抢工作区独占锁：本脚本会改真源码再 trap 还原，
+# 与其他同套路自测并行时会互相盖桩（假红/漏桩）。见 tools/with_worktree_lock.sh。
+worktree_lock_acquire "$0"
 trap restore EXIT
 reset_src() { cp "$TMP/http.bak" "$HTTP"; }
 

@@ -18,6 +18,7 @@
 # 不需要工具链，只要 sh + python3。运行：sh tools/run_http_hardening_guard_tests.sh
 set -e
 cd "$(dirname "$0")/.."
+. "$(dirname "$0")/with_worktree_lock.sh"   # 工作区独占锁：见该文件顶部说明
 
 PY=${PYTHON:-python3}
 GUARD=tools/run_http_hardening_guard.sh
@@ -36,7 +37,13 @@ restore() {
     cp "$TMP/http.bak" "$HTTP"; cp "$TMP/auth.bak" "$AUTH"
     rm -rf "$TMP"
 }
-trap restore EXIT
+# 退出即还原：EXIT / INT / TERM / HUP 都走同一个还原 ——
+# 只 trap EXIT 时，CI 的 kill（默认 TERM）不会触发 EXIT trap，
+# 打桩源码就会留在工作区（正是 #126 那轮脏工作区的机制）。
+# 就地打桩前先抢工作区独占锁：本脚本会改真源码再 trap 还原，
+# 与其他同套路自测并行时会互相盖桩（假红/漏桩）。见 tools/with_worktree_lock.sh。
+worktree_lock_acquire "$0"
+trap restore EXIT INT TERM HUP
 
 run_guard() {
     set +e
@@ -207,6 +214,66 @@ j = s.index(anchor)
 open(p, "w", encoding="utf-8").write(s[:j] + block + s[j:])  # 挪到 400/413 之后
 PYEOF
 must_red "桩⑪（corsOrigin 先用后声明）" "read-before-declare"
+reset_src
+
+# ── 桩⑫（Content-Length 退回 `toIntOrNull() ?: 0` —— 畸形值被静默当"无 body"）──
+# 桩的来源是**回归前的真源码**，不是编出来的反例：上游审出的两条里，
+# 第一条就是这一行。它不崩溃、响应照回，只是 body 一个字节都没读 ——
+# 客户端以为 prompt 送达了，服务端按空 body 处理。
+"$PY" - $HTTP <<'PYEOF'
+import sys
+p = sys.argv[1]; s = open(p, encoding="utf-8").read()
+old = """                "content-length" -> when (val len = ContentLengthHeader.parse(value)) {
+                    is ContentLengthHeader.Parsed.Length -> contentLength = len.bytes
+                    ContentLengthHeader.Parsed.Invalid -> badLength = true
+                    ContentLengthHeader.Parsed.Absent -> Unit
+                }"""
+new = '                "content-length" -> contentLength = value.toIntOrNull() ?: 0'
+assert s.count(old) == 1, "stub12: anchor not found"
+open(p, "w", encoding="utf-8").write(s.replace(old, new, 1))
+PYEOF
+must_red "桩⑫（畸形长度静默折成 0）" "非法 Content-Length 置标记"
+must_red "桩⑫（畸形长度静默折成 0）" "「非法值静默折成 0」的坏写法已绝迹"
+reset_src
+
+# ── 桩⑬（补了标记却不拦负数）────────────────────────
+# `-1` 能解析成 -1，`?: 0` 那类写法挡不住；只补 null 判定照样漏。
+"$PY" - $HTTP <<'PYEOF'
+import sys
+p = sys.argv[1]; s = open(p, encoding="utf-8").read()
+old = '            if (n < 0) return Parsed.Invalid\n'
+assert s.count(old) == 1, "stub13: anchor not found"
+open(p, "w", encoding="utf-8").write(s.replace(old, "", 1))
+PYEOF
+must_red "桩⑬（负数长度不拦）" "负数被拦"
+reset_src
+
+# ── 桩⑭（半包 body 退回 `if (n < 0) break`）──────────
+# 第二条上游 bug 的原样：EOF 静默收工，半包当完整 body 交给业务层。
+"$PY" - $HTTP <<'PYEOF'
+import sys
+p = sys.argv[1]; s = open(p, encoding="utf-8").read()
+old = """                if (n < 0) {
+                    return Req(method, path, "", origin, reqHeaders, auth,
+                        shortBody = true, gotBodyBytes = off)
+                }"""
+new = '                if (n < 0) break'
+assert s.count(old) == 1, "stub14: anchor not found"
+open(p, "w", encoding="utf-8").write(s.replace(old, new, 1))
+PYEOF
+must_red "桩⑭（半包 body 被当完整 body）" "body 读到 EOF 时返回 shortBody"
+must_red "桩⑭（半包 body 被当完整 body）" "body 的 EOF 静默收工已绝迹"
+reset_src
+
+# ── 桩⑮（截断请求体不留日志）────────────────────────
+"$PY" - $HTTP <<'PYEOF'
+import sys
+p = sys.argv[1]; s = open(p, encoding="utf-8").read()
+old = 'emitLog("拒绝截断请求体: 声明 ${req.body.length + req.gotBodyBytes}" +\n                    " 字节，实际收到 ${req.gotBodyBytes} 字节后连接结束")'
+assert s.count(old) == 1, "stub15: anchor not found"
+open(p, "w", encoding="utf-8").write(s.replace(old, "", 1))
+PYEOF
+must_red "桩⑮（截断拒绝不留日志）" "截断 body 拒绝留日志"
 reset_src
 
 # ── 收尾：还原后守卫必须恢复全绿 ──────────────────────

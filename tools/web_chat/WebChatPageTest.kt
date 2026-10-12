@@ -12,6 +12,23 @@ package com.xiaowan.localinference
 //   ① 折叠设置区存在，且三组都在；
 //   ② 三个设置项的字段名与服务端请求侧逐字一致（漂移 = 静默不生效）；
 //   ③ 多轮：页面维护历史、每轮带上、且"失败/空回复不进历史"。
+/* 数一个**字面量**子串出现了几次。
+   为什么不用 Kotlin 的 `Regex` 去数"HTML 里有没有 3 个页签"：页签那段是模板串里
+   手写的 HTML，形状随时会变（多一个类名、多一个属性）；正则写宽了会数到别处，
+   写窄了改一次 HTML 就红。而这条判据真正要问的是"页签的条数是不是 3"——
+   数一个字面量的出现次数就够了，且改 HTML 时它跟着一起改，不会半真半假。
+
+   这里曾经写成 JS 的 `html.match(/…/g)`（Kotlin 的 String 上没有 match）——
+   编译期就报 `unresolved reference 'match'`，而这条脚本在 CI 里是 REQUIRED=0，
+   于是"编译不过"与"环境缺件"长得一样，从落盘起一天没人发现。 */
+private fun countOf(hay: String, needle: String): Int {
+    if (needle.isEmpty()) return 0
+    var n = 0
+    var i = hay.indexOf(needle)
+    while (i >= 0) { n++; i = hay.indexOf(needle, i + needle.length) }
+    return n
+}
+
 private var fail = 0
 private fun ck(n: String, cond: Boolean) {
     if (cond) println("PASS  $n") else { println("FAIL  $n"); fail++ }
@@ -237,6 +254,65 @@ fun main() {
     ck("HTTP 错误不入历史", html.contains("pending = null;") && html.contains("aiBody.classList.add('err')"))
     ck("system 提示可填且只放一次", html.contains("id=\"sys\"") && html.contains("role: 'system'"))
     ck("有流式正文渲染容器", html.contains("id=\"thread\""))
+
+    // ══════════════════════════════════════════════════════════════════
+    // 3b. 单条删除 + 气泡左右分栏（本轮新增）
+    // ══════════════════════════════════════════════════════════════════
+    // 三条判据，每一条都防一件**静默**的事：
+    //   · 只删气泡不删 history（或反过来）→ 视觉与上下文不一致。用户以为删了、
+    //     模型还记得；或者页面上还在、其实已经不发出去。两种都**看不出来**。
+    //   · 删除下标若假定"气泡下标 == history 下标"，在页面上有 system 时就会
+    //     删错一条 —— 而 system 是可选填的，所以这个 bug 只在"填了 system 之后"
+    //     出现，正好是最不容易被随手测到的组合。
+    //   · 左右分栏若用 text-align，长消息撑满整行时"谁说的"就分不出来
+    //     （App 内那处踩的是同一个坑，两边判据必须一致）。
+    ck("长按删除的入口在（oncontextmenu 覆盖移动端长按与桌面右键）",
+        html.contains("line.oncontextmenu"))
+    ck("气泡节点被登记进 bubbles（删除靠它反查下标）",
+        html.contains("let bubbles = []") && html.contains("bubbles.indexOf(line)"))
+    ck("删除**同时**动气泡与 history（两边都动，不会只删一边）",
+        html.contains("history.splice(hi, 1)") && html.contains("bubbles.splice(idx, 1)"))
+    ck("气泡下标换算到 history 下标时扣掉 system（不能假定两者相等）",
+        html.contains("const sysCount = history.filter((m) => m.role === 'system').length") &&
+            html.contains("const hi = idx + sysCount"))
+    ck("删除后从 DOM 移除（不是只从数组里摘掉）",
+        html.contains("el.parentNode.removeChild(el)"))
+    ck("气泡注册顺序与 history 一致（用户这条先注册，模型那条后注册）",
+        html.indexOf("bubbles.push(meBub.el)") < html.indexOf("bubbles.push(aiBub.el)"))
+    // 这一条此前写的是「正在生成的那条也在 bubbles 里（**生成中就能删**）」——
+    // 它断言"可删"，却**没有任何东西**断言"删了之后 history 真的少了"。
+    // 而真相是：那一轮还没进 history，删除只会让气泡消失、上下文照样被污染，
+    // 且收尾时那条回答又被 push 回去 —— 用户以为自己删掉了，模型还记得。
+    // 判据从"存在性"改成"结构关系"：注册 + 生成中的闸门 + 越界不静默。
+    ck("正在生成的那条也在 bubbles 里（长按能定位到它，收尾后即定型）",
+        html.contains("bubbles.push(aiBub.el)"))
+    ck("生成中禁止删除（与 App 内同一道闸门：abort !== null）",
+        html.contains("if (abort) { show($('out'), '生成中，请先停止再删除"))
+    ck("换算越界时不再静默跳过（明说这一条不在历史里）",
+        html.contains("const inRange = hi >= 0 && hi < history.length") &&
+            !html.contains("if (hi >= 0 && hi < history.length) history.splice(hi, 1);"))
+    ck("删除成功只走一条出口（不因闸门而提前说"已删除"）",
+        html.contains("if (inRange) {"))
+    ck("左右分栏用 flex（不是 text-align：长消息撑满整行时分不出左右）",
+        html.contains(".line { display: flex; }") && html.contains(".line.me { justify-content: flex-end; }"))
+    ck("新对话把气泡列表一起清掉（与 history 同步）",
+        html.contains("bubbles = [];"))
+
+    // ══════════════════════════════════════════════════════════════════
+    // 3c. 三页横向切换（需求4）
+    // ══════════════════════════════════════════════════════════════════
+    // 两个入口都要：页签（看得见、点得到）与左右滑动（拇指够得到）。
+    // 滑动落点必须是**内容节点**而不是 document —— 页面里有两个 textarea，
+    // 挂 document 会把它们内部的光标左右移动一起抢走。
+    ck("有三个页签", countOf(html, "<button class=\"tab") == 3)
+    ck("三页内容都在（切 display，不重建 DOM）", countOf(html, "<div class=\"page") == 3)
+    ck("页签点击能切页", html.contains("t.onclick = () => showPage(t.dataset.page)"))
+    ck("滑动落点在内容节点上（不是 document：会抢输入框的光标移动）",
+        html.contains("pg.addEventListener('touchstart'") && html.contains("const pg = $('pager')"))
+    ck("滑动判据与 App 内同一套（|dx|>80 且 >|dy|*1.5）",
+        html.contains("Math.abs(dx) < 80 || Math.abs(dx) < Math.abs(dy) * 1.5"))
+    ck("滑动不消费竖向滚动（passive: true，不 preventDefault）",
+        html.contains("{ passive: true }") && !html.contains("e.preventDefault()"))
 
     // ══════════════════════════════════════════════════════════════════
     // 停止 = 一轮的结束：句柄必须**同步**清掉（Issue #154）

@@ -262,6 +262,21 @@ c "存根按真 jni.h 的形状写（jobject/jstring/jclass 同源不透明类�
   "grep -q 'typedef _jobject \\* jstring' \$STUB_JNI/jni.h && \
    grep -q 'typedef _jobject \\* jobject' \$STUB_JNI/jni.h"
 
+# ── ⑤ 存根面积必须覆盖真源码用到的成员（不需要编译器的那一半）───────────────
+# 判据① 编的是真源码本体，**它就能逮住"桩缺成员"** —— 可它依赖宿主有能过
+# libc++ 的编译器；没有编译器时按契约 SKIP（REQUIRED=0）。于是"桩缺成员"在
+# 无编译器的机器上谁也不红（C-1 的暴露路径正是"有人装上 clang 才红"）。
+# 这一条**扫真源码**取出用到的 `env->成员(` 与 `jXXXArray`，逐项要求桩里有 ——
+# 不需要任何工具链，正好补上判据① 会 SKIP 的那个缺口。
+# 锚"真源码用到了什么"，不锚"桩里写没写某个字面量"：后者是存在性断言，
+# 源码新用了成员而桩没补，照样绿。
+SURFACE_OUT="$TMP/stub_surface.txt"
+if "$PY" "$STUB_JNI/check_stub_surface.py" > "$SURFACE_OUT" 2>&1; then SURFACE_RC=0; else SURFACE_RC=1; fi
+c "存根面积覆盖真源码用到的全部 JNIEnv 成员与 JNI 数组类型（无编译器也能判）" \
+  "[ \"\$SURFACE_RC\" = 0 ]"
+# 缺口逐条打印出来（守护者要看到"缺的是哪几个"），别只留一句"面积不够"。
+[ "$SURFACE_RC" = 0 ] || { grep '^FAIL' "$SURFACE_OUT" | sed 's/^/      /' || true; }
+
 c "android/log.h 存根只声明不定义（本守卫只做 -fsyntax-only）" \
   "grep -q 'int __android_log_print(' \$STUB_SYS/android/log.h && \
    ! grep -qE '^(static )?inline int __android_log_print.*\\{' \$STUB_SYS/android/log.h"

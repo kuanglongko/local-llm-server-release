@@ -286,12 +286,29 @@ details[open] > summary { margin-bottom: 8px; }
 .fld input, .fld select { width: 100%; box-sizing: border-box; }
 .hint { font-size: 11px; color: #999; }
 #thread { display: flex; flex-direction: column; gap: 8px; max-height: 46vh; overflow-y: auto; padding: 4px 2px; }
-.bub { border-radius: 8px; padding: 7px 10px; white-space: pre-wrap; word-break: break-word; }
+.bub { border-radius: 8px; padding: 7px 10px; white-space: pre-wrap; word-break: break-word; max-width: 86%; cursor: default; }
 .bub .who { font-size: 11px; color: #888; margin-bottom: 3px; }
+/* 左右分栏靠 flex 行 + 自动外边距，不靠 text-align —— 后者只影响行内文字，
+   长消息撑满整行时"谁说的"就分不出来了（App 内那处踩的是同一个坑）。 */
+.line { display: flex; }
+.line.me { justify-content: flex-end; }
+.line.ai { justify-content: flex-start; }
+.bub.long { max-width: 100%; }
 .me { background: #8881; }
 .ai { background: #4a71; }
 .think { font-size: 12px; color: #888; border-left: 2px solid #8885; padding-left: 8px; margin: 4px 0; white-space: pre-wrap; }
 .rowgap { display: flex; gap: 8px; align-items: center; margin-top: 8px; flex-wrap: wrap; }
+
+/* 三页横向切换（需求4）。三块内容都在 DOM 里、只切 display ——
+   不用 transform 位移是因为那会把"水平滑动"这个词的真正含义让给 CSS：
+   用户不会看到别的页在隔壁滑过来（那是 ViewPager 的活），
+   而本页只需要"换个内容块"，做位移动画反而在长会话下更卡。 */
+.tabs { display: flex; gap: 6px; margin: 10px 0 4px; }
+.tab { flex: 1; padding: 7px 0; border: 1px solid #ddd; border-radius: 6px;
+       background: #fafafa; color: #888; font-size: 13px; }
+.tab.on { background: #1a73e81a; border-color: #1a73e8; color: #1a73e8; font-weight: 600; }
+.page { display: none; }
+.page.on { display: block; }
 </style>
 </head>
 <body>
@@ -299,11 +316,29 @@ details[open] > summary { margin-bottom: 8px; }
 <div class="sub">本页由手机端服务直接提供（同源），不需要 CORS。端口 <b id="port">$port</b>，局域网访问 <b id="lan">${if (bindAll) "已开启" else "未开启（仅回环）"}</b>。</div>
 ${modelBanner(modelLoaded)}
 
+<!-- (需求4): 左右滑动翻页。App 内是三页 Tab，网页版没有分页的理由 ——
+     同一块屏上「探测 / 设置 / 对话」三件事挤在一起，手机上要划很久才摸到输入框。
+     做成**三页横向切换**之后，翻页靠左右滑动与顶部页签（两种入口都要：
+     手指划得动的地方眼不一定看得见页签，反之亦然）。
+     滑动的判据与 App 内那处同一套：|dx| > |dy| * 1.5 且够远，横滑不抢竖向滚动。
+     ⚠ 落点必须挂在**内容节点**上，不能挂在 document 上：页面里有两个输入框
+     （schema 的 textarea、对话的 textarea），挂 document 会连它们的光标移动一起抢。 -->
+<div class="tabs" id="tabs">
+  <button class="tab on" data-page="0">聊天</button>
+  <button class="tab" data-page="1">设置</button>
+  <button class="tab" data-page="2">探测</button>
+</div>
+<div id="pager">
+<div class="page on" data-page="0">
+
 <div class="card">
   <div class="row"><button id="btnHealth">探测 /health</button><button id="btnModels">看 /v1/models</button></div>
   <div id="health" class="ok">未探测</div>
 </div>
 
+</div><!-- /page 0 探测 -->
+
+<div class="page" data-page="1">
 <details id="detailsSettings">
 <summary>设置（思考链 · 生成与采样 · 重复与惩罚 · 结构化输出）</summary>
   <div class="fld" style="margin-bottom:8px">
@@ -344,7 +379,9 @@ ${modelBanner(modelLoaded)}
     <span class="hint">留空的项不下发，由服务端取默认值。</span>
   </div>
 </details>
+</div><!-- /page 1 设置 -->
 
+<div class="page" data-page="2">
 <div class="card">
   <div class="sub">对话（流式，多轮连贯：页面自己把历史带上，服务端无状态）。模型 id 留空即用服务端当前模型。</div>
   <div class="row"><input id="model" placeholder="model（可留空）" value="$model"></div>
@@ -359,6 +396,7 @@ ${modelBanner(modelLoaded)}
   </div>
   <div class="hint">token 在 App 设置页「接口鉴权」一栏生成/复制。只用于 <code>/v1/*</code>；<code>/health</code>、<code>/v1/models</code> 与本页自身都不需要。</div>
   <div id="thread"></div>
+  <div class="hint">长按任一条可单独删除；左右滑动或点上方页签可切换「聊天 / 设置 / 探测」。删除只影响这一条，<b>不会</b>连带删掉配对的那一条 —— 历史少了哪一段，后面的请求就少发哪一段。</div>
   <div class="row" style="margin-top:8px"><textarea id="q" rows="3" placeholder="说点什么…">用一句话解释 KV cache</textarea></div>
   <div class="rowgap">
     <button id="btnSend">发送</button>
@@ -368,6 +406,9 @@ ${modelBanner(modelLoaded)}
   <div id="out" class="hint"></div>
 </div>
 
+</div><!-- /page 2 聊天 -->
+</div><!-- /pager -->
+
 <div class="sub">注意：本服务无鉴权。开局域网访问后，同网段任何人都能调用，请在可信网络使用或及时关闭。</div>
 
 <script>
@@ -376,6 +417,9 @@ let abort = null;
 // 多轮历史：服务端无状态，连贯性完全由这里维持。
 // 元素形状就是 OpenAI 的 message（role/content），直接塞进下一轮请求体。
 let history = [];
+/* 气泡节点列表（与**非 system** 的历史消息一一对应，顺序一致）。
+   长按删除靠它把"哪个节点"换算回"history 的第几条"。 */
+let bubbles = [];
 // 当前这一轮流式出来的正文；中途停止或报错时不入历史（半截内容进历史 = 后面每轮都喂坏上下文）。
 let pending = null;
 
@@ -513,7 +557,16 @@ function readSettings() {
 
 function show(el, text, cls) { el.className = cls || ''; el.textContent = text; }
 
+/* 一条消息 = 一个气泡。返回 {el, body}：
+   · el 要留在 `bubbles` 里（长按删除时要靠它在列表里的**下标**定位消息）；
+   · body 是正文节点，流式只改它的 textContent（不重建任何节点）。
+
+   为什么返回对象而不是像上一版那样只返回 body：删除要知道"删的是哪一条"，
+   而列表随时可能因为"新对话"重绘 —— 所以下标必须在长按那一刻**当场 indexOf**，
+   不能在闭包里捕获（捕获值在重绘之后就指向别的消息了）。 */
 function bubble(who, cls) {
+  const line = document.createElement('div');
+  line.className = 'line ' + cls;
   const b = document.createElement('div');
   b.className = 'bub ' + cls;
   const w = document.createElement('div');
@@ -521,9 +574,63 @@ function bubble(who, cls) {
   w.textContent = who;
   const body = document.createElement('div');
   b.appendChild(w); b.appendChild(body);
-  $('thread').appendChild(b);
+  line.appendChild(b);
+  $('thread').appendChild(line);
   $('thread').scrollTop = $('thread').scrollHeight;
-  return body;
+  line.oncontextmenu = () => {      // 移动端长按；桌面上右键同效
+    // 生成中的闸门在 removeAt 里（唯一判据），这里只负责把"是哪一条"当场问出来 ——
+    // 下标必须在长按这一刻 indexOf，不能在闭包里捕获（重绘后捕获值会指向别的消息）。
+    const idx = bubbles.indexOf(line);
+    if (idx >= 0) removeAt(idx);
+    return false;
+  };
+  return { el: line, body: body };
+}
+
+/* 删除第 idx 条消息。**同时**删气泡与 history 里对应的那一条 ——
+   只删一边就会出现"视觉与上下文不一致"：用户以为自己删掉了，模型还记得，
+   或者反过来（页面上还在，其实已经不进历史）。这一类不一致无法从输出发现。
+
+   ══════════════════════════════════════════════════════════════════════
+   生成中**不许删**（与 App 内同一道闸门）
+   ══════════════════════════════════════════════════════════════════════
+   这一条是被一个**静默失效**逼出来的：`bubbles` 在本轮**发送时**就登记了两条，
+   而 `history` 只在**成功收尾时**才 push。中间那段窗口里 `hi < history.length`
+   恒不成立 -> 气泡真删了、history 没动 -> 收尾时又把那两条 push 进 history。
+   结果是"用户明确删掉了那条回答，它却仍在上下文里，之后每轮都喂给模型"。
+
+   而它**没有任何症状**：气泡确实从页面消失了，用户以为删成功了。这与本文件
+   开头自己写的「**同时**删气泡与 history」正好相反 —— 写下来的意图与实现分叉。
+
+   修法取"与 App 对齐"：App 内生成中删单条时会回一句 `生成中，请先停止` 并
+   `return`（生成中的流式气泡**不进**可删列表）。网页版此前**没有**这道闸门，
+   于是同一个动作两边行为不同，而分叉的方向恰好是"App 拦住了、网页版静默吞掉"。
+   闸门用现成的 `abort !== null`（它是"页面认为有一轮在飞"的唯一判据）。
+
+   另外：即便不生成，`hi` 越界时也**不再静默跳过** —— 那正是上面那种"删了不算"
+   的形态。现在会明确说出来，让不一致暴露在页面上而不是藏在上下文里。 */
+function removeAt(idx) {
+  if (abort) { show($('out'), '生成中，请先停止再删除（本轮的回答还没定型）。', 'err'); return; }
+  // history 的下标与气泡下标**不一定相等**：system 那条只进 history、不建气泡。
+  // 所以按"气泡前面有几个 system"换算，而不是假定差值为 0 或 1。
+  const sysCount = history.filter((m) => m.role === 'system').length;
+  const hi = idx + sysCount;
+  // 换算结果必须**落在 history 里**才算"两边都删了"。越界说明两个视图已经错位
+  // （气泡比 history 多），这时只删气泡就会留下"页面上没了、模型还记得"。
+  // 所以不静默跳过：把错位说出来，并把那一侧的账也补平（下面按 idx 反查 history）。
+  const inRange = hi >= 0 && hi < history.length;
+  if (inRange) history.splice(hi, 1);
+  const el = bubbles[idx];
+  if (el && el.parentNode) el.parentNode.removeChild(el);
+  bubbles.splice(idx, 1);
+  if (inRange) {
+    show($('out'), '已删除这一条（不再进入后续请求的历史）。', '');
+  } else {
+    // 气泡删了、history 里没有对应项 —— 只能发生在"两个视图已经错位"时。
+    // 明说，别让用户以为上下文也清了。
+    show($('out'), '已从页面移除；但这一条不在历史里（本轮尚未定型），' +
+      '模型可能仍记得它的内容。要彻底清掉请用「新对话」。', 'err');
+  }
 }
 
 /* 鉴权头。判据：
@@ -573,10 +680,49 @@ $('btnTokenShow').onclick = () => {
   el.type = el.type === 'password' ? 'text' : 'password';
 };
 
+/* ══════════════════════════════════════════════════════════════════
+   三页横向切换（需求4）
+   ══════════════════════════════════════════════════════════════════
+   两个入口都要：顶部页签（看得见、点得到）与左右滑动（拇指够得到）。
+   判据与 App 内那处**同一套**（|dx| > 80px 且 > |dy| * 1.5），两处各写一套必然漂移 ——
+   漂移的表现是"手机上能滑、电脑上滑不动"（或反过来），而没人会想到是判据不一致。
+
+   ⚠ 落点是 `#pager`（内容节点），**不是 document**：页面里有两个 textarea
+   （schema 与对话输入），挂在 document 上会把它们内部的光标左右移动一起抢走。 */
+function showPage(i) {
+  for (const p of document.querySelectorAll('.page')) {
+    p.classList.toggle('on', p.dataset.page === String(i));
+  }
+  for (const t of document.querySelectorAll('.tab')) {
+    t.classList.toggle('on', t.dataset.page === String(i));
+  }
+}
+for (const t of document.querySelectorAll('.tab')) {
+  t.onclick = () => showPage(t.dataset.page);
+}
+(function () {
+  const pg = $('pager');
+  if (!pg) return;
+  let dx = 0, dy = 0, sx = 0, sy = 0;
+  pg.addEventListener('touchstart', (e) => {
+    const t0 = e.touches[0]; sx = t0.clientX; sy = t0.clientY; dx = 0; dy = 0;
+  }, { passive: true });
+  pg.addEventListener('touchmove', (e) => {
+    const t0 = e.touches[0]; dx = t0.clientX - sx; dy = t0.clientY - sy;
+  }, { passive: true });
+  pg.addEventListener('touchend', () => {
+    if (Math.abs(dx) < 80 || Math.abs(dx) < Math.abs(dy) * 1.5) return;   // 手抖 / 竖向滚动
+    const cur = Number(document.querySelector('.page.on').dataset.page);
+    const next = cur + (dx < 0 ? 1 : -1);
+    if (next >= 0 && next <= 2) showPage(next);
+  }, { passive: true });
+})();
+
 $('btnNew').onclick = () => {
   // 新对话必须同时清掉**已渲染的气泡**：只清 history 会留下视觉上的旧会话，
   // 用户以为还在同一个上下文里，而请求其实已经空了。
   history = [];
+  bubbles = [];
   $('thread').innerHTML = '';
   show($('out'), '已开新对话。', '');
 };
@@ -634,8 +780,21 @@ $('btnSend').onclick = async () => {
   }
   show($('out'), '');
 
-  bubble('我', 'me').textContent = q;
-  const aiBody = bubble('模型', 'ai');
+  // ══════════════════════════════════════════════════════════════════
+  // 气泡**先注册再填内容**，且注册顺序必须与 history 的顺序严格一致
+  // ══════════════════════════════════════════════════════════════════
+  // `bubbles` 与 `history`（去掉 system 那几条）是同一份顺序的两个视图 ——
+  // 删除要把气泡下标换算回 history 下标，靠的就是这个一一对应。
+  // 所以这两句的**相对顺序**不能反：反了就是"用户这一句"与"模型这一句"
+  // 在 bubbles 里换位，删第 N 条会删到旁一条，且没有任何异常。
+  const meBub = bubble('我', 'me');
+  meBub.body.textContent = q;
+  bubbles.push(meBub.el);
+  // 正在生成的那条也在列表里：用户要能中途删掉它（比如已经开始胡说）。
+  // 收尾时它已定型（正文就是最终答复），删它就是删那一轮的回答 —— 语义正确。
+  const aiBub = bubble('模型', 'ai');
+  bubbles.push(aiBub.el);
+  const aiBody = aiBub.body;
   aiBody.textContent = '…';
 
   // 本轮要发的消息：system（有的话）只放一次 + 历史 + 这一句。

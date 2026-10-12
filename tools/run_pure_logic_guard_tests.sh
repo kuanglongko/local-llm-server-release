@@ -13,6 +13,7 @@
 # 纯 sh + python3 标准库，不依赖工具链。运行：sh tools/run_pure_logic_guard_tests.sh
 set -e
 cd "$(dirname "$0")/.."
+. "$(dirname "$0")/with_worktree_lock.sh"   # 工作区独占锁：见该文件顶部说明
 
 PY=${PYTHON:-python3}
 GUARD=tools/run_pure_logic_guard.sh
@@ -32,7 +33,14 @@ TMP=$(mktemp -d)
 cp "$SS" "$TMP/ss.bak"; cp "$TS" "$TMP/ts.bak"
 cp "$SP" "$TMP/sp.bak"; cp "$TC" "$TMP/tc.bak"
 restore() { cp "$TMP/ss.bak" "$SS"; cp "$TMP/ts.bak" "$TS"; cp "$TMP/sp.bak" "$SP"; cp "$TMP/tc.bak" "$TC"; rm -rf "$TMP"; }
-trap restore EXIT
+# 退出即还原：EXIT / INT / TERM / HUP 都走同一个还原 ——
+# 只 trap EXIT 时，CI 的 kill（默认 TERM）不会触发 EXIT trap，
+# 打桩源码就会留在工作区（正是 #126 那轮脏工作区的机制）。
+# 就地打桩前先抢工作区独占锁：本脚本会改真源码再 trap 还原，
+# 与其他同套路自测并行时会互相盖桩（假红/漏桩）。见 tools/with_worktree_lock.sh。
+worktree_lock_acquire "$0"
+trap restore EXIT INT TERM HUP
+
 reset_src() { cp "$TMP/ss.bak" "$SS"; cp "$TMP/ts.bak" "$TS"; cp "$TMP/sp.bak" "$SP"; cp "$TMP/tc.bak" "$TC"; }
 
 # must_red "<桩名>" "<期望被点名的那条断言>"
@@ -69,33 +77,42 @@ PYEOF
 must_red "C-1：保险丝退回复合 while" "旧形状（size > 2 当先决条件的复合 while）已绝迹"
 reset_src
 
-# ── 桩①b：C-1 截断只做末条（"两条各 12k+12k"仍会突破上限）────────────────
+# ── 桩①b：C-1 第二级只截一条（"两条各 12k+12k"仍会突破上限）────────────────
+# ⚠ S1（`0.9.176`）起截断的落点是**历史**，所以这个桩改锚"把第二级换成对某一条的
+#   无条件截断"：无论截谁，"逐条收窄直到落回上限"这条口径都没了。
+# 桩文本放**独立 .py 文件**（见该文件顶部说明）：它的锚点里带 `for (i in ...) {`，
+# 内联 heredoc 的引号层数会把它吃掉，实测切出空串、守卫照绿 —— 断言静默失效。
+"$PY" tools/pure_logic/stub_cap_single.py $SS
+must_red "C-1：第二级只截一条" "两级口径"
+reset_src
+
+# ── 桩①c（S1 新增）：截断退回"从最新一条往前截、保头"——啃掉本轮提问 ────────
+# 这条是 S1 的**根因桩**：`msgs[i].put(...)` 的无条件下标写法回来了，于是末条
+#（用户这一轮真正要说的话）第一个被截 —— 症状是"我贴的代码它只看到一半，
+# 还答得头头是道"，与模型抽风完全同形。守卫必须变红，且指到"两级口径"那句。
 "$PY" - $SS <<'PYEOF'
-import sys, re
-p = sys.argv[1]; s = open(p, encoding="utf-8").read()
-start = s.index("        if (total() <= MAX_CHARS) return")
-end = s.index("        Log.w(TAG,")
-old = """        if (total() <= MAX_CHARS) return
-        val last = msgs.last()
-        val head = last.optString("content")
-        if (head.length > MAX_CHARS) {
-            last.put("content", head.substring(0, MAX_CHARS))
-        }
-"""
-s2 = s[:start] + old + s[end:]
-open(p, "w", encoding="utf-8").write(s2)
+import sys
+p = sys.argv[1]; s = open(p, encoding='utf-8').read()
+old = """            val cur = msgs[at].optString("content")  // 序号比 i 小的都还在 i 的左边，
+            val cut = minOf(over, cur.length)        // 不会因裁剪而消失
+            if (cut <= 0) continue
+            msgs[at].put("content", cur.substring(0, cur.length - cut))"""
+new = """            val cur = msgs[i].optString("content")
+            val cut = minOf(over, cur.length)
+            if (cut > 0) {
+                msgs[i].put("content", cur.substring(0, cur.length - cut))
+                over -= cut
+            }"""
+assert s.count(old) == 1, "桩①c：没找到新的截断循环"
+open(p, 'w', encoding='utf-8').write(s.replace(old, new, 1))
 PYEOF
-must_red "C-1：截断只做末条" "先按上限裁历史、再把剩余超限量逐条截断"
+must_red "C-1（S1）：截断退回啃末条" "两级口径"
 reset_src
 
 # ── 桩②：C-1 裁剪不再留痕（症状变成"静默截断 = 答非所问"）──────────────────
-"$PY" - $SS <<'PYEOF'
-import sys, re
-p = sys.argv[1]; s = open(p, encoding="utf-8").read()
-s2 = re.sub(r'\n *Log\.w\(TAG, "会话 \$id 超过 \$MAX_CHARS 字符[^\n]*\n', '\n', s, count=1)
-assert s2 != s
-open(p, "w", encoding="utf-8").write(s2)
-PYEOF
+# 删留痕同样走**独立 .py 文件**：正则要穿三层引号层，先前内联版本被吃掉后
+# 桩"改了等于没改"，守卫照绿 —— 断言静默失效（见 stub_cap_nolog.py 顶部）。
+"$PY" tools/pure_logic/stub_cap_nolog.py $SS
 must_red "C-1：裁剪不留痕" "裁剪必须留痕"
 reset_src
 

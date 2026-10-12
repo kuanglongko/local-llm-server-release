@@ -124,6 +124,39 @@ private object Http {
         start()
         return true
     }
+
+    // ---- Issue #159（后台保活）：探活失败 → 登记，空闲后才重启 ----
+    // 与 HttpApi 的对应关系：
+    //   · [generating]              <-> HttpApi.isGenerating
+    //   · [restartPending]          <-> HttpApi.restartPending
+    //   · [consumeRestartPendingIfIdle] <-> HttpApi.consumeRestartPendingIfIdle
+
+    /** 等价于 `HttpApi.isGenerating`（HTTP busy 或引擎在跑；测试里外部置位）。 */
+    val generating = AtomicBoolean(false)
+
+    /** 「欠一次重启」（等价于 HttpApi.restartPending）。 */
+    val restartPending = AtomicBoolean(false)
+
+    /** 真的重启了几轮（断言"该重启的重启了、不该重启的没动"）。 */
+    @Volatile var restarts = 0
+
+    /** 探活失败时的登记（等价于 startWatchdog 里那一行）。**不重启**。 */
+    fun onProbeFailed() { restartPending.set(true) }
+
+    /**
+     * 消费登记：确实空闲才重启。返回是否真的重启了。
+     *
+     * ⚠ 不空闲时**不清标记** —— 清了就等于把这次断联丢了（流跑完也没人补）。
+     */
+    fun consumeRestartPendingIfIdle(): Boolean {
+        if (generating.get()) return false
+        if (!desired.get()) { restartPending.set(false); return false }
+        // 与 HttpApi 同步：原子取清，避免"先读后清"丢掉并发置上的那次欠账。
+        if (!restartPending.getAndSet(false)) return false
+        val ok = restartIfDesired()
+        if (ok) restarts++
+        return ok
+    }
 }
 
 fun main() {
@@ -196,9 +229,46 @@ fun main() {
     ck("A-4 登记表已清空（没有只涨不跌的引用）", Http.conns.isEmpty())
     idle.forEach { try { it.close() } catch (_: Exception) {} }
 
+    // ---- Issue #159 A2：探活失败不许当场重启（会掐掉正在跑的流）----
+    //
+    // 这是"每一句读起来都对"的那种写法：探活失败 -> 立刻重启，最自然。
+    // 而 restartIfDesired 的第一步是 stop()，它 close() 掉**所有在途连接** ——
+    // 包括那条正在续传的 SSE。所以这里必须真开一条连接、真把 generating 置上，
+    // 再断言"连接还在、没被收敛"。
+    Http.start()
+    Thread.sleep(300)
+    val streaming = Socket("127.0.0.1", Http.port)
+    Thread.sleep(200)
+    Http.generating.set(true)                 // 模拟：有一轮生成正在跑
+    Http.onProbeFailed()                      // 探活失败（此时正在生成）
+    val restartsBefore = Http.restarts
+    ck("A2 生成期探活失败只登记、不重启", !Http.consumeRestartPendingIfIdle())
+    ck("A2 生成期确实一次都没重启", Http.restarts == restartsBefore)
+    ck("A2 但登记被保留（复联后要补上，不许丢）", Http.restartPending.get())
+    // 那条连接必须还活着：写一次不抛、读得到字节。
+    val streamAlive = try {
+        val out = streaming.getOutputStream()
+        out.write("GET / HTTP/1.0\r\n\r\n".toByteArray()); out.flush()
+        Thread.sleep(200)
+        streaming.getInputStream().read() >= 0
+    } catch (_: Exception) { false }
+    ck("A2 正在跑的那条连接没被掐断（这是本改动的全部意义）", streamAlive)
+    try { streaming.close() } catch (_: Exception) {}
+
+    // 生成结束（空闲）之后，登记才被消费。
+    Http.generating.set(false)
+    val consumed = Http.consumeRestartPendingIfIdle()
+    Thread.sleep(400)
+    ck("A2 空闲后登记被消费、重启真的发生", consumed && canConnect(Http.port))
+    ck("A2 消费后登记已清（不会反复重启）", !Http.restartPending.get())
+    // 用户已停服时：登记作废，不许自动拉起。
+    Http.stop()
+    Http.onProbeFailed()
+    ck("A2 用户已停服时登记作废、不自动拉起", !Http.consumeRestartPendingIfIdle() && !canConnect(Http.port))
+
     println("")
     if (fail == 0) {
-        println("=== HTTP 生命周期复刻测试：PASS 15 / FAIL 0 ===")
+        println("=== HTTP 生命周期复刻测试：PASS 21 / FAIL 0 ===")
     } else {
         println("=== HTTP 生命周期复刻测试：FAIL $fail ===")
     }

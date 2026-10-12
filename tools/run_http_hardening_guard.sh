@@ -61,10 +61,51 @@ c "截断式 coerceAtMost 已绝迹（它就是静默丢字节的来源）" \
 c "超长行 -> 400"     "grep -q 'writeJson(out, 400, errJson(\"request line or header line too long' \$HTTP"
 c "超大 body -> 413"  "grep -q 'writeJson(out, 413, errJson(\"request body too large' \$HTTP"
 # 顺序：畸形请求判定必须在 `when {` 之前 —— 否则会先进生成端点、先烧算力。
+# ── 4a) 非法 Content-Length 不许被折成「无 body」────────────────────────────
+# 与 413 是**两个不同的码**：溢出值（`2147483648`）连一个合法长度都不是，
+# 回 413（体太大）会把客户端的修改方向指错；而它原来被 `?: 0` 折成 0，
+# 两个码一个都轮不到 —— body 一个字节不读，客户端却收到一个「正常」响应。
+c "非法 Content-Length -> 400" \
+  "grep -q 'writeJson(out, 400, errJson(\"invalid Content-Length header' \$HTTP"
+# 判据锚「非法值去了哪」，不锚「文件里出现过 Content-Length」——后者对静默折成 0 无效。
+c "Content-Length 有三态判据（不是 toIntOrNull + 默认值）" \
+  "grep -q 'internal object ContentLengthHeader' \$HTTP && grep -q 'object Invalid : Parsed()' \$HTTP"
+c "非法 Content-Length 置标记（不是折成 0）" \
+  "grep -q 'ContentLengthHeader.Parsed.Invalid -> badLength = true' \$HTTP"
+# `-1` 能解析成 -1（不是 null），只补 null 判定照样漏 —— 它一路活到
+# `if (contentLength > 0)` 才变假，结局同样是丢 body。
+c "负数被拦（'-1'.toIntOrNull() 不是 null，光靠默认值挡不住）" \
+  "grep -q 'if (n < 0) return Parsed.Invalid' \$HTTP"
+# 坏写法的反向锚：这一行就是回归前的真源码，它必须绝迹。
+c "「非法值静默折成 0」的坏写法已绝迹（它就是丢 body 的根因）" \
+  "! grep -q 'content-length\" -> contentLength = value.toIntOrNull() ?: 0' \$HTTP"
+# 顺序：非法值先判，再判超限。反过来溢出值会被 413 抢走。
+c "非法长度判定排在超限判定之前" \
+  "awk '/if \\(badLength\\)/{f=1} f&&/if \\(contentLength > MAX_BODY_BYTES\\)/{print \"OK\"; exit}' \$HTTP | grep -q OK"
+
+# ── 4b) 半包 body 不许当完整 body 接受 ──────────────────────────────────────
+# 原来 body 循环里那条 `if (n < 0) break` 是**粗粒度**的：头部的哨兵级严谨
+# 与 body 的「读到 EOF 就算完」摆在一起看，这种不对称本身就是信号。
+# 判据锚「EOF 之后去了哪」，不是「有没有 break」（正常读满也会退出循环）。
+c "body 读到 EOF 时返回 shortBody（不再是 break 后照拼）" \
+  "grep -q 'shortBody = true, gotBodyBytes = off' \$HTTP"
+c "body 的 EOF 静默收工已绝迹（半包被当完整 body 的那条路径）" \
+  "! awk '/while \\(off < buf.size\\)/{f=1} f&&/if \\(n < 0\\) break/{print \"BAD\"; exit}' \$HTTP | grep -q BAD"
+# 截断与「头没读完」是两个阶段、两个码：后者是本端等超时（客户端还在 → 503 可重试），
+# 前者是对端已关连接（重发还是残包 → 400）。折在一起等于把两种处境说成一件事。
+c "截断 body -> 400（不是 503：对端已走，重试无用）" \
+  "grep -q 'writeJson(out, 400, errJson(\"incomplete request body' \$HTTP"
+
 c "畸形请求判定排在真实路由之前" \
   "awk '/if \\(req.overlongLine\\)/{f=1} f&&/^            when \\{/{print \"OK\"; exit}' \$HTTP | grep -q OK"
 c "畸形请求判定排在鉴权之前（body 没读全，鉴权无从谈起）" \
   "awk '/if \\(req.overlongLine\\)/{f=1} f&&/ApiAuth.requiresAuth\\(req.method, req.path\\)/{print \"OK\"; exit}' \$HTTP | grep -q OK"
+# 新增的两条拒绝（非法长度 / 截断 body）同样必须排在鉴权与真实路由之前 ——
+# 否则「截断的 body」会先被鉴权路径回一句 401「token 不匹配」，把真因盖住。
+c "非法长度/截断判定也排在鉴权之前" \
+  "awk '/if \\(req.badLength\\)/{f=1} f&&/ApiAuth.requiresAuth\\(req.method, req.path\\)/{print \"OK\"; exit}' \$HTTP | grep -q OK"
+c "非法长度/截断判定也排在真实路由之前" \
+  "awk '/if \\(req.badLength\\)/{f=1} f&&/^            when \\{/{print \"OK\"; exit}' \$HTTP | grep -q OK"
 
 # ── 5) 状态行文案齐备（B-1）────────────────────────────────────────────────
 c "400 有文案"  "grep -q '400 -> \"Bad Request\"' \$HTTP"
@@ -122,9 +163,15 @@ c "400/413 拒绝留在路由之前（移动声明时不许把它们顺回后面
 # ── 7) 拒绝路径也要留痕（否则用户只能靠猜）────────────────────────────────
 c "超长行拒绝留日志"    "grep -q '拒绝畸形请求' \$HTTP"
 c "超限 body 拒绝留日志" "grep -q '拒绝超限请求体' \$HTTP"
+c "非法长度拒绝留日志"   "grep -q '拒绝畸形请求: Content-Length' \$HTTP"
+c "截断 body 拒绝留日志（且说得出差多少字节）" "grep -q '拒绝截断请求体' \$HTTP"
+c "非法长度拒绝留日志"   "grep -q '拒绝畸形请求: Content-Length' \$HTTP"
+c "截断 body 拒绝留日志（且说得出差多少字节）" "grep -q '拒绝截断请求体' \$HTTP"
 # 日志与正文**不许回显**收到的原始内容（可能含凭据/用户数据）。
+# 同样只点名**点号形态**（`req.body` / `req.auth`）：裸标识符会把无关变量
+# （`gotBodyBytes` 之类）也扫进来，守卫就变成"改个变量名就红"。
 c "拒绝日志不打印请求内容本身" \
-  "! grep -qE 'emitLog\\(.*(req\\.body|req\\.auth|first|line)\\)' \$HTTP"
+  "! grep -qE 'emitLog\\(.*(req\\.body|req\\.auth)\\)' \$HTTP"
 
 echo ""
 if [ "$bad" = "0" ]; then echo "=== 请求边界/前缀守卫：PASS $ok / FAIL 0 ==="; exit 0; fi

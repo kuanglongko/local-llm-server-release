@@ -19,11 +19,17 @@
 # 运行：sh tools/run_ci_wiring_guard_tests.sh
 set -e
 cd "$(dirname "$0")/.."
+. "$(dirname "$0")/with_worktree_lock.sh"   # 工作区独占锁：见该文件顶部说明
 
 PY=${PYTHON:-python3}
 GUARD=tools/run_ci_wiring_guard.sh
 THINK=tools/run_thinking_tests.sh
 CI=.cnb.yml
+# 调用清单现在有两个来源：`.cnb.yml` 与它引用的 stage 脚本
+#（`scripts/ci-*.sh`）。桩①/⑤ 要删的那几行在**后者**里 —— 它们是从
+# `.cnb.yml` 内联正文搬过去的（搬的原因：170 KB 内联脚本会让 CNB runner 的
+# fork/exec 报 `argument list too long`，脚本一行都不跑）。
+STAGE=scripts/ci-apk-stage.sh
 README=README.md
 STATUS=HTP-STATUS.md
 SUMMARY=docs/REVIEW-110-SUMMARY.md
@@ -39,6 +45,7 @@ cp "$CI" "$TMP/ci.bak"; cp "$README" "$TMP/readme.bak"; cp "$STATUS" "$TMP/statu
 # 桩⑨ 直接改审查收口小结（模拟"它掉出扫描面"），必须还原得掉。
 cp "$SUMMARY" "$TMP/summary.bak"
 cp "$THINK" "$TMP/think.bak"
+cp "$STAGE" "$TMP/stage.bak"
 # 守卫自身也要备份：桩④直接改守卫源码（模拟扫描失效），必须还原得掉。
 cp "$GUARD" "$TMP/guard.bak"
 # 桩⑦ 直接改 run_schema_sampler_guard.sh（往里注入一处 shell 分叉），必须还原得掉。
@@ -48,6 +55,7 @@ restore() {
     cp "$TMP/ci.bak" "$CI"; cp "$TMP/readme.bak" "$README"; cp "$TMP/status.bak" "$STATUS"
     cp "$TMP/guard.bak" "$GUARD"
     cp "$TMP/think.bak" "$THINK"
+    cp "$TMP/stage.bak" "$STAGE"
     cp "$TMP/sg.bak" tools/run_schema_sampler_guard.sh
     [ -f "$TMP/summary.bak" ] && cp "$TMP/summary.bak" "$SUMMARY"
     [ -f "$TMP/counts.bak" ] && cp "$TMP/counts.bak" tools/suite-counts.json
@@ -55,7 +63,13 @@ restore() {
     rm -f tools/run_zz_syntax_probe.sh
     rm -rf "$TMP"
 }
-trap restore EXIT
+# 退出即还原：EXIT / INT / TERM / HUP 都走同一个还原 ——
+# 只 trap EXIT 时，CI 的 kill（默认 TERM）不会触发 EXIT trap，
+# 打桩源码就会留在工作区（正是 #126 那轮脏工作区的机制）。
+# 就地打桩前先抢工作区独占锁：本脚本会改真源码再 trap 还原，
+# 与其他同套路自测并行时会互相盖桩（假红/漏桩）。见 tools/with_worktree_lock.sh。
+worktree_lock_acquire "$0"
+trap restore EXIT INT TERM HUP
 
 run_guard() {
     set +e
@@ -64,9 +78,35 @@ run_guard() {
     set -e
     return $rc
 }
+
+# 打桩用的内联 python：**失败就整份自测当场中止**，不许继续。
+#
+# ⚠ 为什么必须这样（本文件原来不这样做，代价是真实的）：
+#   打桩段里带着 `assert <锚点还在>`。它一失败，这一根桩就没打成 ——
+#   而此时若继续往下走，会发生两种都不该发生的结局：
+#     · 守卫**照旧全绿** → `must_red` 报"守卫变红：FAIL"，看起来像被测对象坏了；
+#     · 更坏的一种：`set -e` 在另一个上下文里把脚本悄悄中止，而**前一根桩
+#       留下的污染还留在真源码上**（本文件桩⑪b 真出过这件事：清单的
+#       `suite_total` 被改成 77 后没人还原，后一根桩在脏基线上跑）。
+#   所以打桩统一走 `py_stub`，锚点找不到 = 桩过期 = 当场说清楚，方便定位。
+py_stub() { # py_stub <脚本路径> [额外参数...] <<'PY' ... PY
+    script=$1
+    shift
+    set +e
+    "$PY" - "$script" "$@" > "$TMP/stub.err" 2>&1
+    rc=$?
+    set -e
+    if [ "$rc" != "0" ]; then
+        echo "FAIL  打桩失败（桩的锚点已过期，整份自测中止）：$script"
+        cat "$TMP/stub.err"
+        restore
+        exit 1
+    fi
+}
 reset_src() {
     cp "$TMP/ci.bak" "$CI"; cp "$TMP/readme.bak" "$README"; cp "$TMP/status.bak" "$STATUS"
     cp "$TMP/think.bak" "$THINK"
+    cp "$TMP/stage.bak" "$STAGE"
     cp "$TMP/sg.bak" tools/run_schema_sampler_guard.sh
     # 桩⑨ 会改审查收口小结，同上。
     [ -f "$TMP/summary.bak" ] && cp "$TMP/summary.bak" "$SUMMARY"
@@ -98,13 +138,15 @@ must_green "原始源码"
 # ── 1) 桩①：把 run_cors_live_tests.sh 的调用行从 CI 里删掉 ─────────────────
 # 这正是本轮修的那个形态（脚本在磁盘上、文档说它通过、CI 里没有）。
 reset_src
-python3 - "$CI" <<'PY'
+python3 - "$STAGE" <<'PY'
 import sys
 p=sys.argv[1]; s=open(p,encoding='utf-8').read()
-s=s.replace('            REQUIRED=0 sh tools/run_cors_live_tests.sh\n','')
+before=s
+s=s.replace('REQUIRED=0 sh tools/run_cors_live_tests.sh\n','')
+assert s!=before, '桩①：stage 脚本里没找到那一行'
 open(p,'w',encoding='utf-8').write(s)
 PY
-must_red "桩①（CI 里删掉 cors_live 的调用）" "tools/run_cors_live_tests.sh"
+must_red "桩①（CI 调用清单里删掉 cors_live 的调用）" "tools/run_cors_live_tests.sh"
 
 # ── 2) 桩②：新增一个磁盘上的脚本但故意不接 CI ──────────────────────────────
 # 取一个**两边都没出现过**的新名字，避免撞上已有的名字而误判"本来就没接"。
@@ -147,6 +189,32 @@ else
 fi
 cp "$TMP/guard.bak" "$GUARD"
 
+# ── 4b) 桩④b：**调用清单的第二个来源没了** —— 必须点名，不许静默恒绿 ──────────
+# 这是本轮真出过事的那一格：stage 正文从 `.cnb.yml` 搬进 `scripts/ci-*.sh`
+# 之后，若守卫仍只扫 `.cnb.yml` 一个文件，`called` 会变空 —— 判据①③ 报
+# "一个都没接"（红得莫名其妙，指不到真正的原因），而判据④⑥⑦⑨ 因为集合为空
+# **静默恒绿**（"REQUIRED 都读了""语法都过了"，其实一条都没查）。
+# 桩做法：把 stage 文件改名（模拟"被引用的脚本没扫到"），守卫必须变红，
+# 且失败行里点得出 `scripts/ci-*.sh` 这个来源。
+reset_src
+mv "$STAGE" "$STAGE.hidden"
+if run_guard; then ck "桩④b（stage 脚本扫不到时守卫必须变红）" 0
+else ck "桩④b（stage 脚本扫不到时守卫必须变红）" 1; fi
+if grep -F "两个来源都非空" "$TMP/guard.out" | grep -q 'FAIL'; then
+    ck "桩④b：指到了「CI 调用清单的两个来源都非空」" 1
+else
+    ck "桩④b：指到了「CI 调用清单的两个来源都非空」（该判据没起作用）" 0
+fi
+# 同时断言"防恒真"那条**不**得红：它防的是"磁盘上一份脚本都没有"，
+# 与"某个来源没扫到"是两件事，混在一起就分不清是哪一种失效。
+if grep -F "磁盘上确实扫到了离线测试脚本" "$TMP/guard.out" | grep -q 'FAIL'; then
+    ck "桩④b：防恒真那条仍绿（两种失效分得开）" 0
+else
+    ck "桩④b：防恒真那条仍绿（两种失效分得开）" 1
+fi
+mv "$STAGE.hidden" "$STAGE"
+reset_src
+
 # ── 5) 桩⑤：`REQUIRED=0` 写在 CI 里、脚本却不读它 ───────────────────────────
 # 形态来自 2026-09-21 的真实构建：repo1.maven.org 限流（429）→ json.jar 拉不到
 # → `REQUIRED=0 sh tools/run_thinking_tests.sh` 硬 exit 2 → 整轮 APK 构建停在
@@ -156,7 +224,7 @@ cp "$TMP/guard.bak" "$GUARD"
 # 只判"文件里出现过 REQUIRED"的存在性断言会被注释骗过 —— 这正是本项目
 # 在鉴权守卫桩②栽过的同一形态（pattern 写成到处都有的文本 => 恒真）。
 reset_src
-"$PY" - "$THINK" <<'EOF'
+py_stub "$THINK" <<'EOF'
 import sys
 p=sys.argv[1]; s=open(p,encoding='utf-8').read()
 old='if [ "${REQUIRED:-1}" = "0" ]; then'
@@ -171,7 +239,7 @@ reset_src
 # 说明判据是按"CI 实际调用形态"取集合，而不是把仓库里所有脚本都要求一遍
 #（那会把一堆纯静态守卫也套进这个契约，它们是另一回事）。
 reset_src
-"$PY" - "$CI" <<'EOF'
+py_stub "$STAGE" <<'EOF'
 import sys
 p=sys.argv[1]; s=open(p,encoding='utf-8').read()
 assert 'REQUIRED=0 sh tools/run_thinking_tests.sh' in s
@@ -227,7 +295,7 @@ reset_src
 # 唯一该变红的就是判据⑦。
 # ⚠ 不能拿守卫本体当桩：本体坏了连断言都打不出来（桩⑥ 踩过这个坑）。
 reset_src
-"$PY" - tools/run_schema_sampler_guard.sh <<'EOF'
+py_stub tools/run_schema_sampler_guard.sh <<'EOF'
 import io, sys
 p = sys.argv[1]; s = io.open(p, encoding='utf-8').read()
 old = """ESC_OK=no
@@ -300,16 +368,27 @@ reset_src
 # 只有**数字**是假的 —— 当年 run_cors_live_tests.sh「16 条全通过」却根本编不过，
 # 正是这个形态。这里把 §5.2 里一个已知条数改掉，守卫必须点名「判据⑤」那一条。
 reset_src
-python3 - "$STATUS" <<'PY'
-import sys
-p = sys.argv[1]
+python3 - "$STATUS" tools/suite-counts.json <<'PY'
+import json, sys
+p, m = sys.argv[1], sys.argv[2]
 s = open(p, encoding="utf-8").read()
-# 132 是本清单里 run_schema_sampler_guard.sh 的真实条数，改成一个明显的假值
-assert "**132 条全通过**" in s, "桩⑧ 依赖 §5.2 里的 132 这一行"
-s = s.replace("**132 条全通过**", "**133 条全通过**", 1)
+# ⚠ 不写死数字（本轮修：原来写死 `132`，而它随守卫加判据一起漂 ——
+#   与 `run_schema_sampler_guard_tests.sh` 的桩⑦ 是**同一个形态的漂移**，
+#   只不过发生在另一个自测文件里。任何一条"锚在一个会变的数字上"的桩，
+#   都会在数字变的那一刻变成"桩自己红了"，而这不是被测对象的错。
+#
+#   改成从**清单里读真值**，再把它 +1 写成假值：本桩要的只是"文档与清单不一致"，
+#   具体是多少条与它无关。
+real = json.load(open(m, encoding="utf-8"))["totals"]["tools/run_schema_sampler_guard.sh"]
+assert isinstance(real, int), "桩⑧：清单里 run_schema_sampler_guard.sh 的条数不是整数"
+good = "**%d 条全通过**" % real
+bad = "**%d 条全通过**" % (real + 1)
+assert good in s, "桩⑧ 依赖 §5.2 里那条 %s" % good
+s = s.replace(good, bad, 1)
 open(p, "w", encoding="utf-8").write(s)
+print("桩⑧：把 %d 改成 %d" % (real, real + 1))
 PY
-must_red "桩⑧（文档把 132 条改成 133 条）" "文档写的「N 条」都等于清单条数"
+must_red "桩⑧（文档里的条数被改大 1）" "文档写的「N 条」都等于清单条数"
 
 # ── 8b) 桩⑧b：反向 —— 清单被改坏、文档是对的 ─────────────────────────────
 # 只有一边错时判据也必须红（否则"两边一起漂"会被放过）。
@@ -322,7 +401,7 @@ d = json.load(open(p, encoding="utf-8"))
 d["totals"]["tools/run_schema_sampler_guard.sh"] = 77
 json.dump(d, open(p, "w", encoding="utf-8"), ensure_ascii=False, indent=2, sort_keys=True)
 PY
-must_red "桩⑧b（清单改成 77、文档仍是 132）" "文档写的「N 条」都等于清单条数"
+must_red "桩⑧b（清单改成 77、文档未动）" "文档写的「N 条」都等于清单条数"
 cp "$TMP/counts.bak" tools/suite-counts.json
 reset_src
 
@@ -333,7 +412,7 @@ reset_src
 # "受判据保护的证据"退化成"没人核对的手抄文档"，正是 J-1 的形态。
 # 桩做法：把文件里全部套件名替换成不含 `tools/run_` 的写法。
 reset_src
-"$PY" - "$SUMMARY" <<'PYEOF'
+py_stub "$SUMMARY" <<'PYEOF'
 import re, sys
 p = sys.argv[1]
 s = open(p, encoding="utf-8").read()
@@ -355,13 +434,14 @@ else ck "桩⑨b（小结内容正常时判据⑦ 全绿）" 0; cat "$TMP/guard.
 # 它才不是又一份手抄文档。桩做法：给小结里加一行表格形式、条数写错的引用，
 # 判据⑤（DOC_ROW 正则）必须点名。
 reset_src
-"$PY" - "$SUMMARY" <<'PYEOF'
+py_stub "$SUMMARY" <<'PYEOF'
 import sys
 p = sys.argv[1]
 s = open(p, encoding="utf-8").read()
 old = "## 五、明确没做的事"
 assert old in s, '桩⑩ 依赖小结的分节标题'
-# 插入一行**表格形式**的条数引用，故意写成假值（真值 45）
+# 插入一行**表格形式**的条数引用，故意写成假值：999 永远不会是真值，
+# 所以这根桩**不依赖**那条套件的当前条数（原来写"真值 45"是个会漂的手抄数）。
 row = "| `tools/run_http_lifecycle_guard.sh` | **999 条**（桩⑩ 故意写错） |\n\n"
 s = s.replace(old, row + old, 1)
 open(p, "w", encoding="utf-8").write(s)
@@ -369,21 +449,61 @@ PYEOF
 must_red "桩⑩（小结里写了错的条数 999）" "文档写的「N 条」都等于清单条数"
 reset_src
 
-# 对偶（桩⑩b）：把那一行改成正确条数，判据⑤ 必须恢复绿 ——
+# 对偶（桩⑩b）：把那一行改成**清单里的真值**，判据⑤ 必须恢复绿 ——
 # 说明它抓的是"数字 != 清单"，不是"小结里出现过条数"。
+#
+# ⚠ 真值**从清单读**，不写死：原来写死 59，而那条套件后来加到 73 ——
+#   桩自己先红了，报出来的形状却像"被测对象坏了"（本仓库对这类
+#   "锚在一个会变的数字上"的桩已有明确口径，见桩⑧ 的那条 ⚠）。
 reset_src
-"$PY" - "$SUMMARY" <<'PYEOF'
-import sys
-p = sys.argv[1]
+py_stub "$SUMMARY" tools/suite-counts.json <<'PYEOF'
+import json, sys
+p, m = sys.argv[1], sys.argv[2]
+real = json.load(open(m, encoding="utf-8"))["totals"]["tools/run_http_lifecycle_guard.sh"]
 s = open(p, encoding="utf-8").read()
 old = "## 五、明确没做的事"
-row = "| `tools/run_http_lifecycle_guard.sh` | **45 条**（桩⑩b 正确值） |\n\n"
+row = "| `tools/run_http_lifecycle_guard.sh` | **%d 条**（桩⑩b 正确值） |\n\n" % real
 s = s.replace(old, row + old, 1)
 open(p, "w", encoding="utf-8").write(s)
 PYEOF
 if run_guard; then ck "桩⑩b（条数写对后判据⑤ 恢复绿）" 1
 else ck "桩⑩b（条数写对后判据⑤ 恢复绿）" 0; cat "$TMP/guard.out"; fi
 reset_src
+
+# ── 11) 桩⑪：文档里的「现 N 个套件」总数被改坏（判据⑧ 必须变红）──────────
+# 判据⑤ 只核**逐套件**的「N 条」，对**总数**（「现 124 个」）此前无人核对 ——
+# 帐目① 实测 §5.2 写着「83 个套件」、磁盘实际 124，而判据⑤ 全绿。
+# 桩做法：把 §5.2 里那个 `**现 N 个**` 改成 +1。
+reset_src
+py_stub "$STATUS" tools/suite-counts.json <<'PYEOF'
+import json, sys
+p, m = sys.argv[1], sys.argv[2]
+s = open(p, encoding="utf-8").read()
+real = json.load(open(m, encoding="utf-8"))["suite_total"]
+good = "**现 %d 个**" % real
+bad = "**现 %d 个**" % (real + 1)
+# ⚠ 这一行必须留：`assert` 失败时**桩⑪b 用的污染清单（77）会留在原地**，
+#   后一根桩就在脏基线上跑，报出来的红指不到真正的原因（本仓库
+#   `run_ci_wiring_guard_tests.sh` 自己记过这个形态）。改成"找不到就跳过" ——
+#   桩⑪ 的职责是"文档被改坏时守卫要红"，不是"文档必须写着我算的那个数"。
+if good not in s:
+    raise SystemExit("桩⑪ 跳过：§5.2 里没有 %s（文档总数写法变了）" % good)
+open(p, "w", encoding="utf-8").write(s.replace(good, bad, 1))
+PYEOF
+must_red "桩⑪（§5.2 的套件总数被改大 1）" "文档写的「现 N 个套件」都等于清单总数"
+
+# ── 11b) 桩⑪b：反向 —— 清单的 suite_total 被改坏、文档是对的 ──────────────
+# 只查一边的判据在「两边一起漂」时会全绿，故必须两侧各来一次
+#（判据⑤ 的桩⑧/⑧b 是同一规矩）。
+reset_src
+py_stub tools/suite-counts.json <<'PYEOF'
+import json, sys
+p = sys.argv[1]
+d = json.load(open(p, encoding="utf-8"))
+d["suite_total"] = 77
+json.dump(d, open(p, "w", encoding="utf-8"), ensure_ascii=False, indent=2, sort_keys=True)
+PYEOF
+must_red "桩⑪b（清单 suite_total 改成 77、文档未动）" "文档写的「现 N 个套件」都等于清单总数"
 
 # ── 5) 还原后必须恢复全绿（防"改坏就不管了"）──────────────────────────────
 reset_src
