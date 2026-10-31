@@ -62,4 +62,75 @@ App 里它是一个**实验性开关，默认关闭**。关掉时行为与不带
 - **大 ctx + GPU 层**：`gpuLayers > 0` 且 `n_ctx > 32768` 时 OpenCL compute buffer 可能分配失败，
   会自动回退纯 CPU，同时把配额复位为「自动」。
 - 首次 prefill 可能几十秒，期间只有日志在动，没有进度条。
-- 闪退定位：native 日志实时落盘并接管 stderr，导出会话日志即可直接定位原因。
+- 闪退定位见下节。
+
+## 闪退取证（崩溃探针）
+
+native 闪退发生在 `abort()` / `SIGSEGV` 之后，JVM 侧拿不到任何遗言
+（`UncaughtExceptionHandler` 覆盖不到 native abort，`llama_log_set` 缓冲里的日志也会丢）。
+所以取证不能只靠 Kotlin 日志，要靠 native 侧自己直写文件。
+
+**打开**：设置页 →「崩溃取证（闪退排查）」→ 打开「崩溃取证模式」→ **完全退出 App 再启动**。
+
+**取证据**：复现闪退后重开 App → 日志页 →「导出崩溃探针」，得到 `probe-<时间戳>.txt`。
+这一份已含排查所需的全部内容：native 探针**本代**与**上一代**（`probe-native.log.prev`
+—— 信号现场在上一代里，见下）、Kotlin 本次与上次会话全文、设备/后端/变体/Boot ID。
+
+**为什么必须两代都带**：崩溃现场必然落在 `.prev`。用户复现闪退后进程就没了，
+**他得重开 App 才能点这个按钮**；而重开是一次冷启动，滚动发生在 `nativeProbeInit`
+打开文件**之前** —— 于是 `probe-native.log` 是**这一次开机**的，信号现场
+（`!!! ===== SIGNAL n =====` / `>> 函数名` 没有配对的 `<<`）一个字都不在里面。
+此前那一份只能靠用户自己进文件管理器翻 `Android/data/.../logs/`（Android 11+ 上
+那正是普通用户最难碰到的地方），或者靠 `session-*.log` 那半份 Kotlin 侧叙述倒推。
+
+**两份日志的分工**（`0.9.x` 修正常量「取证模式吞日志」后）：取证模式开着时，
+`probe-native.log` = native 全量（`llama_log_set` 的 sink 直写，含 GGUF 解析 / tensor 装载）
++ stderr 遗言（`ggml_abort` 那类只往 fd 2 打的行）+ 逐 token 原始流 + 信号现场；
+`session-*.log` 同时保留 Kotlin 侧全量且**不折叠**（进程没崩时便于一次读完）。
+两份合起来才是全量 —— 此前取证模式下 Kotlin 侧主动不写会话文件、且 `probe_log_sink`
+是空函数，于是"加载模型"那段只剩 `>> loadModel` 骨架，看着像"什么都没干"。
+
+**怎么读**：
+
+| 现象 | 含义 |
+|---|---|
+| `>> 函数名` 没有配对的 `<< 函数名` | 崩在这个 JNI 入口内部 |
+| `[parse]` / `[tools]` 最后一条 `>>>` 没有配对 `<<<` | 崩在库里那一步（渲染 / 解析） |
+| `!!! ===== SIGNAL n =====` | native 收到了信号，紧跟其后的行就是现场 |
+| 只有 `[boot]` 开头的内容 | 崩点落在 Kotlin → native 之间，native 业务还没开始跑 |
+| 一条 `[boot]` 都没有 | native 库根本没跑起来（`loadLibrary` 失败或拿的是旧包） |
+| `UnsatisfiedLinkError: nativeProbeInit` | `.so` 与 `.kt` 不是同一次构建（覆盖安装 / native 未重编） |
+
+**文件的重置与保留**（Issue #238 日志一轮）：
+
+- `probe-native.log` **每代一份**：每次冷启动（`nativeProbeInit` 打开文件前）把上一份滚成
+  `probe-native.log.prev`，本代从零写。只留两代 —— 用 `rename` 而不是 `unlink`，
+  因为崩前那几行在前面，删掉等于把上次那座现场扔掉。滚动失败**不阻断**取证，只留一行 `LOGW`。
+- `session-*.log` 保留最近 `LogFileStore.KEEP`（8）个会话，排序口径是**文件名里的时间戳**
+  （`session-yyyyMMdd-HHmmss.log`）。此前用的是 `lastModified()`，而本次会话文件在筛"上一次"
+  之前就已创建、mtime 立刻是 now —— 于是本次永远排第 1，`drop(KEEP-1)` 恰好删掉
+  **上一次会话**。那句"保留最近 8 个会话，够回溯"从写下那天起就没成立过。
+- **目前没有体积上限**，这是有意的：上限值要先有实测数据（单轮写多少字节 × 想保留几轮现场），
+  在有数据之前拍一个圆整数写死，等于用一个新的没有依据的数去替一个没有数。
+  所以探针文件会一直长；嫌占地方就关开关或直接删文件（下次冷启动照建）。
+
+**探针自身的兜底**（`0.9.113`，模块 K 修复后）：
+
+- handler 安装**幂等**：`nativeProbeInit(on=true)` 在本进程里可以被调到不止一次
+  （init 失败后用户再点「加载」/ 服务再起一轮），第二次安装不再覆盖 `g_old_*`。
+  之前每次覆盖会把转发链指向探针自己 —— 症状正是「`!!! ===== SIGNAL` 一行都没有」，
+  与「根本没崩 signal」**同形**；
+- 装了**备用信号栈**（64KB），`SA_ONSTACK` 才真的生效 ——
+  爆栈型 SIGSEGV（渲染 / PEG 解析的深递归）现在也能留下现场。日志里可直接读
+  `signal handlers installed (..., altstack=yes|no)`；
+- 驱动段**不再改写信号语义**：原 disposition 是 `SIG_IGN` 时，"忽略"就是忽略
+  （之前会被升级成 `exit(128+sig)`）。
+
+探针不问「Kotlin 有没有成功调到 nativeProbeInit」。
+native 在库加载时就自行自举（只读系统属性与包名推导目录），因此即使上面那一跳失败，
+`probe-native.log` 里也会有 `[boot]` 内容；要指定落盘目录（受控，仅调试用）：
+`setprop debug.localinference.probe.dir /data/local/tmp`。
+
+关闭探针时探针函数第一行即返回，零开销，正常使用不受影响。
+
+**注意**：探针**不改任何业务逻辑**，只加观测。它不会让闪退消失，而是让下一次闪退可归因。

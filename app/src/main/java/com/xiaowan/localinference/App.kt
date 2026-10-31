@@ -21,6 +21,10 @@ class App : Application() {
         super.onCreate()
         // 尽早开文件，让 native 初始化阶段的日志也能落盘
         LogFileStore.init(this)
+        // 探针开关与日志落盘都在 Application 里就绪，保证后续任何入口
+        // （UI / 前台服务 / 系统自动拉起服务）都走同一份设置
+        LlmEngine.loadProbeSetting(this)
+        if (LlmEngine.probeEnabled) LogFileStore.append("[probe] 探针已启用（设置里开启后重启生效）")
         val prev = Thread.getDefaultUncaughtExceptionHandler()
         Thread.setDefaultUncaughtExceptionHandler { t, e ->
             runCatching {
@@ -31,8 +35,11 @@ class App : Application() {
                     appendLine("time=${java.util.Date()}")
                     appendLine("---- stack ----")
                     appendLine(sw)
-                    appendLine("---- recent engine logs (${LlmEngine.recentLogs().size} lines) ----")
-                    appendLine(LlmEngine.recentLogs().joinToString("\n"))
+                    // 崩溃现场必须取**全量**：日志页的过滤档位与"哪些行进了 ring"无关，
+                    // 用过滤后的取数会让这份现场在有档位时凭空少掉几段。
+                    val ring = LlmEngine.recentLogsUnfiltered()
+                    appendLine("---- recent engine logs (${ring.size} lines) ----")
+                    appendLine(ring.joinToString("\n"))
                 }
                 // 私有 filesDir 保底 + 外部目录便于用户直接取
                 runCatching {

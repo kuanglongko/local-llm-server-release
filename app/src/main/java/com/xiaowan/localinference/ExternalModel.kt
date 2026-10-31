@@ -29,7 +29,6 @@ import java.io.File
  */
 object ExternalModel {
 
-    private const val PREFS = "external_models"
     /** 登记格式：绝对路径 ␟ content uri（uri 允许为空，用于手工登记/降级场景） */
     private const val SEP = '␟'
 
@@ -39,7 +38,7 @@ object ExternalModel {
 
     /** 全部引用条目（保持登记顺序）。 */
     fun all(ctx: Context): List<Ref> {
-        val sp = ctx.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+        val sp = ctx.getSharedPreferences(Prefs.EXTERNAL, Context.MODE_PRIVATE)
         val order = sp.getString("order", "").orEmpty()
         if (order.isBlank()) return emptyList()
         return order.split(';').mapNotNull { name ->
@@ -59,9 +58,12 @@ object ExternalModel {
         if (!f.isAbsolute || !f.isFile || f.length() <= 0) return false
         val list = all(ctx).toMutableList()
         if (list.any { it.name == name }) return false
-        if (File(ctx.getExternalFilesDir(null), "models/$name").isFile) return false
+        // 用 ModelLibrary.modelsDir() 而不是自己拼 getExternalFilesDir(null)：
+        // 后者在外部存储不可用时返回 null，File(null, child) 会静默变成相对 CWD 的路径 ——
+        // 于是这个去重判据在那种环境下**静默失效**（不报错，只是永远判 False）。
+        if (File(ModelLibrary.modelsDir(ctx), name).isFile) return false
         list += Ref(name, path, uri)
-        ctx.getSharedPreferences(PREFS, Context.MODE_PRIVATE).edit()
+        ctx.getSharedPreferences(Prefs.EXTERNAL, Context.MODE_PRIVATE).edit()
             .putString(key(name), "$path$SEP$uri")
             .putString("order", list.joinToString(";") { it.name })
             .apply()
@@ -78,7 +80,7 @@ object ExternalModel {
     fun remove(ctx: Context, name: String): Ref? {
         val target = find(ctx, name) ?: return null
         val rest = all(ctx).filterNot { it.name == name }
-        ctx.getSharedPreferences(PREFS, Context.MODE_PRIVATE).edit()
+        ctx.getSharedPreferences(Prefs.EXTERNAL, Context.MODE_PRIVATE).edit()
             .remove(key(name))
             .putString("order", rest.joinToString(";") { it.name })
             .apply()

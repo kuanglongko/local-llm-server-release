@@ -31,9 +31,14 @@ function(add_llmjni_variant TAG BASE)
     set_target_properties(${BASE} PROPERTIES
         IMPORTED_LOCATION ${RN_LIBS_DIR}/${ANDROID_ABI}/lib${BASE}.so)
 
-    add_library(llmjni_${TAG} SHARED ${CMAKE_CURRENT_SOURCE_DIR}/llama_jni.cpp)
+    # chat_abi.cpp 与 llama_jni.cpp 必须同一个编译单元集：chat_abi.h 的
+    # static_assert 依赖同一套编译选项（尤其 -DANDROID_STL=c++_static 带来的 libc++）。
+    # 拆到单独的 target 会让护栏与被守护的代码不再同源。
+    add_library(llmjni_${TAG} SHARED
+        ${CMAKE_CURRENT_SOURCE_DIR}/llama_jni.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/chat_abi.cpp)
     set_target_properties(llmjni_${TAG} PROPERTIES OUTPUT_NAME llmjni_${TAG})
-    target_include_directories(llmjni_${TAG} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+    target_include_directories(llmjni_${TAG} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include ${CMAKE_CURRENT_SOURCE_DIR}/chat/include ${CMAKE_CURRENT_SOURCE_DIR})
     target_compile_options(llmjni_${TAG} PRIVATE -O2 -fvisibility=hidden)
     target_link_libraries(llmjni_${TAG} PRIVATE ${BASE} log)
     # 只允许 llama/ggml 与 libc/liblog 这类系统符号；缺符号在 CI 就报错而不是运行时 UnsatisfiedLinkError

@@ -4,10 +4,24 @@
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC" />
+    <!-- 「常驻推理服务」的第二个 FGS 类型（A4，Issue #159）。理由见 <service> 上那段注释：
+         本类型在 API 34+ 是「不适用其它类型」时的兜底，且**没有** dataSync 那条
+         6 小时/24 小时的时间上限（Android 15，仅 targetSdk>=35 生效）。
+         两者一起声明，语义完备性才不依赖"将来要不要抬 targetSdk"。 -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SPECIAL_USE" />
     <!-- 「就地引用」外部 GGUF 需要按裸路径直读（native 只接受路径字符串，SAF 的 uri 级
          权限不延伸到裸路径）。依赖 targetSdk=28 的 legacy 存储可见性。
          拒绝授权不影响「复制到应用内」路径，故不作为启动必需项申请。 -->
     <uses-permission android:name="android.permission.READ_EXTERNAL_STORAGE" />
+    <!-- 「忽略电池优化」申请页（KeepAlive.requestIgnoreBatteryOptimizationIntent）的**配套权限**。
+         缺了它，`Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS` 解析不到：
+         要么 `ActivityNotFoundException` 静默掉到下一级「优化列表」，
+         要么弹出一个**没有本应用条目**的总列表，用户翻不到自己。
+         也就是 KeepAlive 引导的**一级入口恒不可用**——而 README 恰好把这条路当首选推荐。
+         它是 normal 权限：无需运行时申请，但**必须**在这里声明。
+         （与上面那条无障碍服务的 BIND_ACCESSIBILITY_SERVICE 同族：都是"用了某能力
+         就得把配套声明补齐"，缺了不报错、只静默降级。） -->
+    <uses-permission android:name="android.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS" />
     <application
         android:name=".App"
         android:label="LocalLLM Server"
@@ -25,9 +39,45 @@
         </activity>
         <activity android:name=".EngineActivity" android:exported="false"
             android:windowSoftInputMode="adjustResize" />
+        <!-- 常驻推理服务。`dataSync` 描述"进程在做数据传输/本地文件处理"（事实成立：
+             它在为局域网里的客户端持续生成并回传）。但它**不是**一个 time-bounded 的任务，
+             所以再加 `specialUse`：API 34+ 里后者是"其它类型都不适用"时的兜底，
+             `Runtime prerequisites: None`，且**不吃** dataSync 的时间上限
+             （Android 15 起 dataSync 有 6 小时/24 小时额度，仅对 targetSdk>=35 生效）。
+
+             ⚠ 必须同时说清它**不**做什么（否则它会被当成保活开关）：
+               · 它**不**改 oom_score_adj —— 那个由"进程是不是 FGS"决定，与类型位无关；
+               · 它**不**换冻结豁免 —— 内核冻结判据只看 MemFree/SwapFree（见 README）。
+             A4 的收益是语义完备与将来抬 targetSdk 时不吃时间上限，不是"不再被冻"。 -->
         <service
             android:name=".InferenceService"
             android:exported="false"
-            android:foregroundServiceType="dataSync" />
+            android:foregroundServiceType="dataSync|specialUse">
+            <!-- `specialUse` 要求的用途说明（自由文本，Play 审核会看；本项目只做侧载分发）。
+                 写清楚"为什么其它类型都不适用"，而不是一句"保活" —— 后者正是
+                 这个类型最容易被滥用的写法。 -->
+            <property
+                android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
+                android:value="常驻本地推理 HTTP 服务：进程内 llama.cpp 持续为局域网客户端生成 token 并回传，服务生命周期与用户显式启动/停止绑定，不适用其它受时限约束的类型" />
+        </service>
+        <!-- 「后台保活」用的无障碍服务（Issue #159）。它**不做辅助功能**：
+             不订阅事件、不读窗口内容，只为让部分 OEM 把本进程当作"用户显式在意的应用"。
+             权限只能由用户在系统设置里授予 —— 本应用**没有任何**代码去写
+             ENABLED_ACCESSIBILITY_SERVICES（那等于绕过用户同意，且需要普通应用拿不到的
+             系统级的写入权限）。界面侧只负责把"到底开没开"如实显示出来。
+             形态由 res/xml/keepalive_accessibility.xml 声明；改它之前先读
+             KeepAliveAccessibilityService 的文件头。 -->
+        <service
+            android:name=".KeepAliveAccessibilityService"
+            android:exported="false"
+            android:label="LocalLLM Server 后台保活"
+            android:permission="android.permission.BIND_ACCESSIBILITY_SERVICE">
+            <intent-filter>
+                <action android:name="android.accessibilityservice.AccessibilityService" />
+            </intent-filter>
+            <meta-data
+                android:name="android.accessibilityservice"
+                android:resource="@xml/keepalive_accessibility" />
+        </service>
     </application>
 </manifest>

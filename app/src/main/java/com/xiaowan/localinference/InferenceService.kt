@@ -32,6 +32,9 @@ class InferenceService : Service() {
         const val EXTRA_PARALLEL_N = "parallelN"
         const val EXTRA_BATCH_SIZE = "batchSize"
         const val EXTRA_UBATCH_SIZE = "ubatchSize"
+        /** 本次启动的进程 pid + 启动时刻：探针文件里靠它对齐「哪一次运行」 */
+        val BOOT_ID: String = "${android.os.Process.myPid()}-" +
+            java.text.SimpleDateFormat("MMdd-HHmmss", java.util.Locale.US).format(java.util.Date())
         // 渠道创建后 importance 即锁定，提级必须换新 ID 才生效；旧 ID 在下方删除
         private const val CHANNEL_ID = "llm_server_v2"
         private const val NOTIF_ID = 1
@@ -40,10 +43,15 @@ class InferenceService : Service() {
     override fun onBind(intent: Intent?): IBinder? = null
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        LlmEngine.probeMark("[服务] onStartCommand action=${intent?.action} startId=$startId boot=$BOOT_ID")
         when (intent?.action) {
             ACTION_STOP -> {
                 // 停止服务 = 关 HTTP + 卸载模型。
-                // 保证下次「启动服务」必走完整加载流程：切换的 ctx/线程/GPU 参数生效、日志刷新。
+                // ⚠ 必须先 `HttpApi.stop()` 再卸载模型：stop() 会置 desired=false
+                // （看门狗据此**不**自愈），并收敛在途连接 —— 若顺序反了，
+                // 卸载期间一个还在途的生成请求会打到已卸载的引擎上
+                // （`LlmEngine.unload()` 只持 `loadLock`，不持 `genLock`，也不看 `hasModel`）。
+                HttpApi.stop()
                 if (LlmEngine.hasModel) {
                     try {
                         LlmEngine.unload()
@@ -54,8 +62,8 @@ class InferenceService : Service() {
                 } else {
                     LlmEngine.uiLog("[服务] 已停止（无已加载模型）")
                 }
-                HttpApi.stop()
                 HttpApi.currentModel = null
+                // 保证下次「启动服务」必走完整加载流程：切换的 ctx/线程/GPU 参数生效、日志刷新。
                 stopForeground(STOP_FOREGROUND_REMOVE)
                 stopSelf()
                 return START_NOT_STICKY
@@ -65,9 +73,18 @@ class InferenceService : Service() {
                 if (LlmEngine.hasModel) {
                     startForeground(NOTIF_ID, buildNotification("启动中…"))
                     HttpApi.appContext = applicationContext
-                    HttpApi.PORT = ModelStore.serverPort(applicationContext)
-                    HttpApi.bindAll = ModelStore.lanAccess(applicationContext)
+                    HttpApi.PORT = ServerSettings.serverPort(applicationContext)
+                    HttpApi.bindAll = ServerSettings.lanAccess(applicationContext)
+                    applyCorsWhitelist(applicationContext)
+                    applyApiToken(applicationContext)
                     HttpApi.start()
+                    // 水位推到 native（ISSUE #426）：这条路**不经过界面**——
+                    // 冷启动先起前台服务、再打开 MainActivity 时，`LlmEngine.init` 已经
+                    // 跑完、`nativeSetCtxWatermark` 却还没人调（它此前只在 `EngineActivity`
+                    // 里推）。于是 native 按默认 85% 判，直到界面起来才换成用户设的那一档。
+                    // 若用户设的是 70%（想更稳），这段窗口里每一轮都按 85% 判 —— 而屏幕上
+                    // 没有任何东西说这件事。
+                    LlmEngine.pushCtxWatermark(applicationContext)
                     LlmEngine.uiLog("[服务] 检测到已加载模型，直接挂载: ${LlmEngine.modelDesc()}（未重新加载）")
                     Thread {
                         try { Thread.sleep(400) } catch (_: InterruptedException) {}
@@ -79,6 +96,10 @@ class InferenceService : Service() {
                 val path = intent.getStringExtra(EXTRA_MODEL_PATH)
                 if (path.isNullOrBlank()) {
                     LlmEngine.uiLog("[服务] 启动失败：无已加载模型且未指定模型路径")
+                    // 收尾与 ACTION_STOP 同一条纪律：先 HttpApi.stop() 再 stopSelf()。
+                    // 只 stopSelf() 的话 watchdog 每 30s 探活、连续 2 次失败就重启 listener，
+                    // 而这里的 desired 仍为 true —— 要靠 onDestroy() 兜（它是异步的，慢于 30s）。
+                    HttpApi.stop()
                     stopSelf(); return START_NOT_STICKY
                 }
                 val ctxSize = intent.getIntExtra(EXTRA_CTX, 4096)
@@ -86,7 +107,7 @@ class InferenceService : Service() {
                 val gpu = intent.getIntExtra(EXTRA_GPU, 0)
                 // 修复——服务启动加载此前漏传 flashAttn（恒 false），与 UI 加载按钮/自动恢复分支不一致
                 // flash 优先取 Intent extra（toggleServer 已显式传入），prefs 兜底
-                val flash = (intent.getIntExtra(EXTRA_FLASH, -1)).let { if (it >= 0) it != 0 else ModelStore.flashAttn(applicationContext) }
+                val flash = (intent.getIntExtra(EXTRA_FLASH, -1)).let { if (it >= 0) it != 0 else ServerSettings.flashAttn(applicationContext) }
                 val ck = intent.getIntExtra(EXTRA_CACHE_K, 0)
                 val cv = intent.getIntExtra(EXTRA_CACHE_V, 0)
                 val mm = intent.getIntExtra(EXTRA_MMAP, 1) != 0
@@ -96,20 +117,26 @@ class InferenceService : Service() {
                 startForeground(NOTIF_ID, buildNotification("启动中…"))
                 // HTTP 先于模型加载启动 —— /health 立即可达，
                 // 加载再慢或失败也能从 /health 看到状态，不再出现"服务连不上"。
-                HttpApi.currentModel = ModelStore.aliasOf(applicationContext, File(path).name)
+                HttpApi.currentModel = ModelLibrary.aliasOf(applicationContext, File(path).name)
                 HttpApi.appContext = applicationContext
                 // start 前从设置注入自定义端口
-                HttpApi.PORT = ModelStore.serverPort(applicationContext)
+                HttpApi.PORT = ServerSettings.serverPort(applicationContext)
                 // 注入局域网访问开关
-                HttpApi.bindAll = ModelStore.lanAccess(applicationContext)
+                HttpApi.bindAll = ServerSettings.lanAccess(applicationContext)
+                applyCorsWhitelist(applicationContext)
+                applyApiToken(applicationContext)
                 // 注入思考默认开关
-                HttpApi.disableThinkingDefault = ModelStore.disableThinking(applicationContext)
+                HttpApi.disableThinkingDefault = ServerSettings.disableThinking(applicationContext)
                 HttpApi.start()
                 Thread {
                     if (!LlmEngine.init(applicationContext)) {
                         updateNotification("初始化失败：native 引擎不可用（/health 可查状态）")
                         return@Thread
                     }
+                    // 水位推到 native：**在加载模型之前**。设成加载之后也行（它不改 n_ctx），
+                    // 但那样"第一轮请求"与"推送"之间存在一段按默认 85% 判的窗口 ——
+                    // 而这段时间恰好是用户刚起来就发第一条消息的时候。
+                    LlmEngine.pushCtxWatermark(applicationContext)
                     if (!LlmEngine.hasModel) {
                         updateNotification("加载模型 ${File(path).name} (gpu=$gpu)…")
                         val err = LlmEngine.loadModel(
@@ -129,19 +156,21 @@ class InferenceService : Service() {
                 // intent==null = 系统杀进程后 STICKY 自动重启。
                 // 历史缺陷：此分支空转 —— startForeground 未调用（超时 ANR 风险）且模型不加载
                 // → 出现「PID 在但端口不监听」的僵尸态，必须手动打开 App 才能恢复。
-                // 现自动用 ModelStore 保存的选中模型与参数重载，实现断联自愈。
+                // 现自动用 ModelLibrary / ServerSettings 保存的选中模型与参数重载，实现断联自愈。
                 startForeground(NOTIF_ID, buildNotification("自动恢复中…"))
-                val name = ModelStore.selectedName(applicationContext)
-                val mf = if (name.isNotBlank()) ModelStore.findByName(applicationContext, name) else null
+                val name = ModelLibrary.selectedName(applicationContext)
+                val mf = if (name.isNotBlank()) ModelLibrary.findByName(applicationContext, name) else null
                 if (mf != null && mf.isFile) {
-                    HttpApi.currentModel = ModelStore.aliasOf(applicationContext, mf.name)
+                    HttpApi.currentModel = ModelLibrary.aliasOf(applicationContext, mf.name)
                     HttpApi.appContext = applicationContext
-                    HttpApi.PORT = ModelStore.serverPort(applicationContext)
-                    HttpApi.bindAll = ModelStore.lanAccess(applicationContext)
-                    HttpApi.disableThinkingDefault = ModelStore.disableThinking(applicationContext)
+                    HttpApi.PORT = ServerSettings.serverPort(applicationContext)
+                    HttpApi.bindAll = ServerSettings.lanAccess(applicationContext)
+                    applyCorsWhitelist(applicationContext)
+                    applyApiToken(applicationContext)
+                    HttpApi.disableThinkingDefault = ServerSettings.disableThinking(applicationContext)
                     HttpApi.start()
                     LlmEngine.uiLog("[服务] 检测到系统重启服务，自动恢复: ${mf.name}")
-                    val p = ModelStore.engineParams(applicationContext)
+                    val p = ServerSettings.engineParams(applicationContext)
                     val gpu = p["gpu"]?.toIntOrNull() ?: 0
                     val ctxSize = p["ctx"]?.toIntOrNull() ?: 4096
                     val threads = p["threads"]?.toIntOrNull() ?: 4
@@ -151,12 +180,15 @@ class InferenceService : Service() {
                     val parallelN = p["parallelN"]?.toIntOrNull() ?: 0
                     val batchSize = p["batchSize"]?.toIntOrNull() ?: 0
                     val ubatchSize = p["ubatchSize"]?.toIntOrNull() ?: 0
-                    val flash = ModelStore.flashAttn(applicationContext) // 自动恢复：prefs 即最新（doLoad/toggleServer 均回写）
+                    val flash = ServerSettings.flashAttn(applicationContext) // 自动恢复：prefs 即最新（doLoad/toggleServer 均回写）
                     Thread {
                         if (!LlmEngine.init(applicationContext)) {
                             updateNotification("自动恢复失败：native 引擎不可用（/health 可查状态）")
                             return@Thread
                         }
+                        // 自动恢复这条路**更**需要它：进程被杀之后重启，用户可能压根不会
+                        // 再打开界面，于是 native 侧永远停在默认档 —— 而他设的是 70%。
+                        LlmEngine.pushCtxWatermark(applicationContext)
                         if (!LlmEngine.hasModel) {
                             updateNotification("自动恢复：加载 ${mf.name} (gpu=$gpu, ctx=$ctxSize)…")
                             val err = LlmEngine.loadModel(
@@ -174,11 +206,49 @@ class InferenceService : Service() {
                     }.start()
                 } else {
                     LlmEngine.uiLog("[服务] 系统重启服务但未找到已选模型，自动停止")
+                    HttpApi.stop()
                     stopSelf()
                 }
             }
         }
         return START_STICKY
+    }
+
+    /**
+     * 把 Bearer token 从设置注入 [ApiAuth]。
+     *
+     * 与 [applyCorsWhitelist] 同一个道理：不接这一步，"设置页填了 token"就只是
+     * 存进了 prefs，服务端压根不认 —— 而那种失效**完全不报错**：用户以为开了鉴权，
+     * 实际接口仍然裸奔（或反过来，token 永远对不上）。三个启动分支都要走这一步，
+     * 漏掉任何一个都会制造"同一个设置有的路径生效、有的不生效"。
+     *
+     * 空 token = 鉴权关闭（保持旧行为），不做任何隐式兜底。
+     */
+    private fun applyApiToken(ctx: android.content.Context) {
+        val t = ServerSettings.apiToken(ctx)
+        ApiAuth.token = t
+        LlmEngine.uiLog(if (t.isEmpty()) "[服务] 鉴权未开启（生成端点不要求 token）"
+                        else "[服务] 鉴权已开启：仅 /v1/ 生成端点要求 Authorization: Bearer")
+    }
+
+    /**
+     * 把 CORS 白名单从设置注入 [HttpApi]。
+     *
+     * 为什么在白名单**默认集之外**还要接这一步：默认只放行回环与本机 IP，
+     * 局域网内**另一台机器**上的前端（例如 PC 上的 Open WebUI）默认不在里面。
+     * 用户加了来源就必须真的生效 —— 一个"填了没用"的白名单，最终会把所有人
+     * 逼回 `Access-Control-Allow-Origin: *`，那正是本次刻意不做的形态。
+     *
+     * 逐条规范化；**非法串直接丢弃并留日志**，绝不静默变成"放行一切"。
+     */
+    private fun applyCorsWhitelist(ctx: android.content.Context) {
+        CorsPolicy.enabled = ServerSettings.corsEnabled(ctx)
+        CorsPolicy.clearOrigins()
+        for (raw in ServerSettings.corsExtraOrigins(ctx)) {
+            if (!CorsPolicy.addOrigin(raw)) {
+                LlmEngine.uiLog("[服务] CORS 白名单条目无效已忽略: $raw")
+            }
+        }
     }
 
     private fun buildNotification(text: String): Notification {
@@ -212,6 +282,10 @@ class InferenceService : Service() {
     }
 
     override fun onDestroy() {
+        // 非用户意图的销毁（系统回收、OEM 冻结杀进程）也走 stop()：
+        // 本进程的监听 socket 与在途连接必须收敛，不留给"进程内的僵尸 LISTEN"。
+        // 注意这与 A-2 的 desired 语义**不冲突**：服务真销毁了就不该再自愈，
+        // 下次启动由 ACTION_START / STICKY 分支重新置 desired。
         HttpApi.stop()
         super.onDestroy()
     }
