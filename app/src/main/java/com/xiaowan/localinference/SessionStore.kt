@@ -239,6 +239,71 @@ object SessionStore {
         mutate(ctx, id) { it.put("injectWidth", width.coerceAtLeast(0)) }
 
     /**
+     * 这个会话「每一轮注入块」的**回放表**：消息内容身份 -> 当时拼进去的那一段。
+     *
+     * 存的是**会话级**字段，不是逐条消息的附加字段。理由不是"好不好看"：
+     * [writeMessages]（`deleteAt` / `truncateTo`）只重写 `messages` 这一格，
+     * 写在消息对象上的附加字段会在任何一次删除/截断里**静默消失**，
+     * 而消失的后果是"那一轮的块下一轮拼不回来"—— 前缀断开，且没有任何读数指向它。
+     *
+     * 键是内容身份（[RagInject.historyKey]，角色 + 正文 + 出现序号），不是下标：
+     * 历史从头部被预算丢掉时下标会整体位移，而文本不会。
+     *
+     * 与 `injectWidth` / `cardSnapshot` 同一条口径：加字段**不改文件名、不改版本号**，
+     * 读侧缺省为空表 —— 老会话照样能打开，只是还没有可回放的块（等价于功能刚打开）。
+     */
+    @Synchronized
+    fun ragBlocksOf(ctx: Context, id: String): Map<String, String> {
+        val arr = readObj(ctx, id)?.optJSONArray("ragBlocks") ?: return emptyMap()
+        val out = LinkedHashMap<String, String>()
+        for (i in 0 until arr.length()) {
+            val o = arr.optJSONObject(i) ?: continue
+            val k = o.optString("key", "")
+            val v = o.optString("block", "")
+            if (k.isNotEmpty() && v.isNotEmpty()) out[k] = v
+        }
+        return out
+    }
+
+    /** 覆盖这个会话的回放表；与旧表相同则不写盘（同一轮重复调用不产生无谓 IO）。 */
+    @Synchronized
+    fun setRagBlocks(ctx: Context, id: String, blocks: Map<String, String>): Boolean {
+        if (ragBlocksOf(ctx, id) == blocks) return false
+        return mutate(ctx, id) { o ->
+            val arr = JSONArray()
+            for ((k, v) in blocks) {
+                if (k.isEmpty() || v.isEmpty()) continue
+                arr.put(JSONObject().put("key", k).put("block", v))
+            }
+            o.put("ragBlocks", arr)
+        }
+    }
+
+    /**
+     * 把所有会话的回放表都清掉（改相似度阈值时调用）。
+     *
+     * 为什么不是"只清当前会话"：阈值是一个**全局**设置，但回放表是每会话一份。
+     * 当前会话清了、别的会话还留着按旧阈值攒下的块 —— 用户切过去后旧块照样回放，
+     * 表现就是"阈值改了，这个对话里没用"。
+     *
+     * 只删 `ragBlocks` 这一格，不动 `messages` / `injectWidth` / `trimTag`：
+     * 清回放表不该产生"历史没了"这种可见副作用。
+     */
+    @Synchronized
+    fun clearAllRagBlocks(ctx: Context) {
+        dir(ctx).listFiles { f -> f.name.startsWith("s_") && f.name.endsWith(".json") }
+            ?.forEach { f ->
+                runCatching {
+                    val o = JSONObject(f.readText())
+                    if (o.has("ragBlocks")) {
+                        o.remove("ragBlocks")
+                        f.writeText(o.toString())
+                    }
+                }
+            }
+    }
+
+    /**
      * 这个会话的**裁剪起点标记**（`null` = 没有 / 作废了）。
      *
      * ══════════════════════════════════════════════════════════════════════
@@ -360,7 +425,9 @@ object SessionStore {
     /** 清空当前会话消息（保留标题与 system）。 */
     @Synchronized
     fun clearMessages(ctx: Context, id: String): Boolean = mutate(ctx, id) {
-        it.put("messages", JSONArray()).put("updatedAt", System.currentTimeMillis())
+        it.put("messages", JSONArray())
+        it.remove("ragBlocks")
+        it.put("updatedAt", System.currentTimeMillis())
     }
 
     /** 删除会话文件；若删的是当前会话则切到最近一个。 */

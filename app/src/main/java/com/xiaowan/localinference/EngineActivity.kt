@@ -349,6 +349,8 @@ class EngineActivity : UiActivity() {
     // 显式按钮，让"重操作"只发生在用户明确要它发生的时候。
     private lateinit var ragStatusTv: TextView
     private lateinit var ragToggleCb: android.widget.CheckBox
+    /** 相似度阈值输入框（百分数 0~100，默认 35）；低于它的条目一条都不注入。 */
+    private lateinit var ragMinScoreEt: EditText
     private lateinit var ragBuildBtn: Button
     private lateinit var ragSaveBtn: Button
     private lateinit var ragDropBtn: Button
@@ -1593,6 +1595,55 @@ class EngineActivity : UiActivity() {
             }
         }
         pageRag.addView(ragToggleCb)
+
+        // ── 相似度阈值（可调）──────────────────────────────────────────────
+        // 低于它的条目**一条都不注入**（不是"取最像的几条"）。写死 0.35 的问题：
+        // 分数分布随嵌入模型/语料变，用户只能接受；太高会"库里有也不注入"，
+        // 太低会拿弱相关内容污染回答 —— 两个方向的症状都只是"回答变差"。
+        // 按百分数存（0~100），与 0..1 的换算只在 `RagPrefs.minScore` 一处。
+        val ragScoreRow = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+        }
+        ragMinScoreEt = field("相似度阈值（0~100，默认 ${RagPrefs.DEFAULT_MIN_SCORE_PCT}）",
+            RagPrefs.minScorePct(this).toString()).apply {
+            inputType = android.text.InputType.TYPE_CLASS_NUMBER
+            setOnFocusChangeListener { _, has -> if (!has) saveRagMinScore(announce = false) }
+        }
+        ragScoreRow.addView(label("阈值"))
+        ragScoreRow.addView(ragMinScoreEt, lp(0, 1))
+        ragScoreRow.addView(btn("确定").apply {
+            textSize = UiText.LABEL
+            setPadding(px(10), 0, px(10), 0)
+            setOnClickListener { saveRagMinScore(announce = true) }
+        })
+        pageRag.addView(ragScoreRow)
+        pageRag.addView(label(
+            "↑ 低于阈值的条目不注入（0~100，默认 35）。调高更严格、调低注入更多；" +
+            "改动会清空历史注入块回放表，下一轮 KV 会重算一次。").apply {
+            setTextColor(pal.textMuted)
+            textSize = UiText.SMALL
+        })
+
+        // ── 方案 C：「注入块进历史」开关 ──
+        // 它不是"要不要检索"，而是"检索出来的块要不要按消息身份记住、下一轮原样拼回去"。
+        // 开着的效果：上一轮 prompt 成为这一轮的前缀，新算只剩「本轮块 + 提问」；
+        // 关掉只是回到旧行为（每轮把上一轮那段再算一遍），检索结果与回答完全不变。
+        val ragHistoryCb = android.widget.CheckBox(this).apply {
+            text = "注入块进历史并在后续轮次回放（默认开，省 prefill）"
+            textSize = UiText.BODY
+            isChecked = RagPrefs.historyEnabled(this@EngineActivity)
+            setOnCheckedChangeListener { _, v ->
+                RagPrefs.setHistoryEnabled(this@EngineActivity, v)
+            }
+        }
+        pageRag.addView(ragHistoryCb)
+        pageRag.addView(label(
+            "↑ 开着时，上一轮拼在历史提问前的知识库块会在下一轮逐字拼回同一条消息，" +
+            "KV 前缀才能接上；关掉不影响检索，只是每轮会重算上一轮那一小段。").apply {
+            setTextColor(pal.textMuted)
+            textSize = UiText.SMALL
+        })
 
         // ── 远端知识库（阶段 3）：**独立开关 + 独立库名**，默认关 ──
         //
@@ -6019,6 +6070,37 @@ class EngineActivity : UiActivity() {
     }
 
     /**
+     * 保存相似度阈值（失焦即存 + 「确定」；百分数 0~100，默认 35）。
+     *
+     * ⚠ 改值时必须**同时清空回放表**（App 的 `SessionStore` + HTTP 的进程内表）：
+     *   回放表里的块是按**旧阈值**检索出来的。不清的话，用户调高阈值后旧块仍被
+     *   原样拼回历史，界面上看起来"阈值改了没用"，而日志里又没有任何一句能解释它。
+     *   代价是下一轮 KV 会重算一次（旧块被拿掉，断点落在最早的那个块上）。
+     */
+    private fun saveRagMinScore(announce: Boolean = false): Int {
+        val raw = ragMinScoreEt.text.toString().trim()
+        val want = raw.toIntOrNull() ?: RagPrefs.DEFAULT_MIN_SCORE_PCT
+        val got = RagInject.normalizeMinScorePct(want)
+        if (raw != got.toString()) ragMinScoreEt.setText(got.toString())
+        val old = RagPrefs.minScorePct(this)
+        RagPrefs.setMinScorePct(this, got)
+        if (got != old) {
+            SessionStore.clearAllRagBlocks(this)
+            HttpApi.clearRagHistory()
+        }
+        if (announce) {
+            val clipped = got != want
+            val base = if (clipped)
+                "阈值超出 0~100，已按 $got 存"
+            else "相似度阈值已设为 $got（${RagInject.minScoreOfPct(got)}）"
+            Toast.makeText(this,
+                base + if (got != old) "；历史注入块已清空，下一轮 KV 会重算一次" else "",
+                Toast.LENGTH_SHORT).show()
+        }
+        return got
+    }
+
+    /**
      * 保存「每批编几条」（失焦即存；ISSUE #269 第 2 步）。
      *
      * ── 为什么读的是"归一后的值"而不是"用户填的原文"──────────────
@@ -8939,11 +9021,13 @@ class EngineActivity : UiActivity() {
      * 而不是"拼历史的方式"。各拼一份就是判据漂移的起点（比如 system 只在一处被带上），
      * RAG 注入同理 —— 它是"喂给模型的那一份"的组成部分，必须跟着这一处走。
      *
-     * 检索结果**不落盘、不进 `SessionStore`**，每轮按当前开关与当前提问重算：
-     *   · 存进历史会让上一轮的检索内容变成下一轮的**上下文**，而它对下一轮未必相关 ——
-     *     模型会顺着它继续引用，表现为"答着答着跑题了"，且看不出是谁干的；
-     *   · 用户消息是**提问**、system 是**设定**（都持久），检索是**本轮的附加信息**，
-     *     生命周期不同。
+     * 检索结果本身**不进对话历史**（不写成消息、不回写 `SessionStore.messages`），
+     * 每轮仍按当前开关与当前提问重新检索。但自「方案 C」起，服务端会把**拼给模型的
+     * 那一段块**按消息内容身份记一份回放表（`SessionStore.ragBlocks`）：
+     *   · 最后一条 user 是本轮提问，永远用**本轮新检索**的块；
+     *   · 历史 user 若上一轮拼过块，这一轮**原样拼回去**，上一轮 prompt 才成为这一轮的前缀。
+     * 这不是"把检索内容写进上下文"—— 用户看到的历史、导出的归档一个字节都不变；
+     * 它只是让服务端**自己拼出去的那一份**可复现。用户可在知识库页关掉回放。
      *
      * 注入位置是第 4 步改的：拼到**最后一条 user 之前**，不再进 system 段。
      * 原因只有一条 —— system 在 pos 0，而注入块每轮都变，于是 KV 前缀复用的分叉点
@@ -9036,11 +9120,33 @@ class EngineActivity : UiActivity() {
         // 注入块的宽度落账（ISSUE #330 第 4 块）：它一变，本轮提问那一段就全变、
         // 前缀断在块头。App 这条路与 HTTP 同一个口径（都是 `injectionChars(ctxPerSlot)`），
         // 但**每条路各自记一次**（两条路可能落在不同 slot、用不同的每格容量）。
+        // ⚠ 只报**本轮新块**的字符数：native 用它从尾部定位夹带段，回放总量传过去
+        //   会让那个定位落到更早的历史上（见 [LlmEngine.injectCharsOf]）。
         lastInjectChars = rag?.block?.length ?: 0
-        if (rag == null) return msgs
-        // 注入**只动最后一条 user 的正文**（拼在提问之前）：消息角色序列一个字节不变，
-        // 分叉点落在"本轮提问处"。system 段与其余历史一条都不动 —— 它们正是要被 KV 复用的部分。
-        return RagInject.attachBeforeLastUser(msgs, rag.block)
+        // ── 方案 C：历史注入块回放 ────────────────────────────────────────────
+        // 上一轮拼在**历史 user** 前面的块，这一轮按内容身份原样拼回去 ——
+        // 于是上一轮 prompt 成为这一轮的前缀，新算只剩「本轮块 + 提问」。
+        // 最后一条 user 永远用本轮新块；`nextHistory` 顺带把已被预算丢掉/已被
+        // 用户删掉的键修剪掉，并保证**本轮没注入**时旧的最后一条不会留到下一轮。
+        // ⚠ 回放必须同时受「检索开关」约束：用户关掉知识库就是要求"这一轮零注入"，
+        //   若历史块照旧回放，旧的 `[知识库]` 内容会继续影响回答，而开关看起来没生效。
+        //   关掉时连表一起清 —— 下次打开从当前轮重新累计。
+        val historyOn = RagPrefs.historyEnabled(this) && RagPrefs.enabled(this)
+        val cached = SessionStore.ragBlocksOf(this, currentSessionId)
+        if (historyOn) {
+            val next = RagInject.nextHistory(msgs, cached, rag?.block)
+            if (next != cached) SessionStore.setRagBlocks(this, currentSessionId, next)
+        } else if (cached.isNotEmpty()) {
+            // 关掉回放时把旧表清掉：留着它等于"用户关了开关，下次打开却回放一段
+            // 中间已经不再注入的历史"—— 前缀会断在那一段上，而且开关看起来没生效。
+            SessionStore.setRagBlocks(this, currentSessionId, emptyMap())
+        }
+        var out = if (historyOn) RagInject.applyHistory(msgs, cached) else msgs
+        // 注入**只动消息正文**（拼在提问之前）：消息角色序列一个字节不变，
+        // 分叉点落在"本轮提问处"。system 段与其余历史一条都不动 ——
+        // 它们正是要被 KV 复用的部分。
+        if (rag != null) out = RagInject.attachBeforeLastUser(out, rag.block)
+        return out
     }
 
     /**
@@ -9633,7 +9739,8 @@ class EngineActivity : UiActivity() {
         // 而"形状不同"在日志上完全没有现象，只表现为一侧的 KV 复用忽好忽坏。
         return LlmEngine.ragContext(
             this, RagPrefs.currentKb(this), lastUser, RagPrefs.enabled(this),
-            perItemChars = sessionInjectWidth())
+            perItemChars = sessionInjectWidth(),
+            minScore = RagPrefs.minScore(this))
     }
 
     /**

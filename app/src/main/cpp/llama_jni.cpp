@@ -612,6 +612,37 @@ static long proc_rss_kb() {
     return v;
 }
 
+// 一次读出内核**分项记账**：VmRSS / RssAnon / RssFile / RssShmem（KB）。
+//
+// 为什么不能只看 VmRSS：用户问的「GPU 是不是占双份」，一个总数回答不了 ——
+//   · 权重映射是**文件页**（RssFile，干净、可回收），它本来就不该算成"多一份常驻"；
+//   · repack / KV / compute buffer 是**私有匿名页**（RssAnon），这部分才是真常驻；
+//   · 驱动把设备缓冲映射进进程时，会落进 RssFile 或 RssShmem，而不是凭空消失。
+// 三个字段拆开之后，"多出来的差值在哪一类"才有答案；取不到（老内核没有
+// RssAnon 等字段）就报 -1，绝不拿 0 冒充。
+struct ProcMemKb {
+    long rss = -1;
+    long anon = -1;
+    long file = -1;
+    long shmem = -1;
+};
+
+static ProcMemKb proc_mem_kb() {
+    ProcMemKb m;
+    FILE * f = fopen("/proc/self/status", "r");
+    if (!f) return m;
+    char line[256];
+    while (fgets(line, sizeof(line), f)) {
+        long n = -1;
+        if      (sscanf(line, "VmRSS: %ld",   &n) == 1) m.rss   = n;
+        else if (sscanf(line, "RssAnon: %ld", &n) == 1) m.anon  = n;
+        else if (sscanf(line, "RssFile: %ld", &n) == 1) m.file  = n;
+        else if (sscanf(line, "RssShmem: %ld", &n) == 1) m.shmem = n;
+    }
+    fclose(f);
+    return m;
+}
+
 // ──────────────────────────────────────────────────────────────────────────────
 //  maps / smaps 里「这一行的路径列是不是我们的模型文件」——**唯一的路径判据**
 // ──────────────────────────────────────────────────────────────────────────────
@@ -1043,6 +1074,17 @@ static bool model_use_extra_bufts() {
         if (strcmp(v, *p) == 0) return false;
     }
     return true;
+}
+
+// 通用「显式开启」判据：属性存在且值不在 kProbeOffValues 里。
+// 与 model_use_extra_bufts 同一条纪律 —— 只有读到值才算数，读不到 = 不开启；
+// `0/false/no/off/...` 一律当关闭，其余非空值当开启。
+static bool prop_flag_on(const char * key) {
+    char v[32] = {0};
+    if (!probe_getprop(key, v, sizeof(v))) return false;
+    const char * vals[1] = { v };
+    return !probe_flag_off(vals, 1, kProbeOffValues,
+                           sizeof(kProbeOffValues) / sizeof(kProbeOffValues[0]));
 }
 
 // 把"这一轮的 repack 档位是什么、**是谁定的**"打进日志。
@@ -2994,6 +3036,119 @@ static bool build_htp_split(int quota_pct, char * out, size_t cap) {
     return true;
 }
 
+// ── 「GPU 组到底应该多大」：加载前的只读账 ──────────────────────────────────
+//
+// 用户报「GPU 占双份」时，日志里能拿来对照的只有库自己那行
+// `load_tensors: OpenCL model buffer size = X MiB` —— 但 X 该是多少，没人能
+// 只凭文件名算出来。于是「X 是不是两倍」永远只能靠猜。这里在加载**前**只读
+// GGUF header（no_alloc，不映射权重、不读数据），按上游 `load_tensors()` 的
+// 切层规则算一遍，给 X 一个参照：
+//   · 输入层：**永远留 CPU**（llama-model.cpp: `dev_input = cpu_dev`）；
+//   · 输出层：`n_gpu_layers > 0` 时**永远上 GPU**（`dev_output =
+//     get_layer_buft_list(n_layer_all)`）；
+//   · 重复层：`n_gpu_layers - 1` 层（上游先扣掉输出层）。
+// 由此得到一条**只有 tied 模型才有**的额外拷贝：`token_embd.weight` 兼作输出时，
+// 输入那份在 CPU，输出那份在 GPU；`TENSOR_DUPLICATED` 只在**同一个 buft
+// context** 内复用（llama-model-loader.cpp:1301-1311），跨设备不复用 → GPU 上
+// 多出完整一块。它不是「整组 GPU 权重两份」，但确实是实打实的一份。
+//
+// 只观测、不改行为；数值是**上限**（个别张量会被设备拒收回落 CPU，那只会更小）。
+struct WeightSplitDiag {
+    bool ok = false;
+    bool tied = false;
+    int  n_layer = 0;
+    long long total_bytes = 0;
+    long long tok_bytes = 0;       // token_embd.weight
+    long long out_bytes = 0;       // output.weight（0 = 没有独立输出权重 → tied）
+    long long gpu_bytes = 0;       // 按 n_gpu_layers 预期落在加速器组的字节
+    long long gpu_tied_bytes = 0;  // 其中「tied 输出在 GPU 上的额外物理副本」
+};
+
+// `blk.12.attn_q.weight` → 12；不是按层命名的张量返回 -1。
+static int gguf_blk_index(const char * name) {
+    if (!name || strncmp(name, "blk.", 4) != 0) return -1;
+    char * end = nullptr;
+    const long v = strtol(name + 4, &end, 10);
+    if (end == name + 4 || !end || *end != '.' || v < 0) return -1;
+    return (int) v;
+}
+
+static WeightSplitDiag probe_weight_split(const char * path, int n_gpu_layers) {
+    WeightSplitDiag d;
+    if (!path || !*path) return d;
+
+    // 与 nativeProbeGguf 同一条前置：明显不是 GGUF / 明显被截断的文件不交给
+    // `lm_gguf_init_from_file`（它会为整份元数据打一场 malloc 风暴）。
+    // 这里只是**诊断**，读不了就不报，绝不因此影响加载。
+    std::string why;
+    if (!gguf_header_precheck(path, &why)) return d;
+
+    struct lm_gguf_init_params params;
+    params.no_alloc = true;
+    params.ctx = nullptr;
+    struct lm_gguf_context * ctx = lm_gguf_init_from_file(path, params);
+    if (!ctx) return d;
+
+    const int64_t n = lm_gguf_get_n_tensors(ctx);
+    for (int64_t i = 0; i < n; i++) {
+        const char * tn = lm_gguf_get_tensor_name(ctx, i);
+        if (!tn) continue;
+        const long long bytes = (long long) lm_gguf_get_tensor_size(ctx, i);
+        d.total_bytes += bytes;
+        const int li = gguf_blk_index(tn);
+        if (li >= 0 && li + 1 > d.n_layer) d.n_layer = li + 1;
+        if      (strcmp(tn, "token_embd.weight") == 0) d.tok_bytes = bytes;
+        else if (strcmp(tn, "output.weight")     == 0) d.out_bytes = bytes;
+    }
+    d.tied = d.tok_bytes > 0 && d.out_bytes == 0;
+    // 层号是从 `blk.<n>.` 前缀里数出来的。一个 blk 张量都没有（非标准命名、
+    // 或读到的不是对话模型）时，"预期加速器组"会只剩 output_norm/output 两块，
+    // 那个数会把人误导成"GPU 组只有几十 MiB"。这种情况**明确不报**，
+    // 而不是给一个看起来合理的小数。
+    d.ok   = d.n_layer > 0;
+    if (!d.ok) {
+        lm_gguf_free(ctx);
+        return d;
+    }
+
+    // 第二遍才知道 tied / n_layer，才能按层把 GPU 组算全。
+    if (n_gpu_layers > 0) {
+        const int n_gpu = std::min(n_gpu_layers, d.n_layer + 1);
+        const int n_rep = std::max(0, n_gpu - 1);
+        const int first_gpu_layer = std::max(0, d.n_layer - n_rep);
+        for (int64_t i = 0; i < n; i++) {
+            const char * tn = lm_gguf_get_tensor_name(ctx, i);
+            if (!tn) continue;
+            const long long bytes = (long long) lm_gguf_get_tensor_size(ctx, i);
+            const int li = gguf_blk_index(tn);
+            if (li >= 0) {
+                if (li >= first_gpu_layer) d.gpu_bytes += bytes;
+                continue;
+            }
+            if (strcmp(tn, "output_norm.weight") == 0 ||
+                strcmp(tn, "output.weight")      == 0 ||
+                (d.tied && strcmp(tn, "token_embd.weight") == 0)) {
+                d.gpu_bytes += bytes;
+            }
+        }
+        if (d.tied) d.gpu_tied_bytes = d.tok_bytes;
+    }
+
+    lm_gguf_free(ctx);
+    return d;
+}
+
+// tied 输出的**可选**回退：把 `token_embd.weight` 钉回 CPU。
+//
+// 为什么不是默认开：这块张量同时也是输出矩阵，钉回 CPU 等于把 lm-head 的
+// matmul 从 GPU 挪到 CPU（每 token 一次大矩阵乘）。这是**性能换显存**的取舍，
+// 由系统属性 `lm_tied_out_cpu` 显式开启，和 `lm_extra_repack` 同一档纪律。
+// 还要注意组合：`repack=1` 时 CPU 侧会为输出矩阵再做一份 CPU_REPACK 匿名拷贝，
+// 总量不变、只是从显存挪到内存；`repack=0` 时才会直接复用映射里的同一张量
+// （零副本）—— 日志里会把这两种结果分开说。
+static const char * const kPropTiedOutCpu = "lm_tied_out_cpu";
+static llama_model_tensor_buft_override g_tied_out_override[2];
+
 // 对话模型加载的**实现体**（`slotCount` = 这一次要开出几份 ctx）。
 // 两个 JNI 入口共用：`nativeLoadModel`（旧的无 slot 声明，等价 slotCount=1）
 // 与 `nativeLoadModelSlot`（`slotCount` 在形参第一位，§9.2.7）。
@@ -3109,6 +3264,41 @@ static jboolean load_model_impl(
         jlog("[mmap池] mmap=0（直读档）→ 全池参与（显式 nullptr）｜ 权重按设计常驻内存，"
              "GPU/NPU 加速不受影响");
     }
+    // ── 「GPU 是不是占双份」：先把预期值算出来，加载后才好对照 ─────────────
+    // 这一段只读 GGUF header（no_alloc），不改变 mp 的任何行为；唯一的行为开关
+    // 是显式属性 `lm_tied_out_cpu`（默认关），且只对 tied 模型 + GPU 层>0 生效。
+    {
+        const WeightSplitDiag wsd = probe_weight_split(modelPath.c_str(), (int) nGpuLayers);
+        const long long mib = 1024LL * 1024LL;
+        if (wsd.ok) {
+            jlog("[权重切分] n_gpu_layers=%d → 预期加速器组 ≈ %lld MiB（上限%s）｜ 权重合计 %lld MiB ｜ %s",
+                 (int) nGpuLayers, wsd.gpu_bytes / mib,
+                 (wsd.tied && (int) nGpuLayers > 0) ? "，已含 tied 输出副本" : "",
+                 wsd.total_bytes / mib,
+                 wsd.tied ? "tied：token_embd.weight 兼作输出"
+                          : "输出层有独立 output.weight");
+            if (wsd.tied && (int) nGpuLayers > 0) {
+                jlog("[双份诊断] tied 模型 + GPU 层>0 → 输入层固定在 CPU、输出层固定上 GPU，"
+                     "同一块 token_embd.weight 会在 GPU 上再复制 %lld MiB；"
+                     "这不是「整组 GPU 权重两份」，只有这一块（来源：llama-model.cpp 的 "
+                     "dev_input/dev_output 与 llama-model-loader.cpp:1301 的同 context 复用判据）",
+                     wsd.gpu_tied_bytes / mib);
+                if (prop_flag_on(kPropTiedOutCpu)) {
+                    g_tied_out_override[0].pattern = "token_embd\\.weight";
+                    g_tied_out_override[0].buft    = lm_ggml_backend_cpu_buffer_type();
+                    g_tied_out_override[1].pattern = nullptr;
+                    g_tied_out_override[1].buft    = nullptr;
+                    mp.tensor_buft_overrides = g_tied_out_override;
+                    jlog("[双份诊断] lm_tied_out_cpu=1 → token_embd.weight 已钉回 CPU"
+                         "（repack=0 时复用 CPU 组里的同一张量=不再多一份；repack=1 时这份"
+                         "拷贝从显存移到 CPU_REPACK，总量不变、只换位置）");
+                }
+            }
+        } else {
+            jlog("[权重切分] 读不出 GGUF 头或层结构（非 blk.N 命名的架构也不报），"
+                 "本轮给不出预期 GPU 字节（不影响加载）");
+        }
+    }
     long rss_before_kb = proc_rss_kb();
     measure_repack_before();          // 建 repack 缓冲前先记一次 baseline
     S.model = llama_model_load_from_file(modelPath.c_str(), mp);
@@ -3180,6 +3370,27 @@ static jboolean load_model_impl(
         }
     } else {
         jlog("[mmap释放] mmap=0（直读档），权重按设计常驻，不做归还");
+    }
+
+    // ── 「多出来的那份到底在哪」：内核分项记账，一个 VmRSS 答不了 ─────────────
+    // 用户问「GPU 是不是占双份」，必须能区分三类页：
+    //   · RssFile  —— 文件支持的驻留（GGUF 映射在这儿；干净页，可回收）；
+    //   · RssAnon  —— 进程私有匿名页（repack / KV / compute buffer，真正常驻）；
+    //   · RssShmem —— 共享页。
+    // 若 OpenCL 组在进程内又留了一份**匿名**拷贝，它只会落进 RssAnon；驱动把设备
+    // 缓冲记在进程外时三项都不涨 —— 那同样说明进程内没有第二份。把这行与
+    // `[mmap释放]` 的 GGUF 驻留、库自己的 `<设备> model buffer size` 三处对齐，
+    // 「双份」是真是假就不必再猜。
+    {
+        const ProcMemKb pm = proc_mem_kb();
+        const long gguf_map_kb = proc_file_mapped_kb(modelPath.c_str());
+        auto mib = [](long kb) -> long { return kb < 0 ? -1 : kb / 1024; };
+        jlog("[内存账] VmRSS %ld MiB ｜ RssAnon %ld / RssFile %ld / RssShmem %ld MiB"
+             "（/proc/self/status 实测，-1=本机不提供该字段）｜ GGUF 映射驻留 %ld MiB ｜ "
+             "判读：RssFile 含 GGUF 映射与其它文件支持页（可回收），RssAnon 是私有匿名常驻"
+             "（此刻主要是 repack；KV/compute 在下一段建 ctx 后才计入），RssShmem 是共享页；"
+             "GPU 若在进程内多留一份，差额只会出现在这三项之一，不会凭空多出第四份",
+             mib(pm.rss), mib(pm.anon), mib(pm.file), mib(pm.shmem), mib(gguf_map_kb));
     }
 
     // ── 共享存储（FUSE）：这里只做**提示**，不做判定 ────────────────────────

@@ -565,6 +565,38 @@ object HttpApi {
      * 的判据，而那正是这类静默 bug 的温床。
      */
     private val ragWidthStore = HashMap<String, Int>()
+
+    /**
+     * 「历史注入块」的回放表（方案 C）：**按 relay 会话**，进程内、不落盘。
+     *
+     * 与 `ragWidthStore` / [RelayLedger] 同一条理由：它描述的是"服务端上一轮实际
+     * 拼给 native 的那份 prompt"，而模型与 KV 账本都只在**这一次进程**里有效。
+     * 落盘只会多一份"什么时候该清"的判据 —— 那正是这类静默 bug 的温床。
+     *
+     * 键是 `X-Relay-Session`（缺省 "default"，与 [handleRelayChat] 同一口径）；
+     * 值是该会话「消息内容身份 -> 当时拼进去的块」。
+     */
+    private val ragHistoryStore =
+        java.util.concurrent.ConcurrentHashMap<String, Map<String, String>>()
+
+    private fun ragHistoryOf(session: String): Map<String, String> =
+        ragHistoryStore[session] ?: emptyMap()
+
+    private fun setRagHistory(session: String, blocks: Map<String, String>) {
+        if (blocks.isEmpty()) ragHistoryStore.remove(session)
+        else ragHistoryStore[session] = blocks
+    }
+
+    /**
+     * 清空**所有会话**的历史注入块回放表（相似度阈值改变时调用）。
+     *
+     * 阈值是全局设置，回放表是按会话存的；只清当前那条会话会让别的会话继续按
+     * 旧阈值回放旧块 —— 用户切过去后看到"阈值改了但这里没生效"。
+     */
+    fun clearRagHistory() {
+        ragHistoryStore.clear()
+    }
+
     private val ragWidthLock = Any()
 
     /**
@@ -4348,14 +4380,32 @@ object HttpApi {
             // 宽度是跨轮不变的东西，就不能由会变的量决定（见 [sessionInjectWidth]）。
             val rag = LlmEngine.ragContext(
                 ragPrefs(), remoteKb, lastUserText, RagPrefs.remoteEnabled(ragPrefs()),
-                perItemChars = sessionInjectWidth())
+                perItemChars = sessionInjectWidth(),
+                minScore = RagPrefs.minScore(ragPrefs()))
+            // ── 方案 C：历史注入块回放（远端）──────────────────────────────────
+            // 与 App 内那条路共用同一组纯函数（[RagInject.applyHistory] /
+            // [RagInject.nextHistory]），只是落点不同：这里是**进程内按 relay 会话**，
+            // App 那条按会话落盘（见 `SessionStore.ragBlocksOf`）。
+            // 最后一条 user = 本轮提问，永远用本轮新检索的块；历史 user 上一轮拼过什么，
+            // 这一轮就逐字拼回什么 —— 上一轮 prompt 才可能成为这一轮的前缀。
+            // ⚠ 回放同时受「远端知识库开关」约束：`remoteEnabled=false` 就是"远端零注入"，
+            //   旧块继续回放会让关掉的开关看起来无效（与 App 路径同一条纪律）。
+            val historyOn = RagPrefs.historyEnabled(ragPrefs()) && RagPrefs.remoteEnabled(ragPrefs())
+            val ragKey = req.relaySession.ifEmpty { "default" }
+            val cachedRag = ragHistoryOf(ragKey)
+            if (historyOn) {
+                setRagHistory(ragKey, RagInject.nextHistory(msgs, cachedRag, rag?.block))
+            } else if (cachedRag.isNotEmpty()) {
+                // 关掉回放时清空旧表：留着它会让"下次打开开关"回放一段中间已经
+                // 不再注入的历史，前缀断在那里，而开关看起来没有生效。
+                setRagHistory(ragKey, emptyMap())
+            }
+            var injected = if (historyOn) RagInject.applyHistory(msgs, cachedRag) else msgs.toList()
             if (rag != null) {
                 // 与 App 路径**同一个助手**（`attachBeforeLastUser`）：消息角色序列一个字节不变，
                 // 只在最后一条 user 的正文前拼上注入块。位置对了，KV 前缀复用的分叉点就落在
                 // "本轮提问处"（放 system 段会让分叉点回到 pos 0、reuse 恒为 0）。
-                val injected = RagInject.attachBeforeLastUser(msgs.toList(), rag.block)
-                msgs.clear()
-                msgs.addAll(injected)
+                injected = RagInject.attachBeforeLastUser(injected, rag.block)
                 lastRagInjected.set(rag.count)
                 // 注入块的**宽度**也落账（ISSUE #330 第 4 块）：它一变，本轮提问那一段
                 // 就全变、前缀断在块头。以前这个数只在一条 uiLog 里，/health 上没有 ——
@@ -4374,6 +4424,10 @@ object HttpApi {
                 // 这里只补一句"远端这一轮没有注入"，让"开了但没注入"在日志上可判。
                 emitLog("知识库：远端开关开着（kb=$remoteKb）但本轮 0 条注入（原因见上一行 [知识库] 日志）")
             }
+            // ⚠ 无论本轮有没有新检索结果，都要把**回放后的那一份**交回去：
+            //   历史块的回放不依赖本轮是否命中 —— 它正是"上一轮拼过、这一轮照拼"。
+            msgs.clear()
+            msgs.addAll(injected)
 
             // ---- 上下文预算（ISSUE #330）----
             //

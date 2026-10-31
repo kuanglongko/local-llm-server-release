@@ -42,6 +42,22 @@ object RagInject {
     /** 默认相关度阈值：低于它的一条都不要（没有命中时正确行为是"不注入"）。 */
     const val DEFAULT_MIN_SCORE = 0.35f
 
+    /**
+     * 阈值在设置里按**百分数**存（0~100），因为本仓库的 `IntPref` 只有整数型；
+     * 与 [DEFAULT_MIN_SCORE] 的换算收在 [minScoreOfPct] 一处。
+     *
+     * 两条边界都要保留：`0` = 不过滤（对比测试用，不推荐），`100` = 一条都不注入
+     * （用户明确想临时关掉注入时，比去关知识库开关更轻）。
+     */
+    const val MIN_SCORE_PCT_MIN = 0
+    const val MIN_SCORE_PCT_MAX = 100
+
+    /** 把设置里的百分数钳进合法区间（读、写两侧都调；非法值不落盘、也不参与检索）。 */
+    fun normalizeMinScorePct(pct: Int): Int = pct.coerceIn(MIN_SCORE_PCT_MIN, MIN_SCORE_PCT_MAX)
+
+    /** 百分数 -> 检索用的 0..1 阈值。**唯一的换算处**，别在调用方各除一次 100。 */
+    fun minScoreOfPct(pct: Int): Float = normalizeMinScorePct(pct) / 100f
+
     /*
      * 持久化（开关 / 当前库名 / 远端那一对）不在本对象里 —— 见 [RagPrefs]。
      *
@@ -102,6 +118,7 @@ object RagInject {
      */
     fun render(picks: List<Pick>, rows: List<String>): String {
         val sb = StringBuilder()
+        var wrote = false
         for (p in picks) {
             if (sb.isEmpty()) sb.append(MARK).append('\n')
             if (p.index < 0 || p.index >= rows.size) continue
@@ -109,8 +126,12 @@ object RagInject {
             if (row.isEmpty()) continue
             sb.append(row)
             sb.append('\n')
+            wrote = true
         }
-        return sb.toString()
+        // 光表头不是"已注入"：一条正文都没写进去时，把表头也丢掉。
+        // （表头写在跳过之前是为了与 `rag_index.h` 的循环形状同锚，但输出仍必须
+        //   满足「无条目 -> 空串」—— 否则"非空 = 已注入"这条判据会恒真。）
+        return if (wrote) sb.toString() else ""
     }
 
     /** [renderStable] 的两种产出：拼进 prompt 的那一段 + 这一轮实际写进去多少字（供读数与日志）。 */
@@ -221,10 +242,118 @@ object RagInject {
         if (block.isEmpty()) return msgs
         val at = msgs.indexOfLast { it.first == "user" }
         if (at < 0) return msgs
+        return attachAt(msgs, at, block)
+    }
+
+    /**
+     * 把 [block] 拼到第 [at] 条消息的正文之前（[attachBeforeLastUser] 的单点形态）。
+     *
+     * 抽出来是因为「历史回放」要对**每一条**历史 user 做同一件事：那一轮的块必须
+     * 拼回到**同一条**消息前，上一轮 prompt 才可能成为这一轮的前缀。两处各写一遍
+     * 拼接（分隔符、`trimEnd`、空正文）就会在某个边界上产生一个字节的差 ——
+     * 而一个字节的差在 KV 前缀上就是"整段重算"。
+     *
+     * `at` 越界 / `block` 为空时原样返回（与 [attachBeforeLastUser] 同一套硬契约）。
+     */
+    fun attachAt(
+        msgs: List<Pair<String, String>>, at: Int, block: String
+    ): List<Pair<String, String>> {
+        if (block.isEmpty() || at !in msgs.indices) return msgs
         val body = msgs[at].second
         val merged = if (body.isEmpty()) block.trimEnd('\n')
                      else block.trimEnd('\n') + "\n\n" + body
-        return msgs.toMutableList().also { it[at] = "user" to merged }
+        return msgs.toMutableList().also { it[at] = msgs[at].first to merged }
+    }
+
+    /**
+     * 一条消息的**内容身份**：角色 + 正文 + 「同角色同正文第几次出现」。
+     *
+     * ══════════════════════════════════════════════════════════════════════
+     * 为什么不能用消息下标当键
+     * ══════════════════════════════════════════════════════════════════════
+     * 历史会被预算从**头部**丢掉（App 的 `trimTag`、HTTP 的 `ContextBudget`），
+     * 同一个下标在下一轮指向的是另一条消息。按下标记住的块于是会被拼到错误的位置上，
+     * 而 prompt 语法完全合法 —— 只是上一轮的前缀从那里断开，且没有任何读数指向它。
+     *
+     * 内容身份则跟着**文本**走：只要客户端这一轮还发着同一条 user 消息，它的键就不变；
+     * 用户删掉中间几条也不会让后面的键错位。正文参与键，所以"上一轮问过同一句"
+     * 不会串到这一轮的另一个位置。
+     *
+     * `occurrence` 只对「同角色 + 同正文」的重复条目有意义：一条消息被重复发两次时，
+     * 两次的块可能不同（不同轮次检索结果不同），按出现序号分开记才不会互相覆盖。
+     */
+    fun historyKey(role: String, content: String, occurrence: Int): String =
+        "$role\u0000$occurrence\u0000$content"
+
+    /** 整份 messages 的内容身份（下标与 `msgs` 一一对应）。 */
+    fun historyKeysOf(msgs: List<Pair<String, String>>): List<String> {
+        val seen = HashMap<String, Int>()
+        return msgs.map { (role, content) ->
+            val base = "$role\u0000$content"
+            val n = seen.getOrDefault(base, 0)
+            seen[base] = n + 1
+            historyKey(role, content, n)
+        }
+    }
+
+    /**
+     * 把**历史消息**上一轮的注入块原样拼回去（最后一条 user 不在此列 —— 它是本轮
+     * 提问，由调用方用本轮新检索到的块拼）。
+     *
+     * 这是"上一轮 prompt 成为这一轮前缀"的全部实现：上一轮每条历史 user 的正文前
+     * 都拼过一块，这一轮若不再拼，分叉点就落在**上一轮那条 user 的块头**，
+     * 从那里往后的提问、回答全部重算（真机 `prefill=225` 里约 2/3 就是这段）。
+     *
+     * 三条纪律：
+     *   · 只认缓存里**真有**的键（没记过 = 那一轮没注入，原样不动）；
+     *   · 只动 `user` 消息（system / assistant 从不注入）；
+     *   · 最后一条 user **必须**由调用方跳过 —— 否则本轮新块会被上一轮的旧块压在
+     *     前面，两份并列注入。
+     */
+    fun applyHistory(
+        msgs: List<Pair<String, String>>, blocks: Map<String, String>
+    ): List<Pair<String, String>> {
+        if (blocks.isEmpty()) return msgs
+        val keys = historyKeysOf(msgs)
+        val lastUser = msgs.indexOfLast { it.first == "user" }
+        var out = msgs
+        for (i in msgs.indices) {
+            if (i == lastUser || msgs[i].first != "user") continue
+            val block = blocks[keys[i]] ?: continue
+            if (block.isEmpty()) continue
+            out = attachAt(out, i, block)
+        }
+        return out
+    }
+
+    /**
+     * 这一轮结束后该留下的块表：只留**当前还有的那几条 user**，并把本轮新块记到
+     * 最后一条 user 名下。
+     *
+     * 为什么要"只留当前还有的"：历史被预算丢了之后，那些块的键再也不会出现；
+     * 留着它们既白占会话文件，也会在用户删掉再发同样一句话时**错误命中**一份
+     * 属于上一段对话的块。修剪的判据就是这一轮实际发出去的这份 messages。
+     *
+     * `freshBlock` 为空 = 本轮没注入（没命中 / 开关关 / 没库），那个键要**删掉**：
+     * 下一轮若还留着旧块，就会把这一轮**没拼过**的内容拼回去，前缀照样断，
+     * 而断点会出现在一条看起来"不应该被注入"的消息上。
+     */
+    fun nextHistory(
+        msgs: List<Pair<String, String>>, blocks: Map<String, String>, freshBlock: String?
+    ): Map<String, String> {
+        val keys = historyKeysOf(msgs)
+        val lastUser = msgs.indexOfLast { it.first == "user" }
+        val out = LinkedHashMap<String, String>()
+        for (i in msgs.indices) {
+            if (msgs[i].first != "user") continue
+            if (i == lastUser) {
+                if (!freshBlock.isNullOrEmpty()) out[keys[i]] = freshBlock
+            } else {
+                val old = blocks[keys[i]] ?: continue
+                if (old.isNotEmpty()) out[keys[i]] = old
+            }
+        }
+        return out
     }
 
     /**

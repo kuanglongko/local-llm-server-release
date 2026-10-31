@@ -11,11 +11,19 @@ package com.xiaowan.localinference
  * 数据来源是 native 日志 + stderr（两者都汇流到 LlmEngine.pushLog）。本对象只做只读匹配、
  * 不改任何行为；reset() 清零，因此 CPU 回退重试后的摘要反映**最后一次**加载。
  *
- * 权重行的格式（注意 llama 还会打 "CPU Repack" 这种带空格的设备名）：
- * load_tensors:          HTP0 model buffer size =      <n> MiB
- * load_tensors:    HTP0-REPACK model buffer size =   <n> MiB
- * load_tensors:       OpenCL model buffer size =   <n> MiB
- * load_tensors:      CPU Repack model buffer size =  <n> MiB
+ * 权重行的格式（**设备名随 vendor 版本变过，两种都得认**）：
+ *   v1.12.2（当前 vendor）:  `CPU_Mapped` / `CPU_REPACK`（下划线）
+ *   更早的构建:              `CPU Repack`（空格）
+ *   load_tensors:          HTP0 model buffer size =      <n> MiB
+ *   load_tensors:    HTP0-REPACK model buffer size =   <n> MiB
+ *   load_tensors:       OpenCL model buffer size =   <n> MiB
+ *   load_tensors:      CPU_Mapped model buffer size = <n> MiB
+ *   load_tensors:      CPU_REPACK model buffer size = <n> MiB
+ *
+ * ⚠ 0.9.305 修的就是这里：旧正则只写 `CPU` 与带空格的 `CPU Repack`，
+ *   而当前 vendor 打的是 `CPU_Mapped` / `CPU_REPACK` —— 两个下划线名都
+ *   **匹配不上**（`CPU` 后面紧跟 `_`，`\s+` 不成立），于是这两行被静默丢弃：
+ *   摘要里 `CPU=` 偏小，repack 那份根本看不见。丢行不报错，只有断言能钉住。
  */
 object HtpProbe {
 
@@ -41,7 +49,7 @@ object HtpProbe {
     @Volatile var hwinfoFail: Int = 0
         private set
 
-    /** 设备名 → 权重 MiB。设备名归一化后形如 HTP0 / HTP0-REPACK / OpenCL / CPU / CPU-Repack。 */
+    /** 设备名 → 权重 MiB。归一化后形如 HTP0 / HTP0-REPACK / OpenCL / CPU / CPU-Mapped / CPU-Repack。 */
     private val bufs = LinkedHashMap<String, Double>()
 
     private val reBackends = Regex("""backend_ptrs\.size\(\)\s*=\s*(\d+)""")
@@ -52,8 +60,14 @@ object HtpProbe {
     /**
      * 设备名用「非空格词 + 可选 -REPACK」显式匹配，比宽松通配更安全：
      * 时间戳 `[hh:mm:ss.SSS]`、`[stderr]`、`load_tensors:` 这些前缀都被字符集天然排除。
+     *
+     * `CPU[ _]Repack` / `CPU_Mapped` 必须**排在 `CPU` 前面**，且各自成一项：
+     * 当前 vendor（v1.12.2）打的是 `CPU_Mapped` / `CPU_REPACK`（下划线 + 全大写），
+     * 早先构建打的是 `CPU Repack`（空格，首字母大写）；只写 `CPU` 时下划线名会
+     * 在 `\s+` 处失配、整行被丢掉（见文件头注释）。`(?i:repack)` 只为兼容这两种
+     * 大小写，不放开其余名字。
      */
-    private val reBuf = Regex("""\b(CPU Repack|HTP\d+(?:-REPACK)?|OpenCL|CPU|CUDA\d*|Vulkan|SYCL)\s+model buffer size\s*=\s*([\d.]+)\s*MiB""")
+    private val reBuf = Regex("""\b(CPU[ _](?i:repack)|CPU_Mapped|HTP\d+(?:-REPACK)?|OpenCL|CPU|CUDA\d*|Vulkan|SYCL)\s+model buffer size\s*=\s*([\d.]+)\s*MiB""")
 
     /** native 偶尔把同一行重发（callback 与 stderr 双路），用它防止重复累加。 */
     private val seen = HashSet<String>()
@@ -112,7 +126,17 @@ object HtpProbe {
             if (line.contains("model buffer size")) {
                 if (!seen.add(line)) return@runCatching   // 整行去重：重发不再累加
                 for (m in reBuf.findAll(line)) {
-                    val key = m.groupValues[1].trim().replace(' ', '-')
+                    // 同一份缓冲在不同 vendor 构建里有三种写法：`CPU_Mapped` /
+                    // `CPU_REPACK`（v1.12.2）与 `CPU Repack`（更早）。这里显式
+                    // 收敛成两个规范键：`CPU-Mapped` 与 `CPU-Repack` —— 否则
+                    // 大小写/分隔符不同会让同一份权重分裂成不同的格，`sumExact`
+                    // 查不到就等于"没有"，症状与"从未记录"完全一样。
+                    val raw = m.groupValues[1].trim()
+                    val key = when {
+                        raw == "CPU_Mapped" -> "CPU-Mapped"
+                        raw.startsWith("CPU_") || raw.startsWith("CPU ") -> "CPU-Repack"
+                        else -> raw
+                    }
                     bufs[key] = (bufs[key] ?: 0.0) + (m.groupValues[2].toDoubleOrNull() ?: 0.0)
                 }
                 return@runCatching
@@ -131,8 +155,18 @@ object HtpProbe {
         }
     }
 
+    /**
+     * 按设备名前缀求和。**注意**：`"CPU"` 也会命中 `"CPU-Repack"` 与 `"CPU-Mapped"`，
+     * 所以它只适合拿来求 HTP 那一族（HTP0 / HTP0-REPACK 本就该合在一起看）。
+     * CPU 必须拆开：映射那份是**文件页**（可回收），repack 那份才是**匿名拷贝**，
+     * 混成一个数会把「repack 多一份」误读成「GPU 多一份」—— 这正是用户报
+     * 「GPU 占双份」时最容易踩的一格。精确取某一格用 [sumExact]。
+     */
     private fun sum(prefix: String): Double =
         bufs.filterKeys { it.startsWith(prefix) }.values.sum()
+
+    /** 只取这一格，不做前缀匹配（CPU 与 CPU-Repack 必须分开报）。 */
+    private fun sumExact(key: String): Double = bufs[key] ?: 0.0
 
     /** HTP 设备数：HTP0..HTPn 去重（不含 -REPACK 重复计数）。 */
     private fun htpDevs(): Int =
@@ -157,9 +191,14 @@ object HtpProbe {
     fun measured(): String {
         val n = htpLayers + gpuLayers + cpuLayers
         if (n == 0 && bufs.isEmpty()) return ""
-        val htpW = sum("HTP"); val gpuW = sum("OpenCL")
-        val base = "%d/%d层在NPU(HTP=%d GPU=%d CPU=%d) ｜ 权重 HTP=%.0f OpenCL=%.0f CPU=%.0f MiB".format(
-            htpLayers, n, htpLayers, gpuLayers, cpuLayers, htpW, gpuW, sum("CPU"))
+        val htpW = sum("HTP"); val gpuW = sumExact("OpenCL")
+        // CPU 映射有两个名字：带 mmap 时是 `CPU_Mapped`，直读档是 `CPU`；
+        // repack 那份是另一格。前两者都是文件页/普通内存（可回收），
+        // 只有 repack 是**匿名拷贝** —— 混在一起会把「repack 一份」看成「CPU 也存两份」。
+        val cpuMap = sumExact("CPU") + sumExact("CPU-Mapped"); val cpuRp = sumExact("CPU-Repack")
+        val base = ("%d/%d层在NPU(HTP=%d GPU=%d CPU=%d) ｜ " +
+                    "权重 HTP=%.0f OpenCL=%.0f CPU映射=%.0f CPU重排=%.0f MiB").format(
+            htpLayers, n, htpLayers, gpuLayers, cpuLayers, htpW, gpuW, cpuMap, cpuRp)
         // 份额是本轮关键线索：4B 与 0.6B 体积差 6 倍，NPU 层份额都稳在 ~68% → 配额制，不是容量制。
         val share = if (n == 0) "" else
             " ｜ NPU份额=" + (htpLayers * 100 / n) + "%" +
@@ -169,13 +208,17 @@ object HtpProbe {
 
     fun summary(): String {
         val htp = sum("HTP")
-        val cl = sum("OpenCL")
-        val cpu = sum("CPU")
-        val parts = ArrayList<String>(9)
+        val cl = sumExact("OpenCL")
+        val cpu = sumExact("CPU") + sumExact("CPU-Mapped")
+        val cpuRp = sumExact("CPU-Repack")
+        val parts = ArrayList<String>(10)
         parts += "backend=" + (if (backends >= 0) backends.toString() else "?")
         parts += if (htpDevs() > 0) "HTP=%d设备/%.0fMiB".format(htpDevs(), htp) else "HTP=0"
         parts += "OpenCL=%.0fMiB".format(cl)
         if (cpu > 0) parts += "CPU=%.0fMiB".format(cpu)
+        // repack 另存的一份是**匿名**拷贝，必须单列；混进 CPU 会让「GPU 双份」的
+        // 对账永远差一格。0 时不打，避免把没开 repack 的轮次也写成一档。
+        if (cpuRp > 0) parts += "CPU-Repack=%.0fMiB".format(cpuRp)
         if (offloaded >= 0) parts += "offload=$offloaded/${if (totalLayers > 0) totalLayers else "?"}"
         arch?.let { parts += "arch=$it" }
         opQueue?.let { parts += "op-queue=有" }

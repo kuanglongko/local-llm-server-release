@@ -49,8 +49,41 @@ object RagPrefs {
     /** 远端使用的知识库名的键（与 [KEY_CURRENT] **必须不同**）。 */
     const val KEY_REMOTE_KB = "rag_remote_kb"
 
+    /**
+     * 「注入块进历史」开关的键：上一轮拼给模型的块，下一轮对同一条历史 user
+     * 原样拼回去（方案 C）。默认 **true** —— 它是纯加速（让上一轮 prompt 成为
+     * 这一轮的前缀），不改检索结果；关掉只是回到"每轮重算上一轮那段"的旧开销。
+     *
+     * ⚠ 与 [KEY_ENABLED] / [KEY_REMOTE_ENABLED] 都不同：它不决定"要不要检索"，
+     *   只决定"检索出来的块记不记账、下一轮回放不回放"。三个判据各管一件事，
+     *   合成一个键就会出现"关掉回放 = 关掉知识库"这种没人要求过的联动。
+     */
+    const val KEY_HISTORY_ENABLED = "rag_history_enabled"
+
+    /**
+     * 相似度阈值（百分数 0~100）的键。低于它的条目**一条都不注入**。
+     *
+     * 存在理由：0.35 是一个跟嵌入模型/语料强相关的经验值，写死时用户只能接受它。
+     * 阈值太低会把弱相关内容塞进回答（比"没命中"更坏，因为它看起来像有依据）；
+     * 太高则明明库里有也不注入。两条方向的症状都是"回答质量变差"，而日志里只有
+     * 一句"低于阈值"，用户没法判断该调哪边。
+     *
+     * 默认 **35**（= [RagInject.DEFAULT_MIN_SCORE] × 100），与升级前逐字节一致。
+     */
+    const val KEY_MIN_SCORE_PCT = "rag_min_score_pct"
+
+    /** 阈值默认百分数（= 0.35）。改这里必须同步看 [RagInject.DEFAULT_MIN_SCORE]。 */
+    const val DEFAULT_MIN_SCORE_PCT = 35
+
     /** App 内开关；**键不存在时默认 true**。 */
     private val enabledPref = BoolPref(Prefs.RAG, KEY_ENABLED, true)
+
+    /** 注入块进历史（回放）；**键不存在时默认 true**（见 [KEY_HISTORY_ENABLED]）。 */
+    private val historyPref = BoolPref(Prefs.RAG, KEY_HISTORY_ENABLED, true)
+
+    /** 相似度阈值；读、写两侧都过 [RagInject.normalizeMinScorePct]，非法值不会落盘。 */
+    private val minScorePctPref = IntPref(
+        Prefs.RAG, KEY_MIN_SCORE_PCT, DEFAULT_MIN_SCORE_PCT, RagInject::normalizeMinScorePct)
 
     /** App 内当前库名；缺键 = ""。 */
     private val currentPref = StringPref(Prefs.RAG, KEY_CURRENT, "")
@@ -81,6 +114,22 @@ object RagPrefs {
     fun remoteEnabled(ctx: Context): Boolean = remoteEnabledPref.get(ctx)
 
     fun setRemoteEnabled(ctx: Context, on: Boolean) = remoteEnabledPref.set(ctx, on)
+
+    /** 注入块是否进历史并在后续轮次回放（默认 true；只影响缓存/回放，不影响检索）。 */
+    fun historyEnabled(ctx: Context): Boolean = historyPref.get(ctx)
+
+    fun setHistoryEnabled(ctx: Context, on: Boolean) = historyPref.set(ctx, on)
+
+    /** 检索相似度阈值（百分数，默认 35）。 */
+    fun minScorePct(ctx: Context): Int = minScorePctPref.get(ctx)
+
+    fun setMinScorePct(ctx: Context, pct: Int) = minScorePctPref.set(ctx, pct)
+
+    /**
+     * 检索用的 0..1 阈值。**两条路都从这里取**（App / HTTP），不各自除 100 ——
+     * 换算写两遍就会出现"设置页 35、这一侧 0.0035"这种从未同时成立过的组合。
+     */
+    fun minScore(ctx: Context): Float = RagInject.minScoreOfPct(minScorePct(ctx))
 
     /** 远端使用的知识库名（**独立于** [currentKb]）；""= 没配。 */
     fun remoteKb(ctx: Context): String = remoteKbPref.get(ctx)
