@@ -17,25 +17,32 @@ import android.provider.MediaStore
  * - API 29+：MediaStore.Downloads，不需要存储权限，写完在系统「下载」里就能看到；
  * - API 26~28：先试公共 Download（需 WRITE_EXTERNAL_STORAGE，运行时未授予会抛异常），
  * 失败再退回应用专属外部目录（无需权限，路径形如 Android/data/<包名>/files/Download）。
+ *
+ * MIME 是**入参**（默认 text/plain）：聊天记录导出的是 `.json`，声明成 `text/plain`
+ * 会让文件管理器/分享目标把它当纯文本处理（点开是记事本、分享出去对方收到 `.txt`）。
+ * 内容其实没变，改的只是"别人怎么认它"—— 这类错**没有任何报错**，只是用起来别扭。
  */
 object LogExport {
 
-    /** @return 人类可读的落盘位置（已含文件名），失败抛异常由调用方提示 */
-    fun saveText(context: Context, fileName: String, text: String): String {
+    /**
+     * @param mime 落盘时声明的 MIME；`.json` 传 `application/json`。
+     * @return 人类可读的落盘位置（已含文件名），失败抛异常由调用方提示
+     */
+    fun saveText(context: Context, fileName: String, text: String, mime: String = "text/plain"): String {
         val bytes = text.toByteArray(Charsets.UTF_8)
         if (Build.VERSION.SDK_INT >= 29) {
-            runCatching { return viaMediaStore(context, fileName, bytes) }
+            runCatching { return viaMediaStore(context, fileName, bytes, mime) }
             // 个别 ROM 的 MediaStore Download 集合不可写时继续往下兜底
         }
         runCatching { return viaPublicDir(fileName, bytes) }
         return viaAppExternalDir(context, fileName, bytes)
     }
 
-    private fun viaMediaStore(context: Context, name: String, bytes: ByteArray): String {
+    private fun viaMediaStore(context: Context, name: String, bytes: ByteArray, mime: String): String {
         val resolver = context.contentResolver
         val values = ContentValues().apply {
             put(MediaStore.Downloads.DISPLAY_NAME, name)
-            put(MediaStore.Downloads.MIME_TYPE, "text/plain")
+            put(MediaStore.Downloads.MIME_TYPE, mime)
             put(MediaStore.Downloads.RELATIVE_PATH, Environment.DIRECTORY_DOWNLOADS)
             // 不加 IS_PENDING：写完直接可见，省一次通知调用，也避免中途崩溃留下"永久待定"文件
         }

@@ -1,0 +1,23 @@
+--- a/vendor/llama.cpp/ggml/src/ggml-opencl/kernels/gemm_coopk_q4_k_q8_1_dp4a.cl
++++ b/vendor/llama.cpp/ggml/src/ggml-opencl/kernels/gemm_coopk_q4_k_q8_1_dp4a.cl
+@@ -89,6 +89,9 @@
+     }
+ #endif
+ 
++// Mask the packed bytes before shifting: Adreno compiles the uchar promotion of
++// `q[i] >> 6` into a sign-extending byte load, so any byte >= 0x80 corrupts the two
++// high bits. This is the same form the other Q4_K kernels in this directory use.
+ inline void get_scale_min_k4_c(int j, global const uchar * q, int stride,
+                                uchar * d, uchar * m,
+                                uchar mask_d6, uchar mask_d4, uchar mask_hi2) {
+@@ -96,8 +99,8 @@
+         *d = q[j*stride] & mask_d6;
+         *m = q[(j + 4)*stride] & mask_d6;
+     } else {
+-        *d = (q[(j + 4)*stride] & mask_d4) | ((q[(j - 4)*stride] >> 6) << 4);
+-        *m = (q[(j + 4)*stride] >>   4)    | ((q[(j    )*stride] >> 6) << 4);
++        *d = (q[(j + 4)*stride] & mask_d4) | ((q[(j - 4)*stride] & mask_hi2) >> 2);
++        *m = ((q[(j + 4)*stride] >>   4) & mask_d4) | ((q[(j    )*stride] & mask_hi2) >> 2);
+     }
+ }
+ 

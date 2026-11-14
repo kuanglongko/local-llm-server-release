@@ -21,6 +21,28 @@ class App : Application() {
         super.onCreate()
         // 尽早开文件，让 native 初始化阶段的日志也能落盘
         LogFileStore.init(this)
+        // 请求级唤醒锁必须**全进程一份**，而且 App 内对话不经过 InferenceService：
+        // 只在服务里初始化会让「只开 App 聊天、没启动常驻服务」这一档拿到 null 租约，
+        // 屏幕一灭 native 推理就可能被挂起。放在 Application 里初始化，两条入口
+        // （HTTP / App 内对话）共用同一把共享锁与同一套引用计数。
+        // `init` 幂等，InferenceService.onCreate 再调一次也不会建第二把。
+        RequestWakeLock.init(this)
+        // 按需加载的状态机同样必须全进程一份：App 内聊天不经过 InferenceService，
+        // 而 HTTP 推理与 App 聊天共用同一份活跃推理计数。只在服务里初始化会让
+        // 「只开 App 聊天」这一档拿到未初始化的状态机，开关打开也不生效。
+        ModelLifecycle.init(this)
+        // 多模型池同样全进程一份。默认关闭（`multi_model_enabled=false`），此时
+        // 它不会被任何请求用到；初始化只是记下 Context，供开关打开后路由/建池。
+        MultiModelEngine.init(this)
+        // 探针开关与日志落盘都在 Application 里就绪，保证后续任何入口
+        // （UI / 前台服务 / 系统自动拉起服务）都走同一份设置
+        LlmEngine.loadProbeSetting(this)
+        // 悬浮球（默认关）的意图恢复：上次开着就随进程重建把服务拉回来。
+        // 放在 Application 而不是设置页：冷启动不一定会走到那个开关，
+        // 而"开关开着、球却没有"正是漏掉这一跳的症状。`restore` 自己判
+        // 开关 + 系统权限，关着/没授权时一行也不做。
+        FloatingBallService.restore(this)
+        if (LlmEngine.probeEnabled) LogFileStore.append("[probe] 探针已启用（设置里开启后重启生效）")
         val prev = Thread.getDefaultUncaughtExceptionHandler()
         Thread.setDefaultUncaughtExceptionHandler { t, e ->
             runCatching {
@@ -31,8 +53,11 @@ class App : Application() {
                     appendLine("time=${java.util.Date()}")
                     appendLine("---- stack ----")
                     appendLine(sw)
-                    appendLine("---- recent engine logs (${LlmEngine.recentLogs().size} lines) ----")
-                    appendLine(LlmEngine.recentLogs().joinToString("\n"))
+                    // 崩溃现场必须取**全量**：日志页的过滤档位与"哪些行进了 ring"无关，
+                    // 用过滤后的取数会让这份现场在有档位时凭空少掉几段。
+                    val ring = LlmEngine.recentLogsUnfiltered()
+                    appendLine("---- recent engine logs (${ring.size} lines) ----")
+                    appendLine(ring.joinToString("\n"))
                 }
                 // 私有 filesDir 保底 + 外部目录便于用户直接取
                 runCatching {

@@ -17,8 +17,8 @@ android {
         // 版本规则：versionName 恒为 0.9.<versionCode>，两者在同一次提交里一起改。
         // 本文件注释里请勿写出 versionName 紧跟等号与引号的形式——发布器按该形式定位
         // 并改写版本号，全文命中数不等于 1 会直接中止发布。
-        versionCode = 65
-        versionName = "0.9.65"
+        versionCode = 328
+        versionName = "0.9.328"
         ndk {
             // llama.cpp rnllama 构建仅面向 arm64；Hexagon HTP/OpenCL 均在此 ABI
             abiFilters += listOf("arm64-v8a")
@@ -28,7 +28,7 @@ android {
         getByName("main") {
             // 4 个预编译 librnllama 变体从 vendor 目录直接打包（srcDir 是"追加"语义，
             // 不影响默认 jniLibs 与 CMake 产物）；srcDirs += 在 AGP 里会报 Val cannot be reassigned。
-            jniLibs.srcDir("$rootDir/vendor/cui-llama.rn-v1.12.2")
+            jniLibs.srcDir("$rootDir/vendor/cui-llama.rn-v1.13.0")
         }
     }
     compileOptions {
@@ -47,8 +47,8 @@ android {
     defaultConfig.externalNativeBuild.cmake {
         arguments += listOf(
             "-DANDROID_STL=c++_static",
-            // 预编译 rnllama 变体目录（见 vendor/cui-llama.rn-v1.12.2/README.md）
-            "-DRN_LIBS_DIR=$rootDir/vendor/cui-llama.rn-v1.12.2"
+            // 预编译 rnllama 变体目录（见 vendor/cui-llama.rn-v1.13.0/README.md）
+            "-DRN_LIBS_DIR=$rootDir/vendor/cui-llama.rn-v1.13.0"
         )
         cppFlags += "-std=c++17"
     }

@@ -9,8 +9,8 @@
 
 - **用途**：Android arm64 预编译的 `librnllama_*.so` 与配套头文件（`app/src/main/cpp/include/`）。
 - **来源**：<https://github.com/Vali-98/cui-llama.rn>
-- **版本**：v1.12.2（打包自 llama.cpp / ggml commit `d620bae92`）
-- **落库位置**：`vendor/cui-llama.rn-v1.12.2/`（含 `SHA256SUMS` 与来源说明）
+- **版本**：v1.13.0（打包自 llama.cpp / ggml commit `8642541`，build 11960）
+- **落库位置**：`vendor/cui-llama.rn-v1.13.0/`（含 `SHA256SUMS` 与来源说明）
 - **改动**：无。二进制未做任何改写（早期尝试过 ELF 补丁，已回滚并作为教训记录）。
 - **版权**：Copyright (c) 2023 Jhen-Jie Hong
 
@@ -45,7 +45,7 @@ SOFTWARE.
 - **用途**：上述预编译库内含的推理引擎与 GGML 后端框架本体（含 Hexagon NPU 后端实现）；
   头文件亦源自该 commit。
 - **来源**：<https://github.com/ggml-org/llama.cpp>
-- **版本**：commit `d620bae92`（经 cui-llama.rn v1.12.2 间接引入）
+- **版本**：commit `8642541`（经 cui-llama.rn v1.13.0 间接引入）
 - **版权**：Copyright (c) 2023-2026 The ggml authors
 
 ```
@@ -76,30 +76,30 @@ SOFTWARE.
 
 ## 3. Hexagon DSP skeleton（`app/src/main/assets/ggml-hexagon/`）— MIT（经 cui-llama.rn 分发）
 
-- **文件**：`libggml-htp-v69.so` / `-v73` / `-v75` / `-v79` / `-v81`（按 SoC 架构代际选择，共 3.1 MB）
+- **文件**：`libggml-htp-v69.so` / `-v73` / `-v75` / `-v79` / `-v81` / `-v85`（按 SoC 架构代际选择，共 4.5 MB）
 - **用途**：llama.cpp `ggml-hexagon` 后端在 DSP 侧执行的 skeleton，经 FastRPC
   （`libcdsprpc.so`，由**设备系统提供、本项目不打包**）加载进 Hexagon NPU。
 
-**性质认定（已取证，非推测）**：这五个文件是 **llama.cpp 自身的构建产物**，不是高通专有二进制。
+**性质认定（已取证，非推测）**：这六个文件是 **llama.cpp 自身的构建产物**，不是高通专有二进制。
 
 - 文件内残留的源路径全部是 `cpp/ggml-hexagon/htp/*.c`（llama.cpp MIT 源码）；
 - 5 个文件的 `DT_NEEDED` 只有 `libc.so` 与 `libgcc.so`；`qurt_*` / `HAP_*`（Hexagon RTOS 与框架 API）共 110 处引用（单文件 21–23 处）**全部是 `UND` 未定义符号**，由设备 DSP 侧在运行时解析——也就是说文件里**没有内嵌任何专有运行时**，静态链入的只有 `-lc -lgcc` 与 Hexagon SDK 的启动桩；
 - llama.cpp 官方 `docs/backend/snapdragon/README.md` 就把 `libggml-htp-v*.so` 列为
-  `cmake --install` 的标准输出文件（其示例输出列出 v73/v75/v79/v81；**v69 未出现在该示例里**，
+  `cmake --install` 的标准输出文件（其示例输出列出 v73/v75/v79/v81/v85；**v69 未出现在该示例里**，
   但下文的 npm 逐字节校验对 v69 同样成立，故一并按上游产物对待）。
 
-**获取渠道**：npm 包 `cui-llama.rn@1.12.2` → `bin/arm64-v8a/libggml-htp-v*.so`，
+**获取渠道**：npm 包 `cui-llama.rn@1.13.0` → `bin/arm64-v8a/libggml-htp-v*.so`，
 即上文第 1 项的同一作者（Jhen-Jie Hong）官方发布。该包 `package.json` 声明
 `license: MIT`，且包内自带 `LICENSE`（`Copyright (c) 2023 Jhen-Jie Hong`）。
 
-**完整性校验**：本仓库五个文件与该 npm 包**逐字节一致**，SHA-256 已存档于
-[`vendor/cui-llama.rn-v1.12.2/HTP_ASSETS.sha256`](vendor/cui-llama.rn-v1.12.2/HTP_ASSETS.sha256)。
+**完整性校验**：本仓库六个文件与该 npm 包**逐字节一致**，SHA-256 已存档于
+[`vendor/cui-llama.rn-v1.13.0/HTP_ASSETS.sha256`](vendor/cui-llama.rn-v1.13.0/HTP_ASSETS.sha256)。
 比对基准是 **npm tarball**（与第 1 项的 GitHub release asset 属不同渠道，内容不同）。
-tarball 为 `https://registry.npmjs.org/cui-llama.rn/-/cui-llama.rn-1.12.2.tgz`，10696237 字节，`sha256 = da08a83ac222d8ca740b1094d0fc52d2c778af1a51df78d520fae97e617ef52a`，可一条命令复算：
+tarball 为 `https://registry.npmjs.org/cui-llama.rn/-/cui-llama.rn-1.13.0.tgz`，12338308 字节，`sha256 = 61d0682b0ff0e7fa10e62ad36aa35b54f2d0ce1dc3ff5acb92e44f1a48a3de99`，可一条命令复算：
 
 ```sh
-npm pack cui-llama.rn@1.12.2 && sha256sum cui-llama.rn-1.12.2.tgz \
-  && tar -xzf cui-llama.rn-1.12.2.tgz package/bin/arm64-v8a \
+npm pack cui-llama.rn@1.13.0 && sha256sum cui-llama.rn-1.13.0.tgz \
+  && tar -xzf cui-llama.rn-1.13.0.tgz package/bin/arm64-v8a \
   && sha256sum package/bin/arm64-v8a/libggml-htp-v*.so
 ```
 
